@@ -1,0 +1,99 @@
+# Solo CLI · 指挥中心
+
+把「设计题目 → 领题排队 → Docker 跑 Claude Code → 判定 → Cursor 五维分析 → solo-qa 质检 → 上传」串成一条可视化流水线，支持多题并发，一题一容器。
+
+超出并发的题自动排队，前面一结束就补位；运行结束后自动销毁容器、自动分析、自动质检，不需要人工点确认。
+
+## 一键启动
+
+```bash
+cp .env.example .env        # 至少确认 CODER_ROOT 指向宿主机上的 solo-coder 目录
+docker compose up --build   # 首次约 3–5 分钟（拉取 docker CLI、安装 Cursor CLI、构建前端）
+```
+
+启动成功后后端日志会打印：
+
+```
+Startup Success
+Console : http://localhost:8788
+API     : http://localhost:8788/api/health
+```
+
+浏览器打开 <http://localhost:8788>。
+
+## 首次配置（设置页）
+
+| 分组 | 必填项 | 说明 |
+|---|---|---|
+| solo-qa 身份 | `solo_qa_session`、`solo_qa_csrf` | 从已登录浏览器的 Cookie 复制；「测试 solo-qa 身份」应显示登录用户 |
+| Claude Code 容器 | 网关 Key | 注入容器的 `apikey`；镜像默认 `adminfather/benzhi-claude-code:20260915-mount`，需已 `docker pull` 到本机 |
+| Cursor CLI 分析 | Cursor API Key、模型 | Key 在 cursor.com/dashboard/api 创建；「测试 Cursor」返回 `pong` 即可 |
+| 调度 | 并发数、超时、暂停出队 | 默认 3 并发、单题 120 分钟 |
+| 自动流水线 | 销毁 / 分析 / 质检三个开关 | 默认全开；分析与质检共用并发额度，默认 2 |
+| solo-qa 质检 | 项目路径、镜像 | 复用 solo-qa 自己的后端镜像，只读挂载它的源码与 `.env`；「测试质检通道」会连一次远程库 |
+| 题目设计 | GitHub Token | 出题要建仓库、推快照；本机执行 `gh auth token` 取值 |
+
+所有值 Fernet 加密存于 `./data`，界面只回显密钥末 4 位。`.env` 中的 `CURSOR_API_KEY` 等仅作首次种子。
+
+密钥在界面上显示为掩码（`••••••••` + 末 4 位），保存时不会回传，留空也不会清掉已存的值；要换值就直接覆盖输入。启动时会体检一次，发现库里存的是掩码（早期版本的缺陷会写进去）就清空并在日志里点名，需要重新填一遍。
+
+## 目录约定（CODER_ROOT 下）
+
+```
+prompt.md            题库：多题，每题以「题号：NN」起头，正文位于「以下为发送给模型的 prompt 正文」之后
+workspace/NN/        初始快照 git 仓库，挂为容器 /workspace（门禁要求 HEAD == 快照 SHA 且干净）
+出题/轨迹/NN/         容器 ~/.claude/projects 挂载点，启动前必须为空，结束后含一份 <sessionId>.jsonl
+出题/分析/NN/         产物副本 repo/、trace_index.json、analysis_prompt.md、agent 原始输出
+出题/prompts/NN.md   可选归档，回填 SessionID / TurnID 时一并更新
+```
+
+## 单题流程
+
+1. **题库** → 「领取并启动」：门禁检查（Key、镜像、容器名、HEAD、干净、黑名单泄漏扫描、轨迹目录空）。阻断项可一键「重置到快照」「归档轨迹」「删除残留容器」。并发满了就进队列。
+2. **运行舱**：`docker run -i … print < prompt`，只把 prompt 正文送进 stdin；stream-json 事件实时落库并通过 SSE 推到事件流。超时自动 `docker stop`。思考 token 那种一秒几百条的心跳不落库，只按 2 秒推一条进度；事件流默认回放最后 600 条，完整过程看轨迹 jsonl。
+3. **判定**：进程层（退出码）/ 协议层（`result.subtype`）/ 产物层（轨迹、git 改动）→ `FINISHED | FAILED | TIMEOUT | INTERRUPTED`。后端重启后接管的容器读不到 stdout，拿不到 `result`，这时退出码 0 且本轮有轨迹就按正常结束算，轮次与用量留空并在判定备注里说明；导出轨迹到 `data/exports/NN/`，把 SessionID、TurnID/PromptID 写回 `prompt.md`（原文件另存 `.bak`，只改两行）。只认本轮开始之后写过的 jsonl，上一轮留在目录里的不会被当成这次的结果。
+4. **自动流水线**：轨迹导出成功后销毁容器 → 跑五维分析 → 跑质检。没产出轨迹时保留容器并跳过分析，原因写在题目卡上。
+5. **五维评审**：在产物副本上运行 `agent -p --model claude-opus-5-thinking-high`，产出分数、第一人称口语描述、证据（步骤号/文件/引文）、需求覆盖表。后端交叉核验：证据能否在轨迹中定位、分数与覆盖是否自洽、描述是否含表情/markdown/结构词。红项禁止上传，黄项人工确认；描述可直接编辑后「保存评审并核验」。
+6. **质检**：调 solo-qa 的质检链路跑硬校验、查重、模型描述判定，只取结论，不写它的库、不碰飞书。未通过的项会指出缺什么、原文哪句有问题、该怎么改。
+7. **上传**：`form-schema → /submissions/upload → /submissions` 两步上传；422 逐字段回显，401 提示更新 Cookie。`harness_version` 以轨迹里的版本为准（和镜像实测值不一致时以轨迹为准，否则质检直接打回）。
+8. **完成并销毁**：容器通常已被流水线销毁；手动点击可再次确认并标记 `DONE`。
+
+## 队列
+
+「队列」页看排队与在跑的题，可以置顶 / 上移 / 下移 / 放回题库，也能在线改并发上限、暂停出队（暂停只影响新题出队，已在跑的不受影响）。下半部分是自动流水线的实时进度，卡在哪一步、什么原因一目了然。
+
+## 设计题目
+
+「设计题目」页输入数量后，Cursor CLI 按 solo-prompt 的 SOP 出题，产出写进 `出题/prompts/NN.md` 并自动导入题库。随后对新题跑 solo-qa 的查重规则 A（字面/近字面）与规则 C（同仓库语义雷同，含同批互查），命中的直接废弃并记下原因，通过的留在题库等领取。查重本身没跑成时不会放行，题会留在库里并标注，人工决定。
+
+出题需要后端容器里的 `gh` 与 GitHub Token，还需要工作区根目录有需求文档；页面顶部的前置检查会逐项标出缺什么。
+
+后端重启不会打断容器里正在跑的题：启动时按容器实际状态重新接管，结束后照常收尾。分析与质检是后端进程内的活，重启会中断，启动时会把卡在「分析中/质检中」的题复位并自动重新排进流水线。
+
+不想做的题点「废弃」：从题库与运行舱列表中隐藏，残留容器一并销毁，轨迹和工作目录仍留在磁盘上；需要时在题库「已废弃」标签页恢复到废弃前的状态。运行中或排队中的题需先停止或放回才能废弃。
+
+每道题的详情页（题卡「详情」按钮）分两种形态：还没跑的题显示提交参数、prompt 全文、项目路径、时间线，左侧可直接执行门禁检查并修复；跑过的题显示事件流、三层判定、五维评审、上传字段与轨迹步骤索引。
+
+## 开发
+
+```bash
+# 后端
+cd backend && uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install -r requirements.txt pytest
+DATA_DIR=/tmp/solo-data CODER_ROOT_HOST=/path/to/solo-coder uvicorn app.main:app --port 8001 --reload
+python -m pytest tests
+
+# 前端（vite 代理 /api → :8001）
+cd frontend-console && npm install && npm run dev
+```
+
+## 与 solo-qa 的对接方式
+
+查重和质检都复用 `solo-qa-0908` 自己的后端镜像执行：把 `backend/bridges/*.py` 挂进去，stdin/stdout 传 JSON。这样既拿到它最新的规则实现，又不用把它 pin 死的依赖装进本项目。
+
+桥接只调只读函数（`run_dedup`、`semantic.review`、`qc.runner.evaluate_one`），不写结论、不入查重池、不同步飞书，模型缓存也关掉；待查题目用 `MAX(id)` 之上的虚拟 id，只存在于内存。需要 solo-qa 的 `.env` 能连上它的远程库与模型网关。
+
+## 文档
+
+- `docs/Requirements.md` 需求与设计（SSOT）
+- `docs/Roadmap.md` 阶段与验收
+- `docs/DesignSpec.md` 视觉规范

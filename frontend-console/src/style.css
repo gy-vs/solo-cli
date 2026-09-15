@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  background: #F4F6FA;
+  color: #0F172A;
+  font-family: Inter, "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 22px;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+.n-config-provider { height: 100%; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #94A3B8; }
+
+.card {
+  @apply bg-bg2 border border-line rounded-card shadow-card;
+  transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+.card-hover:hover {
+  transform: translateY(-2px);
+  border-color: rgba(79,107,237,0.35);
+  @apply shadow-lift;
+}
+.inner {
+  @apply bg-bg3 rounded-inner;
+}
+.mono { @apply font-mono; }
+.nums { font-variant-numeric: tabular-nums; }
+.label { @apply text-xs text-fg1; }
+.h1 { @apply text-[22px] leading-7 font-semibold text-fg0; }
+.h2 { @apply text-[15px] leading-[22px] font-semibold text-fg0; }
+.pill {
+  @apply inline-flex items-center gap-1.5 px-2 h-6 rounded-full text-xs font-medium border;
+}
+.dot { @apply inline-block w-2 h-2 rounded-full; }
+.page { @apply animate-fadein max-w-[1440px] mx-auto p-6 space-y-4; }
+.empty { @apply mono text-fg2 text-xs py-8 text-center; }
