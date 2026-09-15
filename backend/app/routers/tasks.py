@@ -18,8 +18,8 @@ from app.models import (
 )
 from app.schemas import IdList, QueueMove, ReviewUpdate, task_brief, task_detail
 from app.services import (
-    analyzer, dockerx, gate, pipeline, prompt_bank, qa_bridge, runner, scheduler, uploader,
-    settings_store,
+    analyzer, dockerx, gate, pipeline, prompt_bank, qa_bridge, runner, scheduler, task_reset,
+    uploader, settings_store,
 )
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -210,6 +210,15 @@ async def restore(task_id: int) -> dict:
     return {"ok": True, "status": back, "message": f"已恢复为 {back}"}
 
 
+@router.post("/{task_id}/reset")
+async def reset(task_id: int, keep_traces: bool = Query(default=True)) -> dict:
+    """恢复到做题前：容器、工作区、轨迹、prompt.md 回填、评审与质检记录全部还原。"""
+    r = await task_reset.reset_task(task_id, archive=keep_traces)
+    if r.get("blocked"):
+        raise HTTPException(409, r["steps"][0]["message"])
+    return r
+
+
 @router.post("/{task_id}/fix/{action}")
 async def gate_fix(task_id: int, action: str) -> dict:
     with session() as db:
@@ -219,7 +228,7 @@ async def gate_fix(task_id: int, action: str) -> dict:
     if action == "reset_snapshot":
         return await gate.reset_to_snapshot(t)
     if action == "archive_traces":
-        return gate.archive_traces(t)
+        return gate.archive_traces(t.task_no)
     if action == "remove_container":
         r = await dockerx.remove_container(t.container_name)
         with session() as db:

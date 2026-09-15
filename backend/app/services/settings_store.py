@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
@@ -15,6 +16,8 @@ from sqlalchemy import select
 from app import config
 from app.db import session
 from app.models import Setting
+
+log = logging.getLogger("settings")
 
 MASK_PLACEHOLDER = "••••••••"
 
@@ -119,18 +122,26 @@ def set_one(key: str, value: str) -> None:
     set_many({key: value})
 
 
-def set_many(values: dict[str, str]) -> list[str]:
-    """写入多项。值为掩码时跳过（界面未修改该密钥）。返回实际写入的 key。
+def looks_masked(value: str) -> bool:
+    """界面掩码识别。
 
-    界面回传的掩码是「占位符 + 末 4 位」，不是裸占位符；
-    这里必须用前缀判断，否则「保存全部」会把掩码当真值写进去，密钥直接作废。
+    掩码是「占位符 + 末 4 位」，早期只判前缀，一旦格式变一点就会把掩码当真值
+    写进库里，密钥当场作废、用户以为「配置又丢了」。真实的 key 里不可能出现
+    圆点字符，所以只要出现在任何位置就一律当掩码拒绝。
     """
+    return MASK_PLACEHOLDER in value or "•" in value
+
+
+def set_many(values: dict[str, str]) -> list[str]:
+    """写入多项。值为掩码时跳过（界面未修改该密钥）。返回实际写入的 key。"""
     written: list[str] = []
+    skipped: list[str] = []
     with session() as db:
         for key, value in values.items():
             if key not in SPEC_BY_KEY:
                 continue
-            if value.startswith(MASK_PLACEHOLDER):
+            if looks_masked(value):
+                skipped.append(key)
                 continue
             value = (value or "").strip()
             row = db.get(Setting, key)
@@ -139,6 +150,11 @@ def set_many(values: dict[str, str]) -> list[str]:
                 db.add(row)
             row.value_enc = _enc(value) if value else ""
             written.append(key)
+    # 只记 key 不记值：配置一旦「莫名丢了」，靠这行日志能确认是谁清的
+    if written:
+        log.info("设置写入：%s", ", ".join(f"{k}{'(清空)' if not values[k].strip() else ''}" for k in written))
+    if skipped:
+        log.info("设置跳过（界面掩码，保留原值）：%s", ", ".join(skipped))
     return written
 
 
@@ -185,7 +201,7 @@ def sanitize() -> list[str]:
             row = db.get(Setting, spec.key)
             if row is None or not row.value_enc:
                 continue
-            if _dec(row.value_enc).startswith(MASK_PLACEHOLDER):
+            if looks_masked(_dec(row.value_enc)):
                 row.value_enc = ""
                 cleaned.append(spec.key)
     return cleaned

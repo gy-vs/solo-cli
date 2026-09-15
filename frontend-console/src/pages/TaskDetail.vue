@@ -71,6 +71,8 @@ const canComplete = computed(() => ended.value && task.value?.status !== 'DONE')
 const discarded = computed(() => task.value?.status === 'DISCARDED')
 const claimable = computed(() => task.value?.status === 'AVAILABLE' || task.value?.status === 'CLAIMED')
 const discardable = computed(() => !!task.value && !['RUNNING', 'QUEUED', 'DISCARDED'].includes(task.value.status))
+// 跑过或动过的题才有东西可退；从没碰过的待领取题没必要还原
+const resettable = computed(() => !!task.value && !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(task.value.status))
 /** 没跑过的题只有「题目信息」，跑完才出判定/评审/质检/上传/轨迹 */
 const tabs = computed<[Tab, string][]>(() => ended.value || isRunning.value
   ? [['verdict', '判定'], ['review', '五维评审'], ['qc', '质检'], ['upload', '上传'], ['steps', '轨迹步骤'], ['prompt', '题目信息']]
@@ -136,6 +138,22 @@ function discard() {
   })
 }
 const restore = () => act('restore', () => api.restore(id), '已恢复')
+function resetTask() {
+  dialog.warning({
+    title: `还原题 ${task.value?.task_no} 到做题前`,
+    content: '销毁残留容器；工作区 git clean 并回到初始快照 commit；轨迹目录归档；删除导出的轨迹副本与分析中间产物；'
+      + 'prompt.md 里回填过的 SessionID 与 TurnID 改回占位；清空运行、分析、评审、质检记录。'
+      + '做完这道题回到「待领取」，可以重新跑。工作区里未提交的改动会被清掉。',
+    positiveText: '确认还原',
+    negativeText: '取消',
+    onPositiveClick: () => act('reset', async () => {
+      const r = await api.resetTask(id)
+      const bad = r.steps.filter((s) => !s.ok)
+      if (bad.length) throw new Error(bad.map((s) => `${s.step}（${s.message}）`).join('；'))
+      return r
+    }, '已还原到做题前'),
+  })
+}
 const analyze = () => { tab.value = 'review'; return act('analyze', () => api.analyze(id), 'Cursor 分析已启动，完成后自动填入') }
 const save = () => act('save', async () => {
   const r = await api.saveReview(id, { scores: review.value.scores, descs: review.value.descs, other_issues: review.value.other_issues })
@@ -252,6 +270,8 @@ const payloadPreview = computed(() => {
         <NButton v-if="canComplete" size="small" :type="task.status === 'UPLOADED' ? 'success' : 'warning'" :secondary="task.status !== 'UPLOADED'" :loading="busy === 'complete'" @click="complete">
           完成并销毁
         </NButton>
+        <NButton v-if="resettable" size="small" quaternary :loading="busy === 'reset'"
+          title="工作区、轨迹、回填、评审记录全部退回做题前" @click="resetTask">还原到做题前</NButton>
         <NButton v-if="discardable" size="small" quaternary type="error" :loading="busy === 'discard'" @click="discard">废弃</NButton>
       </div>
       <div v-if="discarded" class="mt-3 text-xs text-fg1">

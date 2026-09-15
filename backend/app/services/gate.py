@@ -148,11 +148,11 @@ async def reset_to_snapshot(task: Task) -> dict:
     return {"ok": ok, "message": (r2.out or r2.err or r1.err).strip()}
 
 
-def archive_traces(task: Task) -> dict:
+def archive_traces(task_no: str) -> dict:
     """把非空轨迹目录整体改名归档（带时间戳），腾出空目录。"""
     from datetime import datetime
 
-    tr = config.TaskPaths(task.task_no).traces
+    tr = config.TaskPaths(task_no).traces
     if not tr.exists() or not any(tr.iterdir()):
         return {"ok": True, "message": "轨迹目录本就为空"}
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -84,6 +84,12 @@ export interface TaskBrief {
 
 export type QcStatus = 'IDLE' | 'RUNNING' | 'DONE' | 'FAILED'
 
+export interface ResetStep {
+  step: string
+  ok: boolean
+  message: string
+}
+
 export interface QcCheck {
   name: string
   passed: boolean
@@ -214,6 +220,8 @@ export const api = {
   release: (id: number) => post<{ ok: boolean }>(`/api/tasks/${id}/release`),
   discard: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/discard`),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
+  resetTask: (id: number, keepTraces = true) =>
+    post<{ ok: boolean; steps: ResetStep[] }>(`/api/tasks/${id}/reset?keep_traces=${keepTraces}`),
   fix: (id: number, action: string) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/fix/${action}`),
   stop: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/stop`),
   events: (id: number) => get<{ items: RunEvent[] }>(`/api/tasks/${id}/events/list`),

@@ -7,11 +7,13 @@ import { fmtTime, HEX } from '../status'
 const props = defineProps<{ task: TaskBrief; busy?: boolean }>()
 const emit = defineEmits<{
   (e: 'claim'): void; (e: 'release'): void; (e: 'open'): void
-  (e: 'discard'): void; (e: 'restore'): void
+  (e: 'discard'): void; (e: 'restore'): void; (e: 'reset'): void
 }>()
 const diffColor = (d: string) => (d.includes('困难') ? HEX.warn : d.includes('中') ? HEX.run : HEX.fg1)
 const claimable = () => props.task.status === 'AVAILABLE' || props.task.status === 'CLAIMED'
 const discardable = () => !['RUNNING', 'QUEUED', 'DISCARDED'].includes(props.task.status)
+// 跑过或动过的题才需要还原；从没碰过的待领取题没什么可退的
+const resettable = () => !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(props.task.status)
 </script>
 
 <template>
@@ -49,6 +51,8 @@ const discardable = () => !['RUNNING', 'QUEUED', 'DISCARDED'].includes(props.tas
       <NButton v-if="task.status === 'DISCARDED'" size="small" type="primary" secondary class="flex-1" :loading="busy" @click="emit('restore')">恢复</NButton>
       <NButton v-if="task.status === 'CLAIMED' || task.status === 'QUEUED'" size="small" tertiary @click="emit('release')">放回</NButton>
       <NButton size="small" tertiary @click="emit('open')">详情</NButton>
+      <NButton v-if="resettable()" size="small" quaternary :loading="busy" title="工作区、轨迹、回填、评审记录全部退回做题前"
+        @click="emit('reset')">还原</NButton>
       <NButton v-if="discardable()" size="small" quaternary type="error" :loading="busy" @click="emit('discard')">废弃</NButton>
     </div>
   </div>

@@ -53,14 +53,22 @@ WRITING_RULES = """
 5. 每条描述 2 到 6 句，80 到 300 字。分数高的维度也要写具体核对了什么，例如「我把 prompt 里的 N 条约束逐条对了产物，都能对上」，并点出对的是哪几条。
 6. 只写模型自身能力造成的问题；网关超时、网络错误这类环境问题不写进描述。
 7. 打分要和描述一致：描述里说了有需求没实现，交付完整性就不能给 4 分以上。
-8. 只要这个维度不是 5 分，描述里必须同时出现三样东西，缺一样都会被质检打回：
+8. 提到文件只写仓库内的相对路径，例如 lib/rules_inline.mjs。禁止出现任何绝对路径或磁盘目录名
+   （以 / 开头的路径、盘符、以及 host、data、workspace、repo、分析、出题、副本这类目录名都不许写）。
+   这些描述会原样交付给评审方，写进去等于把我本地的目录结构一起交出去。
+9. 不许写你自己这次是怎么核验的环境状况，这部分不属于对被评模型的评价：
+   不写有没有装依赖、有没有 node_modules、有没有某个可执行文件、能不能联网、跑不跑得起来、
+   不写「产物副本」「沙箱」「我这边」「我的环境」。
+   命令跑不了就直接依据代码和轨迹下结论，不要解释为什么没跑，也不要说结论不受影响。
+   verification.commands 只填真正执行成功的命令，没跑就给空数组。
+10. 只要这个维度不是 5 分，描述里必须同时出现三样东西，缺一样都会被质检打回：
    扣分点发生的具体位置（第几轮第几步、哪次工具调用、哪个文件或函数、哪条命令或哪段报错原文）；
    哪里不合适（对这个维度的负面判断，不能只写「核对通过」就收尾）；
    模型具体做了什么、造成了什么客观后果。
    反例：「它把目录列了一遍就结束了」——没写是第几步、也没写导致什么。
    正例：「第 7 步它用 Glob 把 src 下的文件名列了一遍就去写 README，没有打开 src/parser.py 看实现，
    写出来的模块说明和代码里的函数名对不上，我按 README 的说法找不到对应函数。」
-9. 满分维度也不要只写一句「没问题」，要写清核对了哪几条、在哪些步骤看到的。
+11. 满分维度也不要只写一句「没问题」，要写清核对了哪几条、在哪些步骤看到的。
 """.strip()
 
 
@@ -90,8 +98,9 @@ def _build_prompt(task: Task, trace_index_path: Path, repo: Path, trace_file: st
 PROMPT>>>
 
 【可用材料】
-1. 产物副本（当前工作目录）：{repo}
-   这是模型完成后的代码。你可以自由读文件、安装依赖、跑测试和构建来验证需求是否真的实现。这是副本，随便改、随便跑。
+1. 当前工作目录就是模型完成后的代码，是一份可随意改动的副本。
+   优先靠读代码核验需求是否真的实现。装依赖、跑测试、跑构建这些能跑就跑，跑不起来就完全依据代码与轨迹判断，
+   不要把「我这边跑不起来」写进任何描述字段。引用文件一律用相对这个目录的路径。
 2. 轨迹步骤索引（JSON）：{trace_index_path}
    steps[] 里每一步有 step 序号、kind（tool 或 text）、tool 名、summary（命令/文件/说明）、files、result（工具返回摘要）、is_error。写证据时引用这里的 step 序号。
 3. 原始轨迹 jsonl（需要看细节时再读，可能很大）：{trace_file or '（无）'}
@@ -99,7 +108,7 @@ PROMPT>>>
 【工作步骤】
 1. 先读 prompt，把需求拆成可核验的功能点与约束清单。
 2. 读轨迹步骤索引，理解模型做了什么、顺序如何、哪里出错、哪里重复。
-3. 在产物副本里逐条核验功能点与约束：读代码，能跑就跑测试或构建，记录命令与结果。
+3. 在当前目录逐条核验功能点与约束：读代码，能跑就跑测试或构建，记录真正跑成功的命令与结果。
 4. 按下面的评分锚点打分，按写法要求写描述，每条描述都要引用具体步骤号或文件名。
 
 【评分锚点】
@@ -154,8 +163,36 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"输出中没有可解析的五维 JSON：{last_err}")
 
 
-def _normalize(obj: dict) -> dict:
+_ABS_PATH = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/)+[A-Za-z0-9_.\-\u4e00-\u9fff]*")
+_HERE = "仓库根目录"
+
+
+def _strip_paths(text: str, repo: Path | str = "") -> str:
+    """把描述里的绝对路径压成仓库内相对路径。
+
+    模型偶尔不听话，把产物副本的绝对路径写进描述，而描述会原样交付给评审方，
+    等于把本机目录结构一并交出去。
+
+    只有产物副本这一个前缀能剥成相对路径（剥完正好是仓库内路径），别的绝对路径
+    整条压掉：末段像文件就留文件名，像目录就换成一句话，不给任何目录名留出口。
+    """
+    if not text:
+        return text
+    # /workspace 是容器里的仓库根，和产物副本一样剥成相对路径
+    for root in (str(repo).rstrip("/"), "/workspace"):
+        if root and root != "/":
+            text = text.replace(root + "/", "").replace(root, _HERE)
+
+    def squash(m: re.Match) -> str:
+        parts = [p for p in m.group(0).split("/") if p]
+        return parts[-1] if parts and "." in parts[-1] else _HERE
+
+    return _ABS_PATH.sub(squash, text)
+
+
+def _normalize(obj: dict, repo: Path | str = "") -> dict:
     out: dict = {"scores": {}, "descs": {}, "evidence": {}, "other_issues": "", "coverage": [], "verification": {}}
+    clean = lambda s: _strip_paths(str(s or "").strip(), repo)  # noqa: E731
     for dim in verifier.DIMS:
         d = obj.get(dim) or {}
         score = d.get("score")
@@ -164,13 +201,26 @@ def _normalize(obj: dict) -> dict:
         except (TypeError, ValueError):
             score = None
         out["scores"][dim] = score
-        out["descs"][dim] = str(d.get("description") or "").strip()
+        out["descs"][dim] = clean(d.get("description"))
         ev = d.get("evidence") or []
-        out["evidence"][dim] = [e for e in ev if isinstance(e, dict)][:12]
-    out["other_issues"] = str(obj.get("other_issues") or "").strip()
+        out["evidence"][dim] = [_clean_dict(e, ("file", "quote"), clean) for e in ev if isinstance(e, dict)][:12]
+    out["other_issues"] = clean(obj.get("other_issues"))
     cov = obj.get("requirement_coverage") or []
-    out["coverage"] = [c for c in cov if isinstance(c, dict)][:40]
-    out["verification"] = obj.get("verification") or {}
+    out["coverage"] = [_clean_dict(c, ("point", "evidence"), clean) for c in cov if isinstance(c, dict)][:40]
+    ver = dict(obj.get("verification") or {})
+    if isinstance(ver.get("commands"), list):
+        ver["commands"] = [clean(c) for c in ver["commands"] if isinstance(c, str)]
+    if isinstance(ver.get("summary"), str):
+        ver["summary"] = clean(ver["summary"])
+    out["verification"] = ver
+    return out
+
+
+def _clean_dict(d: dict, keys: tuple[str, ...], clean) -> dict:
+    out = dict(d)
+    for k in keys:
+        if isinstance(out.get(k), str):
+            out[k] = clean(out[k])
     return out
 
 
@@ -281,7 +331,7 @@ async def analyze_task(task_id: int) -> dict:
         except (json.JSONDecodeError, IndexError):
             agent_session, usage = "", {}
         parsed = _extract_json(result_text)
-        review = _normalize(parsed)
+        review = _normalize(parsed, repo)
 
         with session() as db:
             t = db.get(Task, task_id)

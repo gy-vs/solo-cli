@@ -29,6 +29,19 @@ EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\U0001F00
 MARKDOWN_RE = re.compile(r"(^\s*[-*•]\s+|^\s*#{1,6}\s|\*\*[^*]+\*\*|`[^`]+`|^\s*\d+\.\s+)", re.M)
 _WS = re.compile(r"\s+")
 
+# 描述会原样交付给评审方，本机目录结构不能跟着一起出去，所以按红项拦。
+# 容器里的 /workspace 是题目环境的标准路径，交付信息里本来就有，只提醒改成相对路径。
+ABS_PATH_RE = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/){1,}")
+HOST_DIR_WORDS = ("/host", "/data/", "/Users/", "分析/", "出题/")
+CONTAINER_DIR = "/workspace"
+
+# 对分析环境的自述：说的是我这次怎么核验的，不是被评模型的能力，写进去既没意义也显得荒唐
+META_TALK_WORDS = (
+    "node_modules", "产物副本", "沙箱", "我这边", "我的环境", "本地环境", "跑不起来", "跑不了",
+    "无法运行", "没法运行", "不能运行", "没有装依赖", "未安装依赖", "没有安装依赖",
+    "可执行文件", "没有联网", "无法联网", "不影响结论",
+)
+
 
 def _norm(s: str) -> str:
     return _WS.sub("", s or "").lower()
@@ -47,6 +60,18 @@ def check_text_style(text: str) -> list[dict]:
     hits = [w for w in AI_WORDS if w in text]
     if hits:
         items.append({"level": "warn", "code": "ai_words", "message": f"包含结构词/AI 高频词：{'、'.join(hits[:6])}", "words": hits})
+    found = [m.group(0) for m in ABS_PATH_RE.finditer(text)] + [w for w in HOST_DIR_WORDS if w in text]
+    host = [p for p in dict.fromkeys(found) if not p.startswith(CONTAINER_DIR)]
+    if host:
+        items.append({"level": "block", "code": "abs_path", "words": host,
+                      "message": f"出现本机路径/目录名：{'、'.join(host)[:80]}，交付前必须改成仓库内相对路径"})
+    elif any(p.startswith(CONTAINER_DIR) for p in found):
+        items.append({"level": "warn", "code": "container_path",
+                      "message": "引用了容器内的 /workspace 绝对路径，建议写成仓库内相对路径"})
+    meta = [w for w in META_TALK_WORDS if w in text]
+    if meta:
+        items.append({"level": "block", "code": "meta_talk", "words": meta,
+                      "message": f"在讲我自己的核验环境而不是被评模型：{'、'.join(meta[:6])}，删掉这部分只留基于代码与轨迹的结论"})
     if "我" not in text:
         items.append({"level": "warn", "code": "not_first_person", "message": "没有出现第一人称「我」"})
     return items

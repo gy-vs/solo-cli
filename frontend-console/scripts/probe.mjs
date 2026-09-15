@@ -37,6 +37,18 @@ const click = (text) => page.evaluate((t) => {
   el.click()
   return true
 }, text)
+/** 状态 tab：只点 tab 那排按钮，不能用文本前缀匹配（「全部」会撞上「全部领取并启动」） */
+const tab = (label) => page.evaluate((t) => {
+  const el = [...document.querySelectorAll('button')]
+    .filter((e) => e.className.includes('rounded-inner'))
+    .find((e) => e.textContent.trim().startsWith(t))
+  if (!el) return false
+  el.click()
+  return true
+}, label)
+const tabLabels = () => page.evaluate(() => [...document.querySelectorAll('button')]
+  .filter((e) => e.className.includes('rounded-inner'))
+  .map((e) => e.textContent.trim().replace(/\s+/g, '')))
 /** 侧边栏导航：链接文本带图标前缀，不能用 startsWith 匹配 */
 const nav = (label) => page.evaluate((t) => {
   const el = [...document.querySelectorAll('aside a')].find((e) => e.textContent.includes(t))
@@ -84,7 +96,7 @@ await page.goto(`${BASE}/bank`, { waitUntil: 'domcontentloaded' })
 await sleep(1200)
 const cardsAfter = await cardCount()
 check('题库隐藏废弃题', cardsAfter === cardsBefore - 1, `废弃前 ${cardsBefore} 张，废弃后 ${cardsAfter} 张`)
-await click('已废弃')
+await tab('已废弃')
 await sleep(600)
 check('已废弃 tab 显示该题', await has('恢复'))
 await page.screenshot({ path: '/tmp/solo-shots/probe-bank-discarded.png' })
@@ -92,9 +104,30 @@ await page.screenshot({ path: '/tmp/solo-shots/probe-bank-discarded.png' })
 // 5. 恢复
 await click('恢复')
 await sleep(1500)
-await click('待领取')
+await tab('待领取')
 await sleep(600)
 check('恢复后回到待领取', await has('领取并启动'))
+
+// 5b. 按状态分的 tab：点过领取但没跑的题得有地方能看到
+const labels = await tabLabels()
+check('题库有全部状态 tab', labels.length >= 8, `${labels.length} 个：${labels.join(' ')}`)
+const countResetBtns = () => page.evaluate(() =>
+  [...document.querySelectorAll('.card.card-hover')].filter((c) => c.innerText.includes('还原')).length)
+
+await tab('全部')
+await sleep(700)
+const allCards = await cardCount()
+check('全部 tab 覆盖各状态', allCards >= cardsAfter, `${allCards} 张`)
+// 跑过或动过的题才给还原按钮
+check('跑过的题卡有还原按钮', (await countResetBtns()) > 0, `${await countResetBtns()} 张卡可还原`)
+
+await tab('已领取未跑')
+await sleep(700)
+check('已领取未跑的题不再消失', (await cardCount()) > 0, `${await cardCount()} 张`)
+
+await tab('待领取')
+await sleep(700)
+check('待领取的题不给还原按钮', (await countResetBtns()) === 0)
 
 // 6. 队列管理台（走侧边栏，整页重载会等上设置页的模型探测）
 check('侧边栏有队列入口', await nav('队列'))

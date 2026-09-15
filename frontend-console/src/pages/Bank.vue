@@ -1,32 +1,42 @@
 <script setup lang="ts">
 import { NButton, NInput, useDialog, useMessage } from 'naive-ui'
-import { computed, ref } from 'vue'
+import { computed, h, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, type GateReport, type TaskBrief } from '../api'
+import { api, type GateReport, type Status, type TaskBrief } from '../api'
 import GateModal from '../components/GateModal.vue'
 import TaskCard from '../components/TaskCard.vue'
+import { RUN_END } from '../status'
 import { discardedTasks, liveTasks, refreshTasks, store } from '../store'
 
 const router = useRouter()
 const msg = useMessage()
 const dialog = useDialog()
 const q = ref('')
-const tab = ref<'available' | 'claimed' | 'all' | 'discarded'>('available')
+
+// 每个状态一个 tab：点过领取但没跑的题以前会从默认视图里消失，现在各归各位
+const TABS = [
+  { key: 'all', label: '全部', match: (s: Status) => s !== 'DISCARDED' },
+  { key: 'available', label: '待领取', match: (s: Status) => s === 'AVAILABLE' },
+  { key: 'claimed', label: '已领取未跑', match: (s: Status) => s === 'CLAIMED' },
+  { key: 'active', label: '排队/运行中', match: (s: Status) => s === 'QUEUED' || s === 'RUNNING' },
+  { key: 'ended', label: '待评审', match: (s: Status) => RUN_END.includes(s) },
+  { key: 'reviewed', label: '已评审', match: (s: Status) => s === 'REVIEWED' },
+  { key: 'delivered', label: '已上传/已完成', match: (s: Status) => s === 'UPLOADED' || s === 'DONE' },
+  { key: 'discarded', label: '已废弃', match: (s: Status) => s === 'DISCARDED' },
+] as const
+
+const tab = ref<(typeof TABS)[number]['key']>('all')
+const matcher = computed(() => TABS.find((t) => t.key === tab.value)!.match)
 
 const items = computed(() => {
-  let list = tab.value === 'discarded' ? discardedTasks.value : liveTasks.value
-  if (tab.value === 'available') list = list.filter((t) => t.status === 'AVAILABLE')
-  if (tab.value === 'claimed') list = list.filter((t) => t.status === 'CLAIMED' || t.status === 'QUEUED')
+  let list = (tab.value === 'discarded' ? discardedTasks.value : liveTasks.value).filter((t) => matcher.value(t.status))
   const k = q.value.trim().toLowerCase()
   if (k) list = list.filter((t) => `${t.task_no} ${t.question_type} ${t.languages} ${t.prompt_preview}`.toLowerCase().includes(k))
   return list
 })
-const counts = computed(() => ({
-  available: liveTasks.value.filter((t) => t.status === 'AVAILABLE').length,
-  claimed: liveTasks.value.filter((t) => t.status === 'CLAIMED' || t.status === 'QUEUED').length,
-  all: liveTasks.value.length,
-  discarded: discardedTasks.value.length,
-}))
+const counts = computed(() => Object.fromEntries(
+  TABS.map((t) => [t.key, (t.key === 'discarded' ? discardedTasks.value : liveTasks.value).filter((x) => t.match(x.status)).length]),
+) as Record<(typeof TABS)[number]['key'], number>)
 
 const gateShow = ref(false)
 const gateTask = ref<TaskBrief | null>(null)
@@ -116,9 +126,28 @@ async function claimAll() {
   })
 }
 
-const TABS = [
-  ['available', '待领取'], ['claimed', '已领取/排队'], ['all', '全部'], ['discarded', '已废弃'],
-] as const
+function resetTask(t: TaskBrief) {
+  dialog.warning({
+    title: `还原题 ${t.task_no} 到做题前`,
+    content: () => h('div', { class: 'text-xs leading-6' }, [
+      h('div', '会依次做这几件事，做完这道题回到「待领取」，可以重新跑：'),
+      h('div', { class: 'text-fg1 mt-1' }, '销毁残留容器；工作区 git clean 并回到初始快照 commit；轨迹目录归档；删除导出的轨迹副本与分析中间产物；prompt.md 里回填过的 SessionID 与 TurnID 改回占位；清空运行、分析、评审、质检记录。'),
+      h('div', { class: 'text-err mt-1' }, '工作区里未提交的改动会被清掉，轨迹会归档保留。'),
+    ]),
+    positiveText: '确认还原',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      busyId.value = t.id
+      try {
+        const r = await api.resetTask(t.id)
+        const bad = r.steps.filter((s) => !s.ok)
+        if (r.ok) msg.success(`题 ${t.task_no} 已还原到做题前`)
+        else msg.warning(`部分步骤未完成：${bad.map((s) => `${s.step}（${s.message}）`).join('；')}`)
+        await refreshTasks()
+      } catch (e: any) { msg.error(e.message) } finally { busyId.value = null }
+    },
+  })
+}
 </script>
 
 <template>
@@ -137,10 +166,11 @@ const TABS = [
     </div>
 
     <div class="flex items-center gap-2">
-      <button v-for="t in TABS" :key="t[0]"
-        class="px-3 h-9 rounded-inner text-xs transition-colors" :class="tab === t[0] ? 'bg-accent/15 text-accent' : 'text-fg1 hover:text-fg0 hover:bg-bg3/60'"
-        @click="tab = t[0]">
-        {{ t[1] }}<span class="mono text-[12px] ml-1.5 opacity-70 nums">{{ counts[t[0]] }}</span>
+      <button v-for="t in TABS" :key="t.key"
+        class="px-3 h-9 rounded-inner text-xs transition-colors"
+        :class="tab === t.key ? 'bg-accent/15 text-accent' : (counts[t.key] ? 'text-fg1 hover:text-fg0 hover:bg-bg3/60' : 'text-fg2 hover:bg-bg3/60')"
+        @click="tab = t.key">
+        {{ t.label }}<span class="mono text-[12px] ml-1.5 opacity-70 nums">{{ counts[t.key] }}</span>
       </button>
       <NInput v-model:value="q" size="small" placeholder="搜索题号 / 类型 / 语言 / 正文" clearable class="!w-72 ml-auto" />
     </div>
@@ -148,7 +178,7 @@ const TABS = [
     <div v-if="items.length" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
       <TaskCard v-for="t in items" :key="t.id" :task="t" :busy="busyId === t.id"
         @claim="claim(t)" @release="release(t)" @open="router.push(`/tasks/${t.id}`)"
-        @discard="discard(t)" @restore="restore(t)" />
+        @discard="discard(t)" @restore="restore(t)" @reset="resetTask(t)" />
     </div>
     <div v-else class="card empty">
       <template v-if="tab === 'discarded'">没有废弃的题</template>
