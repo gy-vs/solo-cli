@@ -98,7 +98,20 @@ class Scheduler:
                 await runner.finalize(tid, exit_code=code, result_event={}, manual_stop=(state == ""))
 
     async def _wait_and_finalize(self, tid: int, name: str) -> None:
-        r = await dockerx.run(["docker", "wait", name], timeout=48 * 3600)
+        """等接管的容器结束。超时一样要管：这条路径漏了超时，题会一直跑下去。"""
+        limit = max(1, settings_store.get_int("run.timeout_minutes", 120)) * 60
+        with session() as db:
+            t = db.get(Task, tid)
+            started = t.started_at if t else None
+        elapsed = (utc_now() - started).total_seconds() if started else 0.0
+        remain = max(60.0, limit - elapsed)
+        try:
+            r = await asyncio.wait_for(dockerx.run(["docker", "wait", name], timeout=limit + 300), remain)
+        except asyncio.TimeoutError:
+            log.warning("接管的容器 %s 超过 %s 分钟，停止并按超时收尾", name, limit // 60)
+            await dockerx.run(["docker", "stop", "-t", "10", name], timeout=120)
+            await runner.finalize(tid, exit_code=None, result_event={}, timed_out=True)
+            return
         try:
             code = int(r.out.strip())
         except ValueError:

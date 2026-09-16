@@ -303,7 +303,8 @@ async def finalize(task_id: int, *, exit_code: int | None, result_event: dict,
 
     verdict = {
         "process": {"exit_code": exit_code, "timed_out": timed_out, "manual_stop": manual_stop},
-        "protocol": {"subtype": subtype, "is_error": is_error, "num_turns": result_event.get("num_turns"),
+        "protocol": {"subtype": result_event.get("subtype", ""), "is_error": bool(result_event.get("is_error")),
+                     "num_turns": result_event.get("num_turns"),
                      "duration_ms": result_event.get("duration_ms"), "cost_usd": result_event.get("total_cost_usd"),
                      "usage": result_event.get("usage"), "thinking_tokens": thinking_tokens or None},
         "artifact": {"trace_found": bool(trace_file), "trace_count": trace_count,
