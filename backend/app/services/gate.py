@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import re
 from dataclasses import asdict, dataclass
 
 from app import config
 from app.models import RUNNING, Task
 from app.services import dockerx, qa_bridge, repo, settings_store
+# 快照 sha 的解析归仓库模块管，这里只是用；保留 gate.snapshot_sha 这个名字给现有调用方
+from app.services.gsb_repo import snapshot_sha  # noqa: F401
 
-_SHA_RE = re.compile(r"/commit/([0-9a-fA-F]{40})/?$")
 _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target"}
 
 
@@ -21,11 +21,6 @@ class Check:
     level: str          # ok / warn / block
     message: str
     fix: str = ""       # 可用的修复动作标识
-
-
-def snapshot_sha(env_snapshot: str) -> str:
-    m = _SHA_RE.search(env_snapshot or "")
-    return m.group(1).lower() if m else ""
 
 
 def _scan_blacklist(root: str, patterns: list[str], limit: int = 20) -> list[str]:
