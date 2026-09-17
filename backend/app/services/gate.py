@@ -1,18 +1,36 @@
-"""启动前门禁：泄漏扫描与环境校验。任一 block 级检查不通过则拒绝启动。"""
+"""启动前门禁：题面口径、仓库分支、两侧工作区与容器的校验。
+
+任一 block 级检查不通过就拒绝启动。双跑的检查项按 side 成对出现（workspace_A 与
+workspace_B 这样），因为 A 和 B 是两次完全独立的运行，一侧就绪不代表另一侧也就绪。
+
+题面口径（难度、任务类型）在这里就挡住，是因为跑完了才发现不符合平台收题范围，
+两个容器的算力就白花了。
+"""
 
 from __future__ import annotations
 
 import fnmatch
 import os
+import re
 from dataclasses import asdict, dataclass
 
 from app import config
-from app.models import RUNNING, Task
-from app.services import dockerx, qa_bridge, repo, settings_store
+from app.models import Task
+from app.services import dockerx, gsb_repo, settings_store
 # 快照 sha 的解析归仓库模块管，这里只是用；保留 gate.snapshot_sha 这个名字给现有调用方
 from app.services.gsb_repo import snapshot_sha  # noqa: F401
 
 _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target"}
+
+# 平台的选项原值。注意「0-1代码生成」「feature迭代」中间没有空格，
+# 而题块里习惯写成有空格的，所以比对前要先归一化
+QUESTION_TYPES = ("0-1代码生成", "feature迭代", "Bug修复", "代码理解",
+                  "代码重构", "工程化", "代码测试")
+# 本期只收这两档，简单与中等一律打回（平台规则 G1）
+DIFFICULTIES = ("困难", "地狱")
+REPRO_LEVELS = ("无外部依赖", "有外部依赖，未容器化", "已容器化，可一键起环境")
+
+_WS = re.compile(r"\s+")
 
 
 @dataclass
@@ -21,6 +39,21 @@ class Check:
     level: str          # ok / warn / block
     message: str
     fix: str = ""       # 可用的修复动作标识
+
+
+def normalize_choice(value: str, options: tuple[str, ...]) -> str:
+    """把题块里写的值对到平台选项上。
+
+    去掉全部空白再比对，匹配上返回平台侧的原值。匹配不上返回空串让门禁报出来，
+    不做模糊猜测——猜错了会以一个合法但错误的分类提交上去。
+    """
+    want = _WS.sub("", value or "")
+    if not want:
+        return ""
+    for o in options:
+        if _WS.sub("", o) == want:
+            return o
+    return ""
 
 
 def _scan_blacklist(root: str, patterns: list[str], limit: int = 20) -> list[str]:
@@ -39,10 +72,9 @@ def _scan_blacklist(root: str, patterns: list[str], limit: int = 20) -> list[str
 
 
 async def run_checks(task: Task) -> list[Check]:
-    paths = config.TaskPaths(task.task_no)
     checks: list[Check] = []
 
-    # 1. 配置
+    # 1. 配置与镜像
     if settings_store.is_configured("cc.api_key"):
         checks.append(Check("cc.api_key", "ok", "网关 Key 已配置"))
     else:
@@ -64,99 +96,97 @@ async def run_checks(task: Task) -> list[Check]:
         checks.append(Check("image", level, note))
         mode = await dockerx.image_label(image, "org.benzhi.claude.task-mode")
         if not mode:
-            checks.append(Check("image_label", "warn", "镜像缺少 org.benzhi.claude.task-mode 标签，可能不是本项目的 CC 任务镜像"))
+            checks.append(Check("image_label", "warn",
+                                "镜像缺少 org.benzhi.claude.task-mode 标签，可能不是本项目的 CC 任务镜像"))
     else:
         checks.append(Check("image", "block", f"本机不存在镜像 {image}，请先 docker pull 或在设置页更换"))
 
-    # 2. 容器名占用
-    state = await dockerx.container_state(paths.container_name)
-    if state:
-        checks.append(Check("container", "block", f"容器 {paths.container_name} 已存在（{state}），需先销毁", fix="remove_container"))
+    # 2. 题面必须符合平台口径，不然两个容器跑完也交不上去
+    if normalize_choice(task.difficulty, DIFFICULTIES):
+        checks.append(Check("difficulty", "ok", f"难度 {task.difficulty}"))
     else:
-        checks.append(Check("container", "ok", f"容器名 {paths.container_name} 可用"))
-
-    # 3. 工作目录与快照
-    ws = paths.workspace
-    if not ws.is_dir():
-        checks.append(Check("workspace", "block", f"工作目录不存在：{ws}（需先 clone 初始快照到该目录）"))
-    elif not (ws / ".git").exists():
-        checks.append(Check("workspace", "block", f"{ws} 不是 git 仓库，无法校验初始快照"))
+        checks.append(Check("difficulty", "block",
+                            f"难度「{task.difficulty or '空'}」不收，本期只收困难与地狱（规则 G1）"))
+    qt = normalize_choice(task.question_type, QUESTION_TYPES)
+    if qt:
+        checks.append(Check("question_type", "ok", f"任务类型 {qt}"))
     else:
-        # 一个项目里一道题一个分支，做题前必须落在自己的分支上，否则提交会写到别人头上
-        bs = await repo.branch_state(task.task_no)
-        if bs["current"] == bs["want"]:
-            checks.append(Check("branch", "ok", f"当前在题目分支 {bs['want']}"))
-        elif bs["local"] or bs["remote"]:
-            where = "游离 HEAD" if bs["detached"] else f"分支 {bs['current']}"
-            checks.append(Check("branch", "block",
-                                f"当前是{where}，这道题的分支是 {bs['want']}", fix="switch_branch"))
-        else:
-            checks.append(Check("branch", "warn",
-                                f"仓库里没有分支 {bs['want']}，将直接用当前的 {bs['current'] or '游离 HEAD'}"))
-
-        head = await dockerx.run(["git", "-C", str(ws), "rev-parse", "HEAD"], timeout=20)
-        head_sha = head.out.strip().lower()
-        want = snapshot_sha(task.env_snapshot)
-        if not want:
-            checks.append(Check("snapshot", "warn", "初始环境快照不是 40 位 SHA 的 commit 链接，无法比对 HEAD"))
-        elif head_sha == want:
-            checks.append(Check("snapshot", "ok", f"HEAD == 快照 {want[:12]}"))
-        else:
-            checks.append(Check("snapshot", "block", f"HEAD {head_sha[:12]} ≠ 快照 {want[:12]}", fix="reset_snapshot"))
-
-        st = await dockerx.run(["git", "-C", str(ws), "status", "--porcelain", "--untracked-files=all"], timeout=30)
-        dirty = [line for line in st.out.splitlines() if line.strip()]
-        if dirty:
-            checks.append(Check("clean", "block", f"工作区有 {len(dirty)} 处改动/未跟踪文件，例如 {dirty[0].strip()}", fix="reset_snapshot"))
-        else:
-            checks.append(Check("clean", "ok", "工作区干净（不含忽略文件）"))
-
-        ig = await dockerx.run(["git", "-C", str(ws), "status", "--porcelain", "--ignored=matching", "--untracked-files=no"], timeout=30)
-        ignored = [line[3:] for line in ig.out.splitlines() if line.startswith("!!")]
-        if ignored:
-            checks.append(Check("ignored", "warn", f"存在 {len(ignored)} 个被忽略的文件/目录（如 {ignored[0]}），与初始快照不完全一致；重置到快照会一并清除", fix="reset_snapshot"))
-
-        patterns = [p.strip() for p in settings_store.get("gate.blacklist").split(",") if p.strip()]
-        hits = _scan_blacklist(str(ws), patterns)
-        if hits:
-            checks.append(Check("leak", "block", f"发现可能泄漏的文件：{', '.join(hits[:5])}"))
-        else:
-            checks.append(Check("leak", "ok", "未发现黑名单文件"))
-
-    # 4. 轨迹目录必须为空
-    tr = paths.traces
-    if tr.exists() and any(tr.iterdir()):
-        checks.append(Check("traces", "block", f"轨迹目录非空：{tr}（一题只允许一份轨迹，请先归档清空）", fix="archive_traces"))
+        checks.append(Check("question_type", "block",
+                            f"任务类型「{task.question_type or '空'}」不在平台选项里，"
+                            f"可选：{'、'.join(QUESTION_TYPES)}"))
+    if normalize_choice(task.repro_level, REPRO_LEVELS):
+        checks.append(Check("repro_level", "ok", f"可复现等级 {task.repro_level}"))
     else:
-        checks.append(Check("traces", "ok", "轨迹目录为空"))
+        checks.append(Check("repro_level", "warn",
+                            f"可复现等级「{task.repro_level or '空'}」不在平台选项里，上传前需要改题块"))
 
-    # 5. 一个项目同时只允许跑一道题
-    repo_id = qa_bridge.repo_id_of(task.env_snapshot)
-    running = repo_siblings_running(task.id, repo_id)
-    if running:
-        checks.append(Check(
-            "repo_busy", "block",
-            f"项目 {repo_id} 的题 {'、'.join(running)} 正在运行，一个项目同时只跑一道；"
-            f"现在领取会留在队列里，等它跑完自动启动",
-        ))
-    elif repo_id:
-        checks.append(Check("repo_busy", "ok", f"项目 {repo_id} 现在没有别的题在跑"))
+    # 3. 仓库与分支
+    if not task.repo_url:
+        checks.append(Check("repo_url", "block", "题块里没有仓库地址（「仓库：」那一行）"))
+        return checks
+    checks.append(Check("repo_url", "ok",
+                        f"仓库 {gsb_repo.repo_slug(task.repo_url) or task.repo_url}"))
+    probe = await gsb_repo.probe_branches(task.repo_url)
+    checks.append(Check("branches", "ok" if probe.ok else "block", probe.message))
+
+    snapshot = snapshot_sha(task.env_snapshot)
+    if snapshot:
+        checks.append(Check("snapshot", "ok", f"初始快照 {snapshot[:12]}"))
+    else:
+        checks.append(Check("snapshot", "block",
+                            "初始环境快照不是 40 位 SHA 的 commit 链接，两边都没法对起跑点"))
+
+    # 4. 两侧各自的工作目录、轨迹目录、容器名
+    patterns = [p.strip() for p in settings_store.get("gate.blacklist").split(",") if p.strip()]
+    for side in config.SIDES:
+        paths = config.TaskPaths(task.task_no, side)
+        ws = paths.workspace
+        if not (ws / ".git").exists():
+            checks.append(Check(f"workspace_{side}", "block",
+                                f"{side} 侧还没 clone 到 {ws}", fix="clone_sides"))
+        else:
+            hv = await gsb_repo.verify_head(task.task_no, side, snapshot)
+            checks.append(Check(f"workspace_{side}", "ok" if hv["ok"] else "block",
+                                hv["message"], fix="" if hv["ok"] else "reset_sides"))
+            hits = _scan_blacklist(str(ws), patterns)
+            checks.append(Check(f"leak_{side}", "block" if hits else "ok",
+                                f"{side} 侧发现可能泄漏的文件：{', '.join(hits[:5])}" if hits
+                                else f"{side} 侧未发现黑名单文件"))
+
+        tr = paths.traces
+        if tr.exists() and any(tr.iterdir()):
+            checks.append(Check(f"traces_{side}", "block",
+                                f"{side} 侧轨迹目录非空：{tr}（一次跑只能有一份轨迹）",
+                                fix="archive_traces"))
+        else:
+            checks.append(Check(f"traces_{side}", "ok", f"{side} 侧轨迹目录为空"))
+
+        state = await dockerx.container_state(paths.container_name)
+        if state:
+            checks.append(Check(f"container_{side}", "block",
+                                f"容器 {paths.container_name} 已存在（{state}）",
+                                fix="remove_containers"))
+        else:
+            checks.append(Check(f"container_{side}", "ok", f"容器名 {paths.container_name} 可用"))
 
     return checks
 
 
-def repo_siblings_running(task_id: int, repo_id: str) -> list[str]:
-    """同一个项目里正在运行的其他题号。排队中的不算，它们还没占住工作区。"""
-    if not repo_id:
-        return []
-    from app.db import session as _session  # 局部导入，避免 services 与 db 的加载顺序耦合
+async def prepare_workspaces(task: Task) -> dict:
+    """领题时把 A、B 两个分支各 clone 一份。
 
-    with _session() as db:
-        rows = db.query(Task).filter(Task.status == RUNNING).all()
-        return sorted(
-            t.task_no for t in rows
-            if t.id != task_id and qa_bridge.repo_id_of(t.env_snapshot) == repo_id
-        )
+    先验分支再 clone：分支不合规时 clone 一定失败，让 git 的报错盖住「仓库分支不对」
+    这个真正的原因，只会让人去查 Token 和网络。
+    """
+    probe = await gsb_repo.probe_branches(task.repo_url)
+    if not probe.ok:
+        return {"ok": False, "sides": {}, "message": probe.message}
+    sides: dict[str, dict] = {}
+    for side in config.SIDES:
+        sides[side] = await gsb_repo.clone_side(task.task_no, task.repo_url, side)
+    ok = all(r["ok"] for r in sides.values())
+    msg = "；".join(f"{s}: {r['message']}" for s, r in sides.items())
+    return {"ok": ok, "sides": sides, "message": msg}
 
 
 def summarize(checks: list[Check]) -> dict:
@@ -167,43 +197,3 @@ def summarize(checks: list[Check]) -> dict:
         "warnings": len([c for c in checks if c.level == "warn"]),
         "checks": [asdict(c) for c in checks],
     }
-
-
-async def reset_to_snapshot(task: Task) -> dict:
-    """工作区回到初始快照的 commit。破坏性操作，由界面二次确认后调用。
-
-    题目分支上可能已经有上一轮交付的提交，reset 会把它丢掉，所以先备份成
-    refs/solo-backup/*（不出现在分支列表里，用 git log <ref> 就能找回）。
-    """
-    no = task.task_no
-    ws = config.TaskPaths(no).workspace
-    sha = snapshot_sha(task.env_snapshot)
-    if not sha:
-        return {"ok": False, "message": "初始环境快照缺少 40 位 SHA，无法重置"}
-
-    backup = await repo.backup_head(no, sha)
-    # 回到题目分支上再 reset，别把工作区留在游离 HEAD
-    sw = await repo.switch_to_task_branch(no)
-    r1 = await dockerx.run(["git", "-C", str(ws), "reset", "--hard", sha], timeout=120)
-    r2 = await dockerx.run(["git", "-C", str(ws), "clean", "-fdx"], timeout=120)
-    ok = r1.ok and r2.ok
-    where = f"分支 {sw['branch']}" if sw.get("ok") else "当前分支"
-    msg = f"已把{where}退回到 {sha[:12]}"
-    if backup:
-        msg += f"，原来的提交备份在 {backup}"
-    if not sw.get("ok") and sw.get("message"):
-        msg += f"（{sw['message']}）"
-    return {"ok": ok, "message": (r1.err or r2.err).strip()[:300] or msg}
-
-
-def archive_traces(task_no: str, round_no: int = 1) -> dict:
-    """把非空轨迹目录整体改名归档（带时间戳），腾出空目录。"""
-    from datetime import datetime
-
-    tr = config.TaskPaths(task_no, round_no).traces
-    if not tr.exists() or not any(tr.iterdir()):
-        return {"ok": True, "message": "轨迹目录本就为空"}
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    target = tr.with_name(f"{tr.name}.archived-{stamp}")
-    tr.rename(target)
-    return {"ok": True, "message": f"已归档到 {target}"}
