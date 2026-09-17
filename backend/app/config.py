@@ -32,8 +32,9 @@ SEED_ENV = {
     "cursor.api_key": _env("CURSOR_API_KEY"),
     "cursor.model": _env("CURSOR_MODEL"),
     "cc.api_key": _env("CC_API_KEY"),
-    "qa.session_cookie": _env("QA_SESSION_COOKIE"),
-    "qa.csrf_token": _env("QA_CSRF_TOKEN"),
+    # 环境变量名沿用 QA_*：已部署的 .env 不用跟着改，只是落库的键换到 gsb.* 下
+    "gsb.session_cookie": _env("QA_SESSION_COOKIE"),
+    "gsb.csrf_token": _env("QA_CSRF_TOKEN"),
     "qc.project_host": _env("QA_PROJECT_HOST"),
     "gh.token": _env("GH_TOKEN"),
 }
@@ -55,35 +56,31 @@ CONTAINER_NAME_PREFIX = "solo-cc-"
 CONTAINER_LABEL = "solo-cli.task"
 
 
-class TaskPaths:
-    """一道题涉及的全部目录，同时给出宿主路径与挂载路径。
+SIDES = ("A", "B")
 
-    round_no 是续跑轮次。镜像不接受 --resume，也拒绝复用容器、要求挂进去的轨迹
-    目录必须是空的，所以第 2 轮起必须换一个容器名和一个干净的轨迹目录；后缀取
-    平级的 `-r{n}` 而不是子目录，否则第 1 轮的 rglob 会把后面几轮的 jsonl 一起扫出来。
-    workspace 不带后缀：续跑的前提正是接着上一轮改过的代码往下做。
+
+class TaskPaths:
+    """一道题某一侧（A 或 B）涉及的全部目录，同时给出宿主路径与挂载路径。
+
+    A 和 B 是同一道题在同一个起点上的两次独立运行，代码、轨迹、容器全部分开，
+    只有分析目录共用一个——GSB 对比要同时看两边，放一起省得来回跳。
     """
 
-    def __init__(self, task_no: str, round_no: int = 1):
+    def __init__(self, task_no: str, side: str = "A"):
+        side = (side or "").upper()
+        if side not in SIDES:
+            raise ValueError(f"side 必须是 A 或 B，收到 {side!r}")
         self.task_no = task_no
-        self.round_no = max(1, int(round_no or 1))
-
-    @property
-    def round_suffix(self) -> str:
-        return "" if self.round_no <= 1 else f"-r{self.round_no}"
-
-    @property
-    def slug(self) -> str:
-        return f"{self.task_no}{self.round_suffix}"
+        self.side = side
 
     # ---- 后端可读写的路径 ----
     @property
     def workspace(self) -> Path:
-        return CODER_ROOT_MOUNT / WORKSPACE_DIR / self.task_no
+        return CODER_ROOT_MOUNT / WORKSPACE_DIR / self.task_no / self.side
 
     @property
     def traces(self) -> Path:
-        return CODER_ROOT_MOUNT / TRACES_DIR / self.slug
+        return CODER_ROOT_MOUNT / TRACES_DIR / self.task_no / self.side
 
     @property
     def analysis(self) -> Path:
@@ -91,15 +88,15 @@ class TaskPaths:
 
     @property
     def analysis_repo(self) -> Path:
-        return self.analysis / "repo"
+        return self.analysis / f"repo-{self.side}"
+
+    @property
+    def trace_index(self) -> Path:
+        return self.analysis / f"trace_index_{self.side}.json"
 
     @property
     def export(self) -> Path:
-        return EXPORT_DIR / self.slug
-
-    @property
-    def export_host(self) -> str:
-        return f"{DATA_DIR_HOST}/exports/{self.slug}"
+        return EXPORT_DIR / self.task_no / self.side
 
     @property
     def prompt_archive(self) -> Path:
@@ -108,15 +105,15 @@ class TaskPaths:
     # ---- 传给 docker -v 的宿主路径 ----
     @property
     def workspace_host(self) -> str:
-        return f"{CODER_ROOT_HOST}/{WORKSPACE_DIR}/{self.task_no}"
+        return f"{CODER_ROOT_HOST}/{WORKSPACE_DIR}/{self.task_no}/{self.side}"
 
     @property
     def traces_host(self) -> str:
-        return f"{CODER_ROOT_HOST}/{TRACES_DIR}/{self.slug}"
+        return f"{CODER_ROOT_HOST}/{TRACES_DIR}/{self.task_no}/{self.side}"
 
     @property
     def container_name(self) -> str:
-        return f"{CONTAINER_NAME_PREFIX}{self.slug}"
+        return f"{CONTAINER_NAME_PREFIX}{self.task_no}-{self.side}"
 
 
 def prompt_file() -> Path:
