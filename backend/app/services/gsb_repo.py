@@ -4,7 +4,8 @@
 A 和 B 各自 clone 到 workspace/<题号>/<side>，跑完各自提交到自己的分支。
 平台要求两份产物快照的父提交都是初始环境快照，所以 push 之前会先校验 HEAD^。
 
-GitHub Token 只在拼 URL 时进内存，不写进 .git/config，也不进日志。
+GitHub Token 只在拼命令的那一刻进内存：一次性命令（ls-remote）拼进 URL，
+会落盘的命令（clone）走临时 credential helper，不写进 .git/config，也不进日志和报错。
 """
 
 from __future__ import annotations
@@ -66,6 +67,21 @@ def authed_url(repo_url: str, token: str) -> str:
     return url.replace("https://", f"https://x-access-token:{token}@", 1)
 
 
+def credential_args(repo_url: str) -> list[str]:
+    """给 git 命令拼临时凭据参数。
+
+    token 走 -c credential.helper 传，不进 .git/config，也就不需要事后 set-url 擦除——
+    先写进去再擦掉的做法中间有个窗口，进程在那一刻被杀 token 就永久留在仓库里了。
+    """
+    token = _token()
+    if not token or not (repo_url or "").strip().startswith("https://github.com/"):
+        return []
+    # helper 的值由 git 自己起 shell 执行；我们这边用 create_subprocess_exec 不经 shell，
+    # 所以这里不做额外转义，否则转义字符会原样传给 git 反而把命令弄坏
+    helper = f"!f() {{ echo username=x-access-token; echo password={token}; }}; f"
+    return ["-c", f"credential.helper={helper}"]
+
+
 def _token() -> str:
     return settings_store.get("gh.token")
 
@@ -120,19 +136,26 @@ async def clone_side(task_no: str, repo_url: str, side: str) -> dict:
         origin = (await _git(ws, "remote", "get-url", "origin", timeout=30)).out.strip()
         if cur == side and repo_slug(origin) == repo_slug(repo_url):
             return {"ok": True, "reused": True, "message": f"复用已有的 {side} 目录"}
+        # 只回显 org/repo，不回显原始地址：config 若曾被带 token 的地址污染过，
+        # 原样拼进 message 就把 token 送到调用方和前端了
         return {"ok": False, "reused": False,
-                "message": f"{ws} 已存在但对不上（分支 {cur or '游离'}，远端 {origin or '无'}），先清掉再领取"}
+                "message": f"{ws} 已存在但对不上（分支 {cur or '游离'}，"
+                           f"远端 {repo_slug(origin) or '无法识别'}），先清掉再领取"}
+    if ws.exists() and any(ws.iterdir()):
+        # 有东西但不是 git 仓库（多半是上次 clone 被打断的残留）。git 会因为目标非空拒绝 clone，
+        # 这跟分支、Token 都没关系，提前判掉免得报错把人往错误方向引
+        return {"ok": False, "reused": False,
+                "message": f"{ws} 已存在且非空，但不是 git 仓库，先清掉这个目录再领取"}
     ws.parent.mkdir(parents=True, exist_ok=True)
     # --single-branch：这一侧只关心自己的分支，A 目录里不该看得到 B 的提交
+    # URL 用干净地址，凭据走临时 helper，clone 落盘的 origin 从头就不带 token
     r = await dockerx.run(
-        ["git", "clone", "--branch", side, "--single-branch",
-         authed_url(repo_url, _token()), str(ws)], timeout=600,
+        ["git", *credential_args(repo_url), "clone", "--branch", side, "--single-branch",
+         repo_url, str(ws)], timeout=600,
     )
     if not r.ok:
-        # stderr 里可能带着拼进 URL 的 token，不能原样返回
+        # stderr 里可能带着 git 回显的凭据信息，不能原样返回
         return {"ok": False, "reused": False, "message": f"clone {side} 分支失败，检查分支是否存在与 Token 权限"}
-    # token 不留在 .git/config 里，push 的时候现拼
-    await _git(ws, "remote", "set-url", "origin", repo_url, timeout=30)
     return {"ok": True, "reused": False, "message": f"已 clone {side} 分支到 {ws.name}"}
 
 

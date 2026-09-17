@@ -1,6 +1,6 @@
 """gsb_repo 前半部分：地址解析、远端分支探测、双分支 clone、做题前状态校验。
 
-远端用本地裸仓库模拟，不联网；token 相关只验证纯函数行为。
+远端用本地裸仓库模拟，不联网；token 相关验证纯函数行为，以及 config / 报错里不留痕迹。
 """
 
 import asyncio
@@ -72,6 +72,21 @@ def test_authed_url_injects_token():
     assert gsb_repo.authed_url("/tmp/origin.git", "tok") == "/tmp/origin.git"
 
 
+def test_credential_args_only_for_github_https_with_token(monkeypatch):
+    monkeypatch.setattr(gsb_repo, "_token", lambda: "ghp_FAKE_TOKEN_123")
+    args = gsb_repo.credential_args("https://github.com/acme/widget")
+    assert len(args) == 2
+    assert args[0] == "-c"
+    assert args[1].startswith("credential.helper=")
+    assert "ghp_FAKE_TOKEN_123" in args[1]
+    assert "x-access-token" in args[1]
+    # 本地路径 / ssh 地址不走 https 凭据，helper 传进去只会让 git 报警
+    assert gsb_repo.credential_args("/tmp/origin.git") == []
+    assert gsb_repo.credential_args("git@github.com:acme/widget.git") == []
+    monkeypatch.setattr(gsb_repo, "_token", lambda: "")
+    assert gsb_repo.credential_args("https://github.com/acme/widget") == []
+
+
 def test_probe_branches_accepts_exactly_three(origin):
     probe = asyncio.run(gsb_repo.probe_branches(origin["url"]))
     assert probe.ok is True
@@ -112,6 +127,42 @@ def test_clone_side_reuses_existing_clean_clone(origin):
     again = asyncio.run(gsb_repo.clone_side("07", origin["url"], "A"))
     assert again["ok"] is True
     assert again["reused"] is True
+
+
+def test_clone_side_never_writes_token_into_git_config(origin, monkeypatch):
+    fake = "ghp_FAKE_TOKEN_123"
+    monkeypatch.setattr(gsb_repo, "_token", lambda: fake)
+    r = asyncio.run(gsb_repo.clone_side("07", origin["url"], "A"))
+    assert r["ok"] is True, r["message"]
+    ws = config.TaskPaths("07", "A").workspace
+    cfg = (ws / ".git" / "config").read_text(encoding="utf-8")
+    # 本地路径下 credential_args 返回空列表，这里守住的是「clone 之后 config 里没有任何凭据痕迹」
+    assert fake not in cfg
+    assert "x-access-token" not in cfg
+
+
+def test_clone_side_mismatch_message_hides_origin_url(origin):
+    fake = "ghp_FAKE_TOKEN_123"
+    asyncio.run(gsb_repo.clone_side("07", origin["url"], "A"))
+    ws = config.TaskPaths("07", "A").workspace
+    # 模拟被历史操作污染过的 config：origin 带着 token
+    _git(ws, "remote", "set-url", "origin",
+         f"https://x-access-token:{fake}@github.com/acme/widget.git")
+    r = asyncio.run(gsb_repo.clone_side("07", origin["url"], "A"))
+    assert r["ok"] is False
+    assert fake not in r["message"]
+    assert "x-access-token" not in r["message"]
+    assert "acme/widget" in r["message"]
+
+
+def test_clone_side_reports_nonempty_dir_without_git(origin):
+    ws = config.TaskPaths("07", "A").workspace
+    ws.mkdir(parents=True)
+    (ws / "leftover.txt").write_text("x", encoding="utf-8")
+    r = asyncio.run(gsb_repo.clone_side("07", origin["url"], "A"))
+    assert r["ok"] is False
+    assert str(ws) in r["message"]
+    assert "Token" not in r["message"]
 
 
 def test_verify_head_matches_snapshot(origin):
