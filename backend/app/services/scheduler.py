@@ -1,4 +1,8 @@
-"""并发调度：槽位、队列、启动时接管残留容器。"""
+"""并发调度：槽位按容器算，A/B 成对出闸，启动时接管残留容器。
+
+额度的单位是容器而不是题：一道题要占两个容器，按题算额度会让实际并发翻倍，
+机器上一下起八个容器直接把内存吃满。
+"""
 
 from __future__ import annotations
 
@@ -9,15 +13,17 @@ from sqlalchemy import select
 
 from app.db import session
 from app.events import bus
-from app.models import INTERRUPTED, QUEUED, RUNNING, Task, as_utc, utc_now
-from app.services import dockerx, qa_bridge, runner, settings_store
+from app.models import (
+    QUEUED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING, RUNNING, Task, TaskRun, as_utc, utc_now,
+)
+from app.services import dockerx, runner, settings_store
 
 log = logging.getLogger("scheduler")
 
 
 class Scheduler:
     def __init__(self) -> None:
-        self.running: dict[int, asyncio.Task] = {}
+        self.running: dict[int, asyncio.Task] = {}   # run_id -> 协程
         self._loop_task: asyncio.Task | None = None
         self._stopping = False
         self._readopted: set[int] = set()  # 因 runner 异常重新接管过的，不再重复接管
@@ -33,12 +39,12 @@ class Scheduler:
     def snapshot(self) -> dict:
         with session() as db:
             queued = db.execute(
-                select(Task.id).where(Task.status == QUEUED)
+                select(TaskRun.id).join(Task, Task.id == TaskRun.task_id)
+                .where(Task.status == QUEUED, TaskRun.status.in_((RUN_QUEUED, "PENDING")))
             ).scalars().all()
-        waiting = self.waiting_on_repo()
         return {"running": len(self.running), "max_parallel": self.max_parallel,
                 "running_ids": sorted(self.running), "queued": len(queued),
-                "paused": self.paused, "repo_waiting": waiting}
+                "paused": self.paused}
 
     async def start(self) -> None:
         await self._adopt()
@@ -58,108 +64,119 @@ class Scheduler:
             await asyncio.sleep(2)
 
     async def _tick(self) -> None:
-        for tid, fut in list(self.running.items()):
+        for rid, fut in list(self.running.items()):
             if fut.done():
-                self.running.pop(tid, None)
+                self.running.pop(rid, None)
                 if fut.exception():
-                    log.error("run_task(%s) 异常: %s", tid, fut.exception())
-                    await self._after_crash(tid, fut.exception())
-                    bus.publish("tasks", {"type": "task", "id": tid})
+                    log.error("run_side(%s) 异常: %s", rid, fut.exception())
+                    await self._after_crash(rid, fut.exception())
         if self.paused:
             return
         free = self.max_parallel - len(self.running)
         if free <= 0:
             return
-        for tid in self._pick(free):
-            self._readopted.discard(tid)
-            self.running[tid] = asyncio.create_task(runner.run_task(tid), name=f"run-{tid}")
+        picked = self.pick(free)
+        if not picked:
+            return
+        self._mark_running(picked)
+        for rid in picked:
+            self._readopted.discard(rid)
+            self.running[rid] = asyncio.create_task(runner.run_side(rid), name=f"run-{rid}")
 
-    async def _after_crash(self, tid: int, exc: BaseException | None) -> None:
-        """runner 协程自己炸了，这时候还不能判定这道题结束了。
+    async def _after_crash(self, run_id: int, exc: BaseException | None) -> None:
+        """runner 协程自己炸了，这时候还不能判定这一侧结束了。
 
         容器很可能还在跑。直接标 INTERRUPTED 会留下「状态说结束了、容器还在干活」
         的孤儿：槽位被放开，调度器接着起新题，实际并发就超了额度。所以先看容器，
         还活着就重新接管，只有确认容器没了才收尾。
         """
         with session() as db:
-            t = db.get(Task, tid)
-            if t is None or t.status != RUNNING:
+            run = db.get(TaskRun, run_id)
+            if run is None or run.status != RUN_RUNNING:
                 return
-            name = t.container_name
-        if tid not in self._readopted and await dockerx.container_state(name) == "running":
-            log.warning("题 %s 的 runner 异常但容器 %s 还在跑，重新接管", tid, name)
-            self._readopted.add(tid)
-            self.running[tid] = asyncio.create_task(self._wait_and_finalize(tid, name))
+            name, task_id = run.container_name, run.task_id
+        if run_id not in self._readopted and await dockerx.container_state(name) == "running":
+            log.warning("run %s 的 runner 异常但容器 %s 还在跑，重新接管", run_id, name)
+            self._readopted.add(run_id)
+            self.running[run_id] = asyncio.create_task(self._wait_and_finalize(run_id, name))
             return
         with session() as db:
-            t = db.get(Task, tid)
-            if t and t.status == RUNNING:
-                t.status = INTERRUPTED
-                t.finished_at = utc_now()
-                t.error = f"runner 异常: {exc}"
+            run = db.get(TaskRun, run_id)
+            if run and run.status == RUN_RUNNING:
+                run.status = RUN_INTERRUPTED
+                run.finished_at = utc_now()
+                run.error = f"runner 异常: {exc}"
+        bus.publish("tasks", {"type": "task", "id": task_id})
 
-    def _pick(self, free: int) -> list[int]:
-        """挑出这轮可以启动的题：一个项目同时只跑一道，被占住的留在队列里等。"""
+    def pick(self, free: int) -> list[int]:
+        """挑这轮可以启动的 run。同一道题的两侧必须一起出闸。
+
+        A 和 B 是同一道题在同一起点上的两次独立运行，对比的前提是环境尽量一致。
+        一侧先跑、另一侧排在半小时后，机器负载和网关状况都变了，跑出来的差异说不清
+        是模型的还是环境的。槽位不够两个就整道题继续等。
+        """
         with session() as db:
-            busy_repos = {
-                qa_bridge.repo_id_of(t.env_snapshot)
-                for t in db.execute(select(Task).where(Task.status == RUNNING)).scalars()
-            }
-            busy_repos.discard("")
             # priority 小的先跑，同优先级按领取时间；调队列顺序改的就是 priority
-            queued = db.execute(
+            tasks = db.execute(
                 select(Task).where(Task.status == QUEUED)
                 .order_by(Task.priority, Task.claimed_at, Task.id)
             ).scalars().all()
             picked: list[int] = []
-            for t in queued:
-                rid = qa_bridge.repo_id_of(t.env_snapshot)
-                if rid and rid in busy_repos:
-                    continue
-                if rid:
-                    busy_repos.add(rid)
-                picked.append(t.id)
-                if len(picked) >= free:
+            for t in tasks:
+                if free - len(picked) < 2:
                     break
+                runs = db.execute(select(TaskRun).where(TaskRun.task_id == t.id)
+                                  .order_by(TaskRun.side)).scalars().all()
+                # 两侧齐备、且都还没动过，才算这道题可以起
+                if len(runs) != 2 or any(r.status not in (RUN_QUEUED, "PENDING") for r in runs):
+                    continue
+                picked.extend(r.id for r in runs)
             return picked
 
-    def waiting_on_repo(self) -> list[dict]:
-        """排在队列里但因为同项目有题在跑而起不来的，界面要能解释清楚。"""
+    def _mark_running(self, run_ids: list[int]) -> None:
+        """出闸前先占住状态。
+
+        runner 自己也会把 run 标成 RUNNING，但那是在起容器之后。中间这一小段里
+        pick 会把同一批 run 再挑一遍，于是同一侧被起两次、容器名冲突。
+        """
         with session() as db:
-            running = {}
-            for t in db.execute(select(Task).where(Task.status == RUNNING)).scalars():
-                rid = qa_bridge.repo_id_of(t.env_snapshot)
-                if rid:
-                    running.setdefault(rid, t.task_no)
-            out = []
-            for t in db.execute(select(Task).where(Task.status == QUEUED)
-                                .order_by(Task.priority, Task.claimed_at, Task.id)).scalars():
-                rid = qa_bridge.repo_id_of(t.env_snapshot)
-                if rid in running:
-                    out.append({"id": t.id, "task_no": t.task_no, "repo_id": rid,
-                                "blocked_by": running[rid]})
-            return out
+            for rid in run_ids:
+                run = db.get(TaskRun, rid)
+                if run is None:
+                    continue
+                run.status = RUN_RUNNING
+                task = db.get(Task, run.task_id)
+                if task is not None and task.status == QUEUED:
+                    task.status = RUNNING
+        for tid in {t for t in self._task_ids(run_ids)}:
+            bus.publish("tasks", {"type": "task", "id": tid})
+
+    def _task_ids(self, run_ids: list[int]) -> list[int]:
+        with session() as db:
+            return [r.task_id for r in
+                    db.execute(select(TaskRun).where(TaskRun.id.in_(run_ids))).scalars()]
 
     async def _adopt(self) -> None:
-        """进程重启后：状态为 RUNNING 的任务，按容器实际状态收尾。"""
+        """进程重启后：状态为 RUNNING 的 run，按容器实际状态收尾。"""
         with session() as db:
-            stale = db.execute(select(Task).where(Task.status == RUNNING)).scalars().all()
-            items = [(t.id, t.container_name) for t in stale]
-        for tid, name in items:
+            stale = db.execute(select(TaskRun).where(TaskRun.status == RUN_RUNNING)).scalars().all()
+            items = [(r.id, r.container_name) for r in stale]
+        for rid, name in items:
             state = await dockerx.container_state(name)
             if state == "running":
                 log.info("接管运行中的容器 %s", name)
-                self.running[tid] = asyncio.create_task(self._wait_and_finalize(tid, name))
+                self.running[rid] = asyncio.create_task(self._wait_and_finalize(rid, name))
             else:
                 code = await dockerx.container_exit_code(name) if state else None
-                await runner.finalize(tid, exit_code=code, result_event={}, manual_stop=(state == ""))
+                await runner.finalize(rid, exit_code=code, result_event={},
+                                      manual_stop=(state == ""))
 
-    async def _wait_and_finalize(self, tid: int, name: str) -> None:
-        """等接管的容器结束。超时一样要管：这条路径漏了超时，题会一直跑下去。"""
+    async def _wait_and_finalize(self, run_id: int, name: str) -> None:
+        """等接管的容器结束。超时一样要管：这条路径漏了超时，这一侧会一直跑下去。"""
         limit = max(1, settings_store.get_int("run.timeout_minutes", 120)) * 60
         with session() as db:
-            t = db.get(Task, tid)
-            started = as_utc(t.started_at) if t else None
+            run = db.get(TaskRun, run_id)
+            started = as_utc(run.started_at) if run else None
         elapsed = (utc_now() - started).total_seconds() if started else 0.0
         remain = max(60.0, limit - elapsed)
         try:
@@ -167,13 +184,13 @@ class Scheduler:
         except asyncio.TimeoutError:
             log.warning("接管的容器 %s 超过 %s 分钟，停止并按超时收尾", name, limit // 60)
             await dockerx.run(["docker", "stop", "-t", "10", name], timeout=120)
-            await runner.finalize(tid, exit_code=None, result_event={}, timed_out=True)
+            await runner.finalize(run_id, exit_code=None, result_event={}, timed_out=True)
             return
         try:
             code = int(r.out.strip())
         except ValueError:
             code = None
-        await runner.finalize(tid, exit_code=code, result_event={})
+        await runner.finalize(run_id, exit_code=code, result_event={})
 
 
 scheduler = Scheduler()
