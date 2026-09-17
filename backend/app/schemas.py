@@ -7,20 +7,36 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.models import CONTINUABLE, Task
-from app.services import qa_bridge
+from app.models import Task, TaskRun
+from app.services import gsb_repo
 
 
 class SettingsUpdate(BaseModel):
     values: dict[str, str]
 
 
-class ReviewUpdate(BaseModel):
-    scores: dict[str, int | None] = Field(default_factory=dict)
-    descs: dict[str, str] = Field(default_factory=dict)
-    other_issues: str = ""
-    evidence: dict[str, list[dict[str, Any]]] | None = None
-    coverage: list[dict[str, Any]] | None = None
+class GsbUpdate(BaseModel):
+    """人工修改 GSB 结论。字段与分析产出一致，逐个可改。"""
+
+    verdict: str = ""
+    reason: str = ""
+    a_startup: dict[str, Any] | None = None
+    b_startup: dict[str, Any] | None = None
+    validity: str = ""
+    remark: str = ""
+
+
+class ScreencastUpdate(BaseModel):
+    """两侧录屏链接。只传一侧就只改一侧。"""
+
+    A: str | None = None
+    B: str | None = None
+
+
+class RerunRequest(BaseModel):
+    """重跑哪几侧。留空表示两侧都重跑。"""
+
+    sides: list[str] = Field(default_factory=list)
 
 
 class IdList(BaseModel):
@@ -39,12 +55,6 @@ class QueueMove(BaseModel):
     priority: int | None = None
 
 
-class ContinueRun(BaseModel):
-    """续跑指令。留空表示「就按原需求继续」。"""
-
-    prompt: str = ""
-
-
 def _iso(dt) -> str | None:  # noqa: ANN001
     """SQLite 不保存时区，统一按 UTC 补 Z，前端再转本地时间。"""
     if not dt:
@@ -54,8 +64,46 @@ def _iso(dt) -> str | None:  # noqa: ANN001
     return dt.isoformat()
 
 
-def task_brief(t: Task) -> dict:
-    v = t.verdict or {}
+def run_brief(r: TaskRun) -> dict:
+    v = r.verdict or {}
+    return {
+        "id": r.id,
+        "side": r.side,
+        "status": r.status,
+        "attempt": r.attempt,
+        "container_name": r.container_name,
+        "container_exists": r.container_exists,
+        "image_tag": r.image_tag,
+        "exit_code": r.exit_code,
+        "session_id": r.session_id,
+        "turn_id": r.turn_id,
+        "trace_file": r.trace_file,
+        "artifact_sha": r.artifact_sha,
+        "artifact_url": r.artifact_url,
+        "protocol": v.get("protocol") or {},
+        "artifact": v.get("artifact") or {},
+        "gateway_errors": (v.get("process") or {}).get("gateway_errors") or [],
+        "notes": v.get("notes") or [],
+        "abnormal": r.abnormal,
+        "error": r.error,
+        "started_at": _iso(r.started_at),
+        "finished_at": _iso(r.finished_at),
+    }
+
+
+def run_detail(r: TaskRun) -> dict:
+    d = run_brief(r)
+    d.update({
+        "result": r.result,
+        "verdict": r.verdict,
+        "trace_summary": r.trace_summary,
+        "git_diff_stat": r.git_diff_stat,
+    })
+    return d
+
+
+def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
+    gsb = t.gsb or {}
     return {
         "id": t.id,
         "task_no": t.task_no,
@@ -69,39 +117,19 @@ def task_brief(t: Task) -> dict:
         "os_platform": t.os_platform,
         "repro_level": t.repro_level,
         "env_snapshot": t.env_snapshot,
-        "repo_id": qa_bridge.repo_id_of(t.env_snapshot),
+        "repo_url": t.repo_url,
+        "repo_slug": gsb_repo.repo_slug(t.repo_url),
+        "branch_check": t.branch_check,
         "prompt_preview": (t.user_prompt or "")[:220],
         "prompt_chars": len(t.user_prompt or ""),
-        "session_id": t.session_id,
-        "turn_id": t.turn_id,
-        "container_name": t.container_name,
-        "container_exists": t.container_exists,
-        "image_tag": t.image_tag,
-        "exit_code": t.exit_code,
-        "round_no": max(1, t.round_no or 1),
-        "rounds": t.rounds,
-        "can_continue": t.status in CONTINUABLE,
         "meta": t.meta,
-        "verdict_notes": v.get("notes") or [],
-        "protocol": v.get("protocol") or {},
-        "artifact": v.get("artifact") or {},
+        "gsb_verdict": gsb.get("verdict", ""),
+        "gsb_reason_chars": len(gsb.get("reason") or ""),
+        "screencast": t.screencast,
         "verify_overall": (t.verify or {}).get("overall"),
+        "verify_blocked": (t.verify or {}).get("blocked") or 0,
         "upload_ok": (t.upload or {}).get("ok"),
         "submission_id": (t.upload or {}).get("submission_id"),
-        "error": t.error,
-        "created_at": _iso(t.created_at),
-        "claimed_at": _iso(t.claimed_at),
-        "started_at": _iso(t.started_at),
-        "finished_at": _iso(t.finished_at),
-        "uploaded_at": _iso(t.uploaded_at),
-        "done_at": _iso(t.done_at),
-        "discarded_at": _iso(t.discarded_at),
-        "discarded_from": t.discarded_from,
-        "qc_status": t.qc_status,
-        "qc_conclusion": (t.qc or {}).get("conclusion") or "",
-        "qc_summary": (t.qc or {}).get("summary") or (t.qc or {}).get("error") or "",
-        "qc_failed_count": len((t.qc or {}).get("failed_checks") or []),
-        "qc_at": _iso(t.qc_at),
         "priority": t.priority,
         "origin": t.origin,
         "design_run_id": t.design_run_id,
@@ -109,24 +137,27 @@ def task_brief(t: Task) -> dict:
         "auto_error": t.auto_error,
         "dedup_verdict": (t.dedup or {}).get("verdict") or "",
         "dedup_reason": (t.dedup or {}).get("reason") or (t.dedup or {}).get("error") or "",
+        "created_at": _iso(t.created_at),
+        "claimed_at": _iso(t.claimed_at),
+        "finished_at": _iso(t.finished_at),
+        "uploaded_at": _iso(t.uploaded_at),
+        "done_at": _iso(t.done_at),
+        "discarded_at": _iso(t.discarded_at),
+        "discarded_from": t.discarded_from,
+        "runs": [run_brief(r) for r in sorted(runs or [], key=lambda x: x.side)],
     }
 
 
-def task_detail(t: Task) -> dict:
-    d = task_brief(t)
+def task_detail(t: Task, runs: list[TaskRun] | None = None) -> dict:
+    d = task_brief(t, runs)
     d.update({
         "user_prompt": t.user_prompt,
-        "result": t.result,
-        "verdict": t.verdict,
-        "trace_summary": t.trace_summary,
-        "trace_file": t.trace_file,
-        "git_diff_stat": t.git_diff_stat,
+        "gsb": t.gsb,
         "analysis": t.analysis,
-        "review": t.review,
         "verify": t.verify,
         "upload": t.upload,
-        "qc": t.qc,
         "dedup": t.dedup,
+        "runs": [run_detail(r) for r in sorted(runs or [], key=lambda x: x.side)],
     })
     return d
 

@@ -122,7 +122,7 @@ async def requeue_run(run_id: int, *, reason: str, reset_attempt: bool = False) 
         task_id, task_no, side = task.id, task.task_no, run.side
         snapshot, name = gsb_repo.snapshot_sha(task.env_snapshot), run.container_name
 
-    await dockerx.remove_container(name, force=True)
+    await dockerx.remove_container(name)
     arch = await asyncio.to_thread(archive_traces, task_no, side)
     if not arch["ok"]:
         return {"ok": False, "message": f"归档 {side} 侧轨迹失败：{arch['message']}"}
@@ -192,7 +192,7 @@ async def _destroy_containers(task_no: str, runs: list[TaskRun]) -> None:
     """轨迹已经导出到宿主机就销毁容器；没导出成功的留着，让人工进去捞。"""
     for run in runs:
         if run.trace_file:
-            await dockerx.remove_container(run.container_name, force=True)
+            await dockerx.remove_container(run.container_name)
 
 
 async def push_artifacts(task_id: int) -> dict:

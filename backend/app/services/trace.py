@@ -92,9 +92,14 @@ def parse_trace(path: Path) -> dict:
     session_id = ""
     prompt_id = ""
     first_user_text = ""
+    prompt_text = ""
     steps: list[dict] = []
     by_tool_use: dict[str, dict] = {}
+    # human_turns 是真人真正说话的轮数。平台要求恰好一轮（规则 T5）：多一轮说明
+    # 中途人工介入指导过，这次跑就不能代表模型自己的水平。type=user 的行里绝大多数
+    # 是工具返回，必须把它们排除掉才数得准。
     counts = {"user": 0, "assistant": 0, "tool_calls": 0, "tool_errors": 0, "lines": 0}
+    human_turns = 0
     first_ts = last_ts = ""
     last_assistant_text = ""
     stop_reason = ""
@@ -140,9 +145,16 @@ def parse_trace(path: Path) -> dict:
                                 step["is_error"] = bool(b.get("is_error"))
                                 if step["is_error"]:
                                     counts["tool_errors"] += 1
-                elif not obj.get("isSidechain") and not prompt_id and obj.get("promptId"):
-                    prompt_id = str(obj["promptId"])
-                    first_user_text = _text_of(content, 200)
+                elif not obj.get("isSidechain"):
+                    # 子会话（isSidechain）里的 user 行是 Task 工具派出去的子代理在自问自答，
+                    # 不是真人；算进去的话用了 Task 工具的题全都会被判成多轮人工介入
+                    human_turns += 1
+                    if not prompt_id and obj.get("promptId"):
+                        prompt_id = str(obj["promptId"])
+                    if not first_user_text:
+                        first_user_text = _text_of(content, 200)
+                    if not prompt_text:
+                        prompt_text = _text_of(content, 100000)
             elif typ == "assistant":
                 counts["assistant"] += 1
                 model = msg.get("model") or model
@@ -191,6 +203,9 @@ def parse_trace(path: Path) -> dict:
         "session_id": session_id,
         "prompt_id": prompt_id,
         "first_user_text": first_user_text,
+        # 完整的题面，核验要拿它和题块比对（规则 G4）
+        "prompt": prompt_text,
+        "human_turns": human_turns,
         "model": model,
         "harness_version": harness_version,
         "cwd": cwd,

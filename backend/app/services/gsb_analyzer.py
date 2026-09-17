@@ -39,19 +39,25 @@ SANDBOX_SKIP = ("node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
 VERDICT_LABEL = {"A": "A 更好", "B": "B 更好", "Same": "Same"}
 VERDICTS = tuple(VERDICT_LABEL)
 
-WRITING_RULES = """
+# 一眼就是机器写的词。既写进 prompt 让模型别用，也给核验模块拿去查——
+# 两处必须是同一份表，否则会出现「prompt 里没禁、核验却拦」的死循环。
+BANNED_WORDS = (
+    "首先", "其次", "最后", "综上", "总的来说", "总之", "值得注意的是", "此外", "另外",
+    "不仅", "而且", "显然", "令人", "堪称", "优雅", "精妙", "丝滑", "赋能", "闭环",
+    "亮点", "整体而言", "可以看出", "由此可见", "体现了", "展现了", "表现出色",
+    "表现良好", "表现一般", "基本可用", "效果不错", "非常", "极其", "十分", "相当",
+)
+
+WRITING_RULES = f"""
 理由的写法（reason 与 findings 里的每一条都必须遵守）：
 1. 用第一人称「我」，像我自己看完两份轨迹和两份产物之后随手记下来的口语，不要书面腔。
 2. 只写看到的现象和位置，位置一律用文件名、函数名、方法名、命令、报错原文来指，例如
-   「A 侧 lib/dumper.js 的 writeNode 返回了 { text, tag }，B 侧还是只返回字符串」。
+   「A 侧 lib/dumper.js 的 writeNode 返回了对象，B 侧还是只返回字符串」。
    禁止写「第 38 步」「第 19、20 步」「步骤 12」这类步数说法，一次都不要出现。
    步号只填进 evidence 字段的 step，理由正文里不写。
 3. 禁止表情符号，禁止 markdown（不要列表符号、不要标题、不要加粗、不要反引号），
    禁止比喻、排比、反问、夸张。
-4. 禁止使用这些词：首先、其次、最后、综上、总的来说、总之、值得注意的是、此外、另外、
-   不仅、而且、显然、令人、堪称、优雅、精妙、丝滑、赋能、闭环、亮点、整体而言、可以看出、
-   由此可见、体现了、展现了、表现出色、表现良好、表现一般、基本可用、效果不错、非常、
-   极其、十分、相当。
+4. 禁止使用这些词：{"、".join(BANNED_WORDS)}。
 5. 只写模型自身能力造成的差异；环境问题不写进理由。
 6. 提到文件只写仓库内的相对路径，例如 lib/rules_inline.mjs。禁止出现任何绝对路径或磁盘
    目录名（以 / 开头的路径、盘符、以及 host、data、workspace、repo、分析、出题、副本、
@@ -493,7 +499,7 @@ async def analyze_task(task_id: int) -> dict:
             db.flush()
         from app.services import gsb_verifier
 
-        gsb_verifier.run_verify(task_id)
+        await gsb_verifier.run_verify(task_id)
         bus.publish("tasks", {"type": "task", "id": task_id})
         return {"ok": True, "verdict": gsb["verdict"]}
     except Exception as exc:  # noqa: BLE001

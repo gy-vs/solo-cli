@@ -12,8 +12,8 @@ from sqlalchemy import func, select
 from app import config
 from app.db import session
 from app.events import bus, sse_format
-from app.models import ALL_STATUSES, Task
-from app.services import analyzer, designer, dockerx, pipeline, qa_bridge, settings_store, uploader
+from app.models import ALL_STATUSES, RUN_RUNNING, Task, TaskRun
+from app.services import designer, dockerx, gsb_analyzer, gsb_uploader, qa_bridge, settings_store, watchdog
 from app.services.scheduler import scheduler
 
 router = APIRouter(prefix="/api", tags=["system"])
@@ -47,27 +47,32 @@ async def system_status() -> dict:
         finished_today = sum(1 for f, _ in rows if _is_today(f))
         uploaded_today = sum(1 for _, u in rows if _is_today(u))
         today = today.isoformat()
+        # 容器数才是真实负载：一道题占两个
+        running_sides = db.execute(select(func.count()).select_from(TaskRun)
+                                   .where(TaskRun.status == RUN_RUNNING)).scalar() or 0
     containers = await dockerx.list_task_containers() if docker_ok else []
-    qc_ok, qc_why = qa_bridge.available()
+    dedup_ok, dedup_why = qa_bridge.available()
     return {
         "docker": {"ok": docker_ok, "message": docker_msg},
         "image": {"name": image, "present": image_ok},
         "scheduler": scheduler.snapshot(),
-        "pipeline": {
-            **pipeline.snapshot(),
-            "destroy": settings_store.get_bool("auto.destroy_on_finish", True),
-            "analyze": settings_store.get_bool("auto.analyze", True),
-            "qc": settings_store.get_bool("auto.qc", True),
+        "watchdog": {
+            "interval_seconds": settings_store.get_int("watchdog.interval_seconds",
+                                                       watchdog.INTERVAL_DEFAULT),
+            "max_retries": settings_store.get_int("watchdog.max_retries",
+                                                  watchdog.MAX_RETRIES_DEFAULT),
         },
-        "qc": {"ok": qc_ok, "message": qc_why or "已启用", "image": settings_store.get("qc.image")},
+        "dedup": {"ok": dedup_ok, "message": dedup_why or "已启用",
+                  "image": settings_store.get("qc.image")},
         "design": {"running": sorted(designer.running)},
         "counts": counts,
+        "running_sides": running_sides,
         "totals": {"finished": finished_today, "uploaded": uploaded_today, "date": today},
         "containers": containers,
         "configured": {
             "cc.api_key": settings_store.is_configured("cc.api_key"),
-            "qa.session_cookie": settings_store.is_configured("qa.session_cookie"),
-            "qa.csrf_token": settings_store.is_configured("qa.csrf_token"),
+            "gsb.session_cookie": settings_store.is_configured("gsb.session_cookie"),
+            "gsb.csrf_token": settings_store.is_configured("gsb.csrf_token"),
             "cursor.api_key": settings_store.is_configured("cursor.api_key"),
         },
         "paths": {"coder_root_host": config.CODER_ROOT_HOST, "coder_root_mount": str(config.CODER_ROOT_MOUNT),
@@ -77,13 +82,13 @@ async def system_status() -> dict:
 
 @router.post("/system/probe/{target}")
 async def probe(target: str) -> dict:
-    if target == "qa":
-        return await uploader.probe_identity()
+    if target in ("gsb", "qa"):
+        return await gsb_uploader.probe_identity()
     if target == "gateway":
-        return await uploader.probe_gateway()
+        return await gsb_uploader.probe_gateway()
     if target == "cursor":
-        return await analyzer.probe_ping()
-    if target == "qc":
+        return await gsb_analyzer.probe_ping()
+    if target in ("dedup", "qc"):
         return await qa_bridge.probe()
     if target == "docker":
         ok, msg = await dockerx.daemon_ok()

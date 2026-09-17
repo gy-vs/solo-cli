@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from app.services import trace, verifier
+from app.services import trace
 
 
 def _line(**kw):
@@ -79,33 +79,3 @@ def test_parse_trace_reads_harness_version(tmp_path: Path):
     s = trace.parse_trace(f)
     assert s["harness_version"] == "2.1.246"
     assert s["cwd"] == "/workspace"
-
-
-def test_verify_flags(tmp_path: Path):
-    f = tmp_path / "t.jsonl"
-    make_trace(f)
-    idx = trace.parse_trace(f)
-    good = ("src/merge.ts 的 mergeHunks 改完之后我跑 npm test，有 1 个用例失败，"
-            "模型改完就结束了，没有再跑一次测试确认。")
-    review = {
-        "scores": {d: 4 for d in verifier.DIMS},
-        "descs": {d: good for d in verifier.DIMS},
-        "evidence": {"delivery": [{"step": 2, "file": "src/diff.ts", "quote": "1 failed, 3 passed"}],
-                     "instruction": [{"step": 99}], "planning": [], "reasoning": [], "execution": []},
-        "other_issues": "",
-        "coverage": [{"point": "Myers", "status": "missing"}],
-    }
-    rep = verifier.verify(review, idx)
-    codes = {(i.get("dim"), i["code"]) for i in rep["items"]}
-    assert ("instruction", "step_missing") in codes
-    assert ("delivery", "score_coverage_conflict") in codes
-    assert rep["overall"] == "block"            # 分数与覆盖冲突 + 描述雷同
-    assert rep["evidence_hit"] == 1 and rep["evidence_total"] == 2
-
-    review["descs"] = {d: good + f"这是第{n}条。" for n, d in enumerate(verifier.DIMS)}
-    review["descs"]["delivery"] = "首先，模型表现出色 ✅ **完美**"
-    review["coverage"] = [{"point": "Myers", "status": "done"}]
-    rep2 = verifier.verify(review, idx)
-    delivery_codes = {i["code"] for i in rep2["items"] if i.get("dim") == "delivery"}
-    assert {"ai_words", "emoji", "markdown", "not_first_person", "too_short"} <= delivery_codes
-    assert rep2["overall"] == "warn"

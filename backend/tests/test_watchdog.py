@@ -134,7 +134,7 @@ def test_archive_traces_noop_when_empty(monkeypatch, tmp_path):
 def stub_side_effects(monkeypatch, tmp_path):
     calls = {"removed": [], "reset": []}
 
-    async def remove(name, force=False):
+    async def remove(name):
         calls["removed"].append(name)
         return True
 
@@ -345,7 +345,7 @@ def test_push_failure_does_not_count_as_retry(task_with_runs, monkeypatch):
     async def push(task_no, repo_url, side, snapshot, *, message):
         return {"ok": False, "message": "远端拒绝"}
 
-    async def remove(name, force=False):
+    async def remove(name):
         return True
 
     monkeypatch.setattr(wd.gsb_repo, "commit_and_push", push)
@@ -369,7 +369,7 @@ def test_advance_pair_keeps_container_when_trace_missing(task_with_runs, monkeyp
         db.get(m.TaskRun, ids["A"]).trace_file = ""
     removed = []
 
-    async def remove(name, force=False):
+    async def remove(name):
         removed.append(name)
         return True
 

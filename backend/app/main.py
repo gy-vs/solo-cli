@@ -14,7 +14,7 @@ from app.routers import design as design_router
 from app.routers import settings as settings_router
 from app.routers import system as system_router
 from app.routers import tasks as tasks_router
-from app.services import pipeline, prompt_bank, settings_store
+from app.services import prompt_bank, settings_store, watchdog
 from app.services.scheduler import scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -40,21 +40,21 @@ async def lifespan(_: FastAPI):
     except Exception:  # noqa: BLE001
         log.exception("题库导入失败")
     await scheduler.start()
-    resumed = pipeline.resume_stale()
-    if resumed:
-        log.info("重新接续被打断的流水线：%s", resumed)
+    await watchdog.start()
     log.info("=" * 60)
     log.info("Startup Success")
     log.info("Console : http://localhost:%s", config.HOST_PORT)
     log.info("API     : http://localhost:%s/api/health", config.HOST_PORT)
     log.info("Coder   : %s (mount %s)", config.CODER_ROOT_HOST, config.CODER_ROOT_MOUNT)
-    log.info("自动流水线: 销毁=%s 分析=%s 质检=%s",
-             settings_store.get_bool("auto.destroy_on_finish", True),
-             settings_store.get_bool("auto.analyze", True),
-             settings_store.get_bool("auto.qc", True))
+    log.info("巡检    : 每 %s 秒一轮，异常最多自动重跑 %s 次",
+             settings_store.get_int("watchdog.interval_seconds", watchdog.INTERVAL_DEFAULT),
+             settings_store.get_int("watchdog.max_retries", watchdog.MAX_RETRIES_DEFAULT))
+    log.info("并发    : 最多 %s 个容器（%s 道题同时跑）",
+             scheduler.max_parallel, scheduler.max_parallel // 2)
     log.info("=" * 60)
     yield
     await scheduler.stop()
+    await watchdog.stop()
 
 
 app = FastAPI(title="Solo CLI Console", version="1.0.0", lifespan=lifespan)
