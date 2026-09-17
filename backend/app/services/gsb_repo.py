@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from app import config
@@ -175,3 +176,110 @@ async def verify_head(task_no: str, side: str, snapshot: str) -> dict:
         return {"ok": False, "head": head, "dirty": dirty,
                 "message": f"{side} 侧工作区有 {dirty} 处改动，需要先回退"}
     return {"ok": True, "head": head, "dirty": 0, "message": f"{side} 侧停在初始快照且干净"}
+
+
+async def backup_head(task_no: str, side: str, snapshot: str) -> str:
+    """回退前把领先快照的 HEAD 记到 refs/solo-backup/*，事后用 git log 还能捞回来。
+
+    reset --hard 加 clean -fdx 会把模型跑出来的东西全抹掉，先留个 ref 才敢动手。
+    已经停在快照上就没什么可备份的，返回空串。
+    """
+    ws = config.TaskPaths(task_no, side).workspace
+    head = (await _git(ws, "rev-parse", "HEAD", timeout=30)).out.strip()
+    if not head or head.lower() == (snapshot or "").lower():
+        return ""
+    # ref 名带题号、侧别和时间戳：同一侧多次回退各留一份，互不覆盖
+    ref = f"{BACKUP_NS}/{task_no}-{side}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    r = await _git(ws, "update-ref", ref, head, timeout=30)
+    if not r.ok:
+        # 备份失败不阻断回退：这里的 err 只进日志不外传，且 update-ref 参数里没有凭据
+        log.warning("题 %s %s 侧备份 HEAD 失败：%s", task_no, side, r.err.strip()[:200])
+        return ""
+    return ref
+
+
+async def reset_side(task_no: str, side: str, snapshot: str) -> dict:
+    """把这一侧退回初始快照。重跑之前必须做，否则产物快照的父提交对不上。"""
+    ws = config.TaskPaths(task_no, side).workspace
+    if not (ws / ".git").exists():
+        return {"ok": False, "backup": "", "message": f"{side} 侧不是 git 仓库"}
+    if not snapshot:
+        # 没有 sha 就没有回退目标，reset --hard 拿空串会退到 HEAD 等于白做，不如直接拦下
+        return {"ok": False, "backup": "", "message": "初始环境快照缺少 40 位 SHA，无法回退"}
+    backup = await backup_head(task_no, side, snapshot)
+    r1 = await _git(ws, "reset", "--hard", snapshot, timeout=180)
+    # -x 连 .gitignore 里的东西一起清：模型跑出来的依赖目录、缓存多半正好在 ignore 里
+    r2 = await _git(ws, "clean", "-fdx", timeout=180)
+    if not (r1.ok and r2.ok):
+        # reset / clean 的参数里只有本地路径和 sha，没有凭据，err 可以外传
+        return {"ok": False, "backup": backup,
+                "message": (r1.err or r2.err).strip()[:300] or "回退失败"}
+    msg = f"{side} 侧已退回 {snapshot[:12]}"
+    if backup:
+        msg += f"，原提交备份在 {backup}"
+    return {"ok": True, "backup": backup, "message": msg}
+
+
+def commit_message(task_no: str, side: str, session_id: str) -> str:
+    return (f"solo {task_no} · {side}\n\n"
+            f"SessionID: {session_id or '-'}\n")
+
+
+async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
+                          *, message: str) -> dict:
+    """提交这一侧的产物并推到同名分支，返回产物快照 permalink。
+
+    push 之前校验父提交等于初始快照：平台规则 G3 卡这个，等提交被打回才发现就晚了。
+    """
+    ws = config.TaskPaths(task_no, side).workspace
+    if not (ws / ".git").exists():
+        return {"ok": False, "message": f"{side} 侧不是 git 仓库"}
+    slug = repo_slug(repo_url)
+    if not slug:
+        return {"ok": False, "message": f"仓库地址解析不出 org/repo：{repo_url}"}
+    # 推送走 origin 而不是题块地址：clone 时 origin 就是从题块地址来的，两者本该一致；
+    # 这里再比一次 org/repo，防止目录被人换过远端后把产物推进别的 github 仓库。
+    # origin 解析不出 org/repo 的（本地裸仓库之类）不是要防的情形，放行。
+    # 只回显 org/repo，不回显 origin 原始地址，config 若被带 token 的地址污染过也不会外漏
+    origin_slug = repo_slug((await _git(ws, "remote", "get-url", "origin", timeout=30)).out.strip())
+    if origin_slug and origin_slug != slug:
+        return {"ok": False,
+                "message": f"{side} 侧的 origin（{origin_slug}）与题块仓库 {slug} 对不上，不能推送"}
+
+    st = await _git(ws, "status", "--porcelain", "--untracked-files=all", timeout=60)
+    changed = len([x for x in st.out.splitlines() if x.strip()])
+    if not changed:
+        return {"ok": False, "message": f"{side} 侧工作区没有改动，这一跑没有产出，不能当作产物提交"}
+
+    # add / commit 的参数里没有凭据，stderr 可以带给调用方帮人定位问题
+    add = await _git(ws, "add", "-A", timeout=180)
+    if not add.ok:
+        return {"ok": False, "message": f"git add 失败：{add.err.strip()[:300]}"}
+    ci = await _git(ws, "-c", f"user.name={COMMIT_USER}", "-c", f"user.email={COMMIT_EMAIL}",
+                    "commit", "-m", message, timeout=180)
+    if not ci.ok:
+        return {"ok": False, "message": f"git commit 失败：{(ci.err or ci.out).strip()[:300]}"}
+
+    head = (await _git(ws, "rev-parse", "HEAD", timeout=30)).out.strip()
+    parent = (await _git(ws, "rev-parse", "HEAD^", timeout=30)).out.strip()
+    if parent.lower() != (snapshot or "").lower():
+        return {"ok": False,
+                "message": f"{side} 侧产物的父提交是 {parent[:12]}，不是初始快照 {snapshot[:12]}；"
+                           f"平台规则 G3 会打回，需要先回退这一侧再重跑"}
+
+    # 凭据走临时 credential helper，不用带 token 的 URL——push 失败时 git 会把命令行
+    # 回显进 stderr，URL 里的 token 就跟着漏出去了。-c 必须放在 push 之前，放后面
+    # git 会把它当成 push 的参数。目标写 origin：上面已经核对过它和题块仓库是同一个，
+    # 而测试里的 origin 是本地裸仓库，这样不用联网也能走通整条 push 链路
+    push = await dockerx.run(
+        ["git", "-C", str(ws), *credential_args(repo_url), "push", "origin",
+         f"HEAD:refs/heads/{side}"], timeout=300,
+    )
+    if not push.ok:
+        # 超时分支的 err 里拼着完整命令行，而 helper 参数里就有 token：一律不透传
+        return {"ok": False, "message": f"{side} 侧 push 失败，检查 Token 的 repo 写权限"}
+
+    url = commit_url(repo_url, head)
+    log.info("题 %s %s 侧产物 %s 已推到分支 %s（%d 个文件）", task_no, side, head[:12], side, changed)
+    return {"ok": True, "sha": head, "url": url, "changed_files": changed,
+            "message": f"{side} 侧已提交 {head[:12]} 并推到分支 {side}（{changed} 个文件）"}
