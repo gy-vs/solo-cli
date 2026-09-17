@@ -15,8 +15,12 @@ from app.services import gsb_uploader as up
 
 
 def _schema(*keys, required=True, fingerprint="fp1"):
+    """按平台真实 schema 的形状造：必填标记是 is_required，附件靠 field_type 认。"""
     return {"fingerprint": fingerprint,
-            "fields": [{"field_key": k, "required": required} for k in keys]}
+            "fields": [{"field_key": k, "is_required": required, "is_enabled": True,
+                        "field_type": "attachment" if k.endswith("trace_file")
+                        else "video" if k.endswith("screencast") else "text"}
+                       for k in keys]}
 
 
 @pytest.fixture()
@@ -118,8 +122,20 @@ def test_missing_required_reports_empty_fields():
 
 
 def test_missing_required_ignores_optional_fields():
-    schema = {"fields": [{"field_key": "remark", "required": False}]}
-    assert up.missing_required(schema, {"remark": ""}) == []
+    assert up.missing_required(_schema("remark", required=False), {"remark": ""}) == []
+
+
+def test_missing_required_ignores_disabled_fields():
+    """后台停用的字段不填也不校验。"""
+    schema = {"fields": [{"field_key": "legacy", "is_required": True, "is_enabled": False}]}
+    assert up.missing_required(schema, {}) == []
+    assert up.unknown_required(schema, {}) == []
+
+
+def test_missing_required_reads_legacy_required_key():
+    """兼容早期只有 required 的字段名，别因为改名把校验整段跳过。"""
+    schema = {"fields": [{"field_key": "languages", "required": True}]}
+    assert up.missing_required(schema, {"languages": ""}) == ["languages"]
 
 
 def test_missing_required_skips_trace_attachments():
@@ -139,8 +155,15 @@ def test_unknown_required_accepts_trace_attachments():
 
 
 def test_unknown_required_ignores_optional_unknown():
-    schema = {"fields": [{"field_key": "whatever", "required": False}]}
-    assert up.unknown_required(schema, {}) == []
+    assert up.unknown_required(_schema("whatever", required=False), {}) == []
+
+
+def test_too_long_flags_over_max_length():
+    """理由超长会被平台 422 打回，提交前先自己量一遍。"""
+    schema = {"fields": [{"field_key": "gsb_reason", "is_required": True,
+                          "is_enabled": True, "max_length": 10}]}
+    assert "gsb_reason" in up.too_long(schema, {"gsb_reason": "x" * 11})
+    assert up.too_long(schema, {"gsb_reason": "x" * 10}) == {}
 
 
 # ---------------- 提交流程 ----------------

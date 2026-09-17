@@ -113,18 +113,31 @@ async def build_values(task: Task, runs: dict[str, TaskRun]) -> dict:
     return values
 
 
+def _field_key(f: dict) -> str:
+    return f.get("field_key") or f.get("key") or ""
+
+
+def _required(f: dict) -> bool:
+    """平台 schema 里必填标记叫 is_required；`required` 只是兼容早期字段名。"""
+    return bool(f.get("is_required", f.get("required", False)))
+
+
+def enabled_fields(schema: dict) -> list[dict]:
+    """后台可以停用字段，停用的不填也不校验。"""
+    return [f for f in (schema.get("fields") or [])
+            if _field_key(f) and f.get("is_enabled", True)]
+
+
+def is_attachment(f: dict) -> bool:
+    """附件字段的值是对象数组，其余字段都是字符串。录屏是 video 类型，存的是 URL 字符串。"""
+    return f.get("field_type") in ("attachment", "file")
+
+
 def missing_required(schema: dict, values: dict) -> list[str]:
     """schema 说必填、而我们没值的字段。附件字段单独处理，不在这里查。"""
-    out = []
-    for f in (schema.get("fields") or []):
-        key = f.get("field_key") or f.get("key")
-        if not key or not f.get("required"):
-            continue
-        if key.endswith("trace_file"):
-            continue
-        if not str(values.get(key) or "").strip():
-            out.append(key)
-    return out
+    return [k for f in enabled_fields(schema)
+            if _required(f) and not is_attachment(f)
+            and not str(values.get(k := _field_key(f)) or "").strip()]
 
 
 def unknown_required(schema: dict, values: dict) -> list[str]:
@@ -134,9 +147,19 @@ def unknown_required(schema: dict, values: dict) -> list[str]:
     而报出字段名人工补一下只要一分钟。
     """
     known = set(values) | {f"{s.lower()}_trace_file" for s in config.SIDES}
-    return [f.get("field_key") or f.get("key")
-            for f in (schema.get("fields") or [])
-            if f.get("required") and (f.get("field_key") or f.get("key")) not in known]
+    return [_field_key(f) for f in enabled_fields(schema)
+            if _required(f) and _field_key(f) not in known]
+
+
+def too_long(schema: dict, values: dict) -> dict[str, str]:
+    """超出 schema 的 max_length 的字段。理由写太长会被 422 打回，提交前先自己量一遍。"""
+    out = {}
+    for f in enabled_fields(schema):
+        limit = f.get("max_length") or 0
+        v = str(values.get(_field_key(f)) or "")
+        if limit and len(v) > limit:
+            out[_field_key(f)] = f"{len(v)} 字，超出上限 {limit} 字"
+    return out
 
 
 async def _upload_file(c: httpx.AsyncClient, path: Path, kind: str = "") -> dict:
@@ -235,6 +258,10 @@ async def upload_task(task_id: int) -> dict:
                 names = [human.get(k, k) for k in missing]
                 return _fail(task_id, record, f"字段缺失：{', '.join(names)}",
                              fields={k: "缺值" for k in missing})
+            if over := too_long(schema, values):
+                return _fail(task_id, record,
+                             f"字段超长：{', '.join(f'{k} {v}' for k, v in over.items())}",
+                             fields=over)
 
             data = dict(values)
             for side in config.SIDES:
