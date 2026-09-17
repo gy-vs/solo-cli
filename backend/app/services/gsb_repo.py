@@ -178,24 +178,31 @@ async def verify_head(task_no: str, side: str, snapshot: str) -> dict:
     return {"ok": True, "head": head, "dirty": 0, "message": f"{side} 侧停在初始快照且干净"}
 
 
-async def backup_head(task_no: str, side: str, snapshot: str) -> str:
+async def backup_head(task_no: str, side: str, snapshot: str) -> tuple[str, str]:
     """回退前把领先快照的 HEAD 记到 refs/solo-backup/*，事后用 git log 还能捞回来。
 
     reset --hard 加 clean -fdx 会把模型跑出来的东西全抹掉，先留个 ref 才敢动手。
-    已经停在快照上就没什么可备份的，返回空串。
+    返回 (ref 名, 错误说明)：
+    - 已经停在快照上没什么可备份，返回 ("", "")；
+    - 备份成功，返回 (ref, "")；
+    - 需要备份但 update-ref 失败，返回 ("", 错误说明)。
+    用二元组而不是抛异常，是因为「不需要备份」和「备份失败」对调用方都是正常分支，
+    不该走异常路径；单个空串又区分不开这两种情况，调用方会误以为可以放心 reset。
     """
     ws = config.TaskPaths(task_no, side).workspace
     head = (await _git(ws, "rev-parse", "HEAD", timeout=30)).out.strip()
     if not head or head.lower() == (snapshot or "").lower():
-        return ""
-    # ref 名带题号、侧别和时间戳：同一侧多次回退各留一份，互不覆盖
-    ref = f"{BACKUP_NS}/{task_no}-{side}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        return "", ""
+    # ref 名带题号、侧别和毫秒级时间戳：秒级精度下同一秒内连续备份两次，
+    # 第二次 update-ref 会直接改掉第一次的指向，前一份就真的找不回来了
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    ref = f"{BACKUP_NS}/{task_no}-{side}-{stamp}"
     r = await _git(ws, "update-ref", ref, head, timeout=30)
     if not r.ok:
-        # 备份失败不阻断回退：这里的 err 只进日志不外传，且 update-ref 参数里没有凭据
+        # 详细 err 只进日志：update-ref 参数里虽然没有凭据，但 git 的 stderr 一律不透传给调用方
         log.warning("题 %s %s 侧备份 HEAD 失败：%s", task_no, side, r.err.strip()[:200])
-        return ""
-    return ref
+        return "", f"{side} 侧 HEAD {head[:12]} 领先初始快照，但备份 ref 写入失败"
+    return ref, ""
 
 
 async def reset_side(task_no: str, side: str, snapshot: str) -> dict:
@@ -206,7 +213,12 @@ async def reset_side(task_no: str, side: str, snapshot: str) -> dict:
     if not snapshot:
         # 没有 sha 就没有回退目标，reset --hard 拿空串会退到 HEAD 等于白做，不如直接拦下
         return {"ok": False, "backup": "", "message": "初始环境快照缺少 40 位 SHA，无法回退"}
-    backup = await backup_head(task_no, side, snapshot)
+    backup, backup_err = await backup_head(task_no, side, snapshot)
+    if backup_err:
+        # 备份没打上就不能动手：reset --hard 加 clean -fdx 会把模型产出彻底抹掉，
+        # 这时宁可停下让人手动处理，也不能拿「反正日志里记了」当理由继续
+        return {"ok": False, "backup": "",
+                "message": f"{backup_err}，为免丢失产物已中止回退，请先手动处理"}
     r1 = await _git(ws, "reset", "--hard", snapshot, timeout=180)
     # -x 连 .gitignore 里的东西一起清：模型跑出来的依赖目录、缓存多半正好在 ignore 里
     r2 = await _git(ws, "clean", "-fdx", timeout=180)
@@ -238,13 +250,20 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
     if not slug:
         return {"ok": False, "message": f"仓库地址解析不出 org/repo：{repo_url}"}
     # 推送走 origin 而不是题块地址：clone 时 origin 就是从题块地址来的，两者本该一致；
-    # 这里再比一次 org/repo，防止目录被人换过远端后把产物推进别的 github 仓库。
-    # origin 解析不出 org/repo 的（本地裸仓库之类）不是要防的情形，放行。
+    # 这里再比一次，防止目录被人换过远端后把产物推去别处。
+    # 判定按「origin 是不是 https」而不是「能不能解析出 slug」分岔：credential helper
+    # 不看目标主机、无条件交出 token，所以任何 https 目标都必须是题块那个 github 仓库——
+    # 非 github 的 https 地址 slug 为空串、另一个 github 仓库 slug 不等，两种都在这里被拒。
+    # 非 https 的 origin（本地路径、ssh）不走 http 凭据通道，git 根本不会调 helper，
+    # token 漏不出去，放行；测试用本地裸仓库当远端走的就是这条路。
     # 只回显 org/repo，不回显 origin 原始地址，config 若被带 token 的地址污染过也不会外漏
-    origin_slug = repo_slug((await _git(ws, "remote", "get-url", "origin", timeout=30)).out.strip())
-    if origin_slug and origin_slug != slug:
-        return {"ok": False,
-                "message": f"{side} 侧的 origin（{origin_slug}）与题块仓库 {slug} 对不上，不能推送"}
+    origin = (await _git(ws, "remote", "get-url", "origin", timeout=30)).out.strip()
+    if origin.startswith("https://"):
+        origin_slug = repo_slug(origin)
+        if origin_slug != slug:
+            return {"ok": False,
+                    "message": f"{side} 侧的 origin（{origin_slug or '无法识别'}）"
+                               f"与题块仓库 {slug} 对不上，不能推送"}
 
     st = await _git(ws, "status", "--porcelain", "--untracked-files=all", timeout=60)
     changed = len([x for x in st.out.splitlines() if x.strip()])
