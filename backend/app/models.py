@@ -31,57 +31,50 @@ class Base(DeclarativeBase):
 
 
 # ---------------- 任务状态 ----------------
-AVAILABLE = "AVAILABLE"        # 题库中，未领取
-CLAIMED = "CLAIMED"            # 已领取，未进队列（门禁未过）
-QUEUED = "QUEUED"              # 等待槽位
-RUNNING = "RUNNING"            # 容器运行中
-FINISHED = "FINISHED"          # result.success
-FAILED = "FAILED"              # result 非 success / 退出码非 0
-TIMEOUT = "TIMEOUT"            # 超时被停止
-INTERRUPTED = "INTERRUPTED"    # 容器异常消失 / 137 / 进程中断
-REVIEWED = "REVIEWED"          # 五维齐全且核验无红项
-UPLOADED = "UPLOADED"          # 已上传 solo-qa
-DONE = "DONE"                  # 人工确认完成，容器已销毁
-DISCARDED = "DISCARDED"        # 人工废弃，默认不在列表显示
+# 题级状态只描述「这道题走到哪一步」，单侧容器跑得怎样由 TaskRun.status 承担。
+# 两层分开是因为 GSB 一题两跑：A 跑完 B 还在跑时题仍是 RUNNING，
+# 若把 FINISHED/FAILED 留在题级，任一侧的结果都会把另一侧的状态盖掉。
+AVAILABLE = "AVAILABLE"              # 题库中，未领取
+CLAIMED = "CLAIMED"                  # 已领取，门禁未过或工作区未就绪
+QUEUED = "QUEUED"                    # 两个 run 都在等槽位
+RUNNING = "RUNNING"                  # 至少一个 run 在跑
+RUN_DONE = "RUN_DONE"                # 两个 run 都结束，等 push 与分析
+ANALYZING = "ANALYZING"              # GSB 对比进行中
+ANALYZED = "ANALYZED"                # 有结论，等录屏与上传
+UPLOADED = "UPLOADED"                # 已提交 solo2
+DONE = "DONE"                        # 人工确认完成
+NEEDS_ATTENTION = "NEEDS_ATTENTION"  # 重跑用尽或准备失败，等人工
+DISCARDED = "DISCARDED"              # 人工废弃
 
 ALL_STATUSES = (
-    AVAILABLE, CLAIMED, QUEUED, RUNNING, FINISHED, FAILED, TIMEOUT,
-    INTERRUPTED, REVIEWED, UPLOADED, DONE, DISCARDED,
+    AVAILABLE, CLAIMED, QUEUED, RUNNING, RUN_DONE, ANALYZING, ANALYZED,
+    UPLOADED, DONE, NEEDS_ATTENTION, DISCARDED,
 )
-RUN_END_STATUSES = frozenset({FINISHED, FAILED, TIMEOUT, INTERRUPTED})
-# 允许进入分析的状态
-ANALYZABLE = RUN_END_STATUSES | {REVIEWED, UPLOADED}
 # 允许上传的状态
-UPLOADABLE = frozenset({REVIEWED})
-# 允许续跑的状态：跑完、跑挂、超时、中断，以及已评审但想再补一轮的
-CONTINUABLE = RUN_END_STATUSES | {REVIEWED}
+UPLOADABLE = frozenset({ANALYZED})
+
+# ---------------- 单侧运行状态 ----------------
+# 取值字面量与题级的 QUEUED/RUNNING 同名，故常量名加 RUN_ 前缀区分；
+# 比较时务必用常量而不是字面量，否则题级和侧级会混用。
+RUN_PENDING = "PENDING"
+RUN_QUEUED = "QUEUED"
+RUN_RUNNING = "RUNNING"
+RUN_FINISHED = "FINISHED"
+RUN_FAILED = "FAILED"
+RUN_TIMEOUT = "TIMEOUT"
+RUN_INTERRUPTED = "INTERRUPTED"
+
+RUN_END_STATUSES = frozenset({RUN_FINISHED, RUN_FAILED, RUN_TIMEOUT, RUN_INTERRUPTED})
+# 只有 FINISHED 算正常结束；其余结束态由 watchdog 决定重跑还是转人工
+RUN_OK_STATUSES = frozenset({RUN_FINISHED})
 
 ANALYSIS_IDLE = "IDLE"
 ANALYSIS_RUNNING = "RUNNING"
 ANALYSIS_DONE = "DONE"
 ANALYSIS_FAILED = "FAILED"
 
-# 质检（调 solo-qa 的链路，只取结论）
-QC_IDLE = "IDLE"
-QC_RUNNING = "RUNNING"
-QC_DONE = "DONE"
-QC_FAILED = "FAILED"
-# solo-qa 的结论取值
-QC_PASS = "PASS"
-QC_REJECT = "REJECT"
-QC_DISCARD = "DISCARD"
-QC_INCOMPLETE = "INCOMPLETE"
-
-# 任务来源
-ORIGIN_BANK = "bank"          # prompt.md 导入
-ORIGIN_DESIGNED = "designed"  # /solo-prompt 设计产出
-
-# 自动流水线阶段，仅用于界面展示当前卡在哪一步
-STAGE_IDLE = ""
-STAGE_DESTROY = "destroy"
-STAGE_ANALYZE = "analyze"
-STAGE_QC = "qc"
-STAGE_DONE = "done"
+ORIGIN_BANK = "bank"
+ORIGIN_DESIGNED = "designed"
 
 # 设计任务状态
 DESIGN_QUEUED = "QUEUED"
@@ -127,54 +120,46 @@ class Task(Base, JsonMixin):
     repro_level: Mapped[str] = mapped_column(String(64), default="")
     env_snapshot: Mapped[str] = mapped_column(String(512), default="")
     user_prompt: Mapped[str] = mapped_column(Text, default="")
+    # 题块 meta 里的「仓库」。GSB 题要求仓库自带 main/A/B 三个分支，
+    # clone 与分支校验都从这里取地址，不再从 user_prompt 里现场解析。
+    repo_url: Mapped[str] = mapped_column(String(512), default="")
 
-    # ---- 运行 ----
-    session_id: Mapped[str] = mapped_column(String(128), default="")
-    turn_id: Mapped[str] = mapped_column(String(128), default="")
-    # 续跑轮次：1 是首轮。第一轮 504 或报错后，可以带着新指令再跑一轮，
-    # 每轮独立容器与轨迹目录，workspace 沿用上一轮的改动。
-    # server_default 不能省：_ensure_columns 给没有 DDL 默认值的整型列补的是 DEFAULT 0，
-    # 老库补出来的 0 轮会让轮次语义错位。
-    round_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
-    rounds_json: Mapped[str] = mapped_column(Text, default="[]")  # 每轮的指令与结果留痕
-    continue_prompt: Mapped[str] = mapped_column(Text, default="")  # 待执行的续跑指令
+    # ---- 工作区准备 ----
+    # 远端分支校验结果。校验失败题会停在 CLAIMED，把原因存下来是为了题卡能直接
+    # 显示缺哪个分支，而不是让人翻日志。
+    branch_check_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 废弃前的状态，恢复时按它回退；不属于单跑字段，所以留在题级
     discarded_from: Mapped[str] = mapped_column(String(16), default="")
-    container_name: Mapped[str] = mapped_column(String(64), default="")
-    container_exists: Mapped[bool] = mapped_column(Boolean, default=False)
-    image_tag: Mapped[str] = mapped_column(String(128), default="")
-    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    result_json: Mapped[str] = mapped_column(Text, default="{}")       # stream-json 的 result 事件
-    verdict_json: Mapped[str] = mapped_column(Text, default="{}")      # 三层判定明细
-    trace_summary_json: Mapped[str] = mapped_column(Text, default="{}")
-    trace_file: Mapped[str] = mapped_column(String(512), default="")   # 导出后的 jsonl 路径
-    git_diff_stat: Mapped[str] = mapped_column(Text, default="")
-    error: Mapped[str] = mapped_column(Text, default="")
 
-    # ---- 分析 / 评审 ----
+    # ---- GSB 分析 / 结论 ----
+    # 容器、会话、result、verdict 这些「一次跑」的信息全在 TaskRun 上，
+    # 题级只放对比两侧才得出的东西。
     analysis_status: Mapped[str] = mapped_column(String(16), default=ANALYSIS_IDLE)
-    analysis_json: Mapped[str] = mapped_column(Text, default="{}")     # agent 原始输出（结构化）
-    review_json: Mapped[str] = mapped_column(Text, default="{}")       # 人工可编辑的五维与描述
-    verify_json: Mapped[str] = mapped_column(Text, default="{}")       # 交叉核验报告
+    analysis_json: Mapped[str] = mapped_column(Text, default="{}")     # GSB 分析 agent 的原始输出
+    # 人工可编辑的结论：verdict / reason / a_startup / b_startup。
+    # 前身是五维评分的 review_json，语义完全变了，直接换名而不是复用旧列名，
+    # 避免旧代码按五维结构去读它。
+    gsb_json: Mapped[str] = mapped_column(Text, default="{}")
+    verify_json: Mapped[str] = mapped_column(Text, default="{}")       # GSB 核验报告
+    # 两侧录屏链接 {"A": url, "B": url}，平台上传必填，由人工录完后填入
+    screencast_json: Mapped[str] = mapped_column(Text, default="{}")
     upload_json: Mapped[str] = mapped_column(Text, default="{}")
-
-    # ---- 质检（solo-qa 链路的结论，不入它的库） ----
-    qc_status: Mapped[str] = mapped_column(String(16), default=QC_IDLE)
-    qc_json: Mapped[str] = mapped_column(Text, default="{}")
-    qc_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # ---- 队列与来源 ----
     priority: Mapped[int] = mapped_column(Integer, default=0, index=True)   # 越小越先出队
     origin: Mapped[str] = mapped_column(String(16), default=ORIGIN_BANK)
     design_run_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     dedup_json: Mapped[str] = mapped_column(Text, default="{}")             # 设计产出的查重结论
-    auto_stage: Mapped[str] = mapped_column(String(16), default=STAGE_IDLE)
+    # 自动流水线当前卡在哪一步，仅供界面展示；取值由流水线模块自行定义
+    auto_stage: Mapped[str] = mapped_column(String(16), default="")
     auto_error: Mapped[str] = mapped_column(Text, default="")
 
     # ---- 时间 ----
+    # started_at 不在题级：两侧各有自己的开始时间，题级没有一个有意义的「开始」。
+    # finished_at 则是两侧都结束的时刻，题级保留。
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -188,6 +173,111 @@ class Task(Base, JsonMixin):
     @meta.setter
     def meta(self, v: dict) -> None:
         self.meta_json = self._dump(v)
+
+    @property
+    def gsb(self) -> dict:
+        return self._load(self.gsb_json, {})
+
+    @gsb.setter
+    def gsb(self, v: dict) -> None:
+        self.gsb_json = self._dump(v)
+
+    @property
+    def verify(self) -> dict:
+        return self._load(self.verify_json, {})
+
+    @verify.setter
+    def verify(self, v: dict) -> None:
+        self.verify_json = self._dump(v)
+
+    @property
+    def screencast(self) -> dict:
+        return self._load(self.screencast_json, {})
+
+    @screencast.setter
+    def screencast(self, v: dict) -> None:
+        self.screencast_json = self._dump(v)
+
+    @property
+    def upload(self) -> dict:
+        return self._load(self.upload_json, {})
+
+    @upload.setter
+    def upload(self, v: dict) -> None:
+        self.upload_json = self._dump(v)
+
+    @property
+    def analysis(self) -> dict:
+        return self._load(self.analysis_json, {})
+
+    @analysis.setter
+    def analysis(self, v: dict) -> None:
+        self.analysis_json = self._dump(v)
+
+    @property
+    def dedup(self) -> dict:
+        return self._load(self.dedup_json, {})
+
+    @dedup.setter
+    def dedup(self, v: dict) -> None:
+        self.dedup_json = self._dump(v)
+
+    @property
+    def branch_check(self) -> dict:
+        return self._load(self.branch_check_json, {})
+
+    @branch_check.setter
+    def branch_check(self, v: dict) -> None:
+        self.branch_check_json = self._dump(v)
+
+
+class TaskRun(Base, JsonMixin):
+    """一道题的一次跑（A 或 B）。一题固定两行，从 clone 到 push 的状态都在这里。
+
+    单跑时代这些列全挂在 Task 上；改成双跑后若继续放题级，就得给每列复制一份
+    带 a_/b_ 前缀的版本，调度、watchdog、时间线全都要写两套分支。拆成按 side 分行，
+    所有只关心「一次跑」的代码拿到一行 TaskRun 就够了，不必知道自己是 A 还是 B。
+    """
+
+    __tablename__ = "task_run"
+    # (task_id, side) 唯一：调度器和 watchdog 都会在并发下尝试建 run，
+    # 靠数据库约束兜底而不是靠应用层「先查再插」。
+    __table_args__ = (UniqueConstraint("task_id", "side", name="uq_run_task_side"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
+    side: Mapped[str] = mapped_column(String(1), index=True)   # 取值见 config.SIDES
+    status: Mapped[str] = mapped_column(String(16), default=RUN_PENDING, index=True)
+    # 第几次跑。重跑加一，达到上限后 watchdog 不再自动重跑。
+    # server_default 不能省：_ensure_columns 给没有 DDL 默认值的整型列补的是 DEFAULT 0，
+    # 补出来的第 0 次会让重跑计数错位。
+    attempt: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+    container_name: Mapped[str] = mapped_column(String(64), default="")
+    container_exists: Mapped[bool] = mapped_column(Boolean, default=False)
+    image_tag: Mapped[str] = mapped_column(String(128), default="")
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    session_id: Mapped[str] = mapped_column(String(128), default="")
+    turn_id: Mapped[str] = mapped_column(String(128), default="")
+
+    result_json: Mapped[str] = mapped_column(Text, default="{}")        # stream-json 的 result 事件
+    verdict_json: Mapped[str] = mapped_column(Text, default="{}")       # 三层判定明细
+    trace_summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    trace_file: Mapped[str] = mapped_column(String(512), default="")    # 导出后的 jsonl 路径
+    git_diff_stat: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+
+    # push 之后回填，是上传要交的产物快照。存 sha 而不只存分支名，
+    # 是因为分支可能被后续重跑覆盖，而平台要的是当时评的那份代码。
+    artifact_sha: Mapped[str] = mapped_column(String(64), default="")
+    artifact_url: Mapped[str] = mapped_column(String(512), default="")
+
+    # watchdog 判定为异常时记原因与时间，题卡要显示
+    abnormal_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     @property
     def result(self) -> dict:
@@ -214,60 +304,12 @@ class Task(Base, JsonMixin):
         self.trace_summary_json = self._dump(v)
 
     @property
-    def analysis(self) -> dict:
-        return self._load(self.analysis_json, {})
+    def abnormal(self) -> dict:
+        return self._load(self.abnormal_json, {})
 
-    @analysis.setter
-    def analysis(self, v: dict) -> None:
-        self.analysis_json = self._dump(v)
-
-    @property
-    def review(self) -> dict:
-        return self._load(self.review_json, {})
-
-    @review.setter
-    def review(self, v: dict) -> None:
-        self.review_json = self._dump(v)
-
-    @property
-    def verify(self) -> dict:
-        return self._load(self.verify_json, {})
-
-    @verify.setter
-    def verify(self, v: dict) -> None:
-        self.verify_json = self._dump(v)
-
-    @property
-    def upload(self) -> dict:
-        return self._load(self.upload_json, {})
-
-    @upload.setter
-    def upload(self, v: dict) -> None:
-        self.upload_json = self._dump(v)
-
-    @property
-    def qc(self) -> dict:
-        return self._load(self.qc_json, {})
-
-    @qc.setter
-    def qc(self, v: dict) -> None:
-        self.qc_json = self._dump(v)
-
-    @property
-    def dedup(self) -> dict:
-        return self._load(self.dedup_json, {})
-
-    @dedup.setter
-    def dedup(self, v: dict) -> None:
-        self.dedup_json = self._dump(v)
-
-    @property
-    def rounds(self) -> list:
-        return self._load(self.rounds_json, [])
-
-    @rounds.setter
-    def rounds(self, v: list) -> None:
-        self.rounds_json = self._dump(v)
+    @abnormal.setter
+    def abnormal(self, v: dict) -> None:
+        self.abnormal_json = self._dump(v)
 
 
 class RunEvent(Base, JsonMixin):
@@ -278,8 +320,11 @@ class RunEvent(Base, JsonMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     task_id: Mapped[int] = mapped_column(Integer, index=True)
     seq: Mapped[int] = mapped_column(Integer)
-    # 续跑后时间线要能分清哪条属于哪轮；同上，老库补列要靠 server_default 落到 1
-    round_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # 事件流按 A/B 分栏展示，靠这列区分。挂 task_id 而不是 run_id，
+    # 是因为重跑会换 run 的 attempt 但事件仍归同一侧，按 (task_id, side) 查最直接。
+    # server_default 写裸的 A 而不是 'A'：SQLAlchemy 编译 DDL 时会自己给字符串加引号，
+    # 写成 'A' 会被编成 DEFAULT '''A'''，_ensure_columns 补列时老行的 side 就成了三个字符的 'A'。
+    side: Mapped[str] = mapped_column(String(1), default="A", server_default="A")
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     kind: Mapped[str] = mapped_column(String(32))          # system / assistant / user / result / stderr / lifecycle
     summary: Mapped[str] = mapped_column(Text, default="")  # 供时间线直接展示的一行摘要
