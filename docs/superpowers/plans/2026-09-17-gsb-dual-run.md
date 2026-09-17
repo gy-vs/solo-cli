@@ -270,7 +270,9 @@ git commit -m "func(gsb): 路径按 A/B 分侧，设置项切到 GSB 平台与�
     `RUN_TIMEOUT`、`RUN_INTERRUPTED`；集合 `RUN_END_STATUSES`、`RUN_OK_STATUSES = {RUN_FINISHED}`
   - `class TaskRun(Base, JsonMixin)`，字段见下；JSON 属性 `result`、`verdict`、`trace_summary`、`abnormal`
   - `Task` 的 JSON 属性：`meta`、`gsb`、`verify`、`screencast`、`upload`、`analysis`、`dedup`、`branch_check`
-  - `RunEvent.side`（`String(1)`，默认 `"A"`，`server_default="'A'"`）
+  - `RunEvent.side`（`String(1)`，默认 `"A"`，`server_default="A"` —— SQLAlchemy 会自己给
+    字符串型 `server_default` 加引号，再手写一层引号会让 DDL 变成 `DEFAULT '''A'''`，
+    `_ensure_columns` 补列时老行会拿到三个字符的 `'A'`）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -528,7 +530,7 @@ class TaskRun(Base, JsonMixin):
 `RunEvent` 的 `round_no` 换成：
 
 ```python
-    side: Mapped[str] = mapped_column(String(1), default="A", server_default="'A'")
+    side: Mapped[str] = mapped_column(String(1), default="A", server_default="A")
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -889,7 +891,11 @@ git commit -m "func(gsb): 远端分支探测与 A/B 双分支 clone"
 **Interfaces:**
 - Consumes: Task 3 的全部
 - Produces:
-  - `async backup_head(task_no: str, side: str, snapshot: str) -> str` 返回备份 ref 名，没备份返回 `""`
+  - `async backup_head(task_no: str, side: str, snapshot: str) -> tuple[str, str]`
+    返回 `(备份 ref 名, 错误说明)`。两者都为空串表示本来就停在快照上、不需要备份；
+    错误说明非空表示需要备份但失败了，此时 `reset_side` 必须直接返回失败而不是继续 reset
+    ——分不清这两种情况就会闷头 `reset --hard` 把模型产出删掉。
+    ref 名的时间戳到毫秒，否则同一秒内的第二次备份会覆盖掉第一次。
   - `async reset_side(task_no: str, side: str, snapshot: str) -> dict`
     返回 `{"ok": bool, "message": str, "backup": str}`
   - `async commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str, *, message: str) -> dict`
@@ -1078,8 +1084,16 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
                 "message": f"{side} 侧产物的父提交是 {parent[:12]}，不是初始快照 {snapshot[:12]}；"
                            f"平台规则 G3 会打回，需要先回退这一侧再重跑"}
 
+    # 推 origin 而不是把 repo_url 当地址：origin 是 clone 时设好的干净地址，
+    # 顺带能拦住「目录被人换过远端」——推错仓库比推失败更难查。
+    # 凭据走临时 credential helper 而不是带 token 的 URL：push 失败时 git 会把命令行
+    # 回显进 stderr，URL 里的 token 就跟着漏出去了
+    origin = (await _git(ws, "remote", "get-url", "origin", timeout=30)).out.strip()
+    if repo_slug(origin) and repo_slug(origin) != slug:
+        return {"ok": False,
+                "message": f"{side} 侧目录的远端是 {repo_slug(origin)}，与题块仓库 {slug} 不一致"}
     push = await dockerx.run(
-        ["git", "-C", str(ws), "push", authed_url(repo_url, _token()),
+        ["git", "-C", str(ws), *credential_args(repo_url), "push", "origin",
          f"HEAD:refs/heads/{side}"], timeout=300,
     )
     if not push.ok:
