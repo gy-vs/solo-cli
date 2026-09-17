@@ -61,31 +61,24 @@ def test_parse_multi():
     assert "第二段：hunk 头用标准格式。" in t1.user_prompt
     assert "题号" not in t1.user_prompt
     assert t2.user_prompt == "修一下这个 bug。"
-    assert t2.fields["session_id"] == ""
+    # SessionID / TurnID 不再入库：双跑时两侧各有自己的会话号，题级放不下
+    assert "session_id" not in t1.fields and "turn_id" not in t1.fields
 
 
-def test_backfill_only_two_lines(tmp_path: Path):
+def test_import_picks_up_repo_url(tmp_db, tmp_path, monkeypatch):
+    """双跑要按分支 clone 两份，仓库地址必须在导入时就拿到。"""
+    from app.db import session
+    from app.models import Task
+
     f = tmp_path / "prompt.md"
     f.write_text(SAMPLE, encoding="utf-8")
-    tasks = prompt_bank.parse_text(SAMPLE)
-    changed = prompt_bank.backfill_file(f, "01", tasks[0].prompt_hash, "sess-uuid", "prompt-uuid")
-    assert changed == 2
-    after = f.read_text(encoding="utf-8")
-    assert "SessionID：sess-uuid\n" in after
-    assert "TurnID/PromptID：prompt-uuid\n" in after
-    # 第二题不受影响
-    assert "SessionID：\nTurnID/PromptID：\n" in after
-    # 其余字节不变
-    before_lines = SAMPLE.splitlines()
-    after_lines = after.splitlines()
-    assert len(before_lines) == len(after_lines)
-    diff = [(a, b) for a, b in zip(before_lines, after_lines) if a != b]
-    assert len(diff) == 2
-    assert list(tmp_path.glob("prompt.md.bak.*"))
+    monkeypatch.setattr(prompt_bank.config, "prompt_file", lambda: f)
+    monkeypatch.setattr(prompt_bank, "archive_files", lambda: [])
 
-
-def test_backfill_wrong_hash_noop(tmp_path: Path):
-    f = tmp_path / "prompt.md"
-    f.write_text(SAMPLE, encoding="utf-8")
-    assert prompt_bank.backfill_file(f, "01", "deadbeef", "s", "t") == 0
-    assert f.read_text(encoding="utf-8") == SAMPLE
+    res = prompt_bank.import_tasks()
+    assert res["parsed"] == 2
+    with session() as db:
+        t1 = db.query(Task).filter(Task.task_no == "01").one()
+        assert t1.repo_url == "https://github.com/gy-vs/merge-conflict-lab"
+        # 第二题题块里没写仓库，留空让门禁去拦，不要瞎猜
+        assert db.query(Task).filter(Task.task_no == "02").one().repo_url == ""

@@ -16,7 +16,7 @@
     <空行>
     <正文…直到下一个「题号：」或文件末尾>
 
-回填只改 SessionID / TurnID 两行的值，其余字节不动。
+「仓库：」那一行是双跑的关键：A、B 两个分支都从它 clone。
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from sqlalchemy import select
 from app import config
 from app.db import session
 from app.models import AVAILABLE, ORIGIN_BANK, Task
+from app.services import gsb_repo
 
 BODY_MARKER = "以下为发送给模型的 prompt 正文，整段复制。"
 _TASK_LINE = re.compile(r"^题号[：:]\s*(\S+)\s*$")
@@ -49,8 +50,6 @@ FIELD_MAP = {
     "操作系统": "os_platform",
     "环境可复现等级": "repro_level",
     "初始环境快照": "env_snapshot",
-    "SessionID": "session_id",
-    "TurnID/PromptID": "turn_id",
 }
 META_KEYS = ("仓库", "本地路径", "容器工作目录", "轨迹目录", "来源说明")
 
@@ -115,10 +114,6 @@ def parse_file(path: Path | None = None) -> list[ParsedTask]:
     return parse_text(path.read_text(encoding="utf-8"))
 
 
-def _pending_value(v: str) -> bool:
-    return (not v) or v.startswith("待回填")
-
-
 def archive_files() -> list[Path]:
     """出题/prompts/ 下的单题归档。/solo-prompt 批量出题时每题一个文件。"""
     d = config.CODER_ROOT_MOUNT / config.PROMPTS_ARCHIVE_DIR
@@ -159,65 +154,12 @@ def import_tasks(*, sources: list[Path] | None = None, origin: str = ORIGIN_BANK
                      user_prompt=p.user_prompt, origin=origin, design_run_id=design_run_id)
             t.meta = p.meta
             for fk, fv in p.fields.items():
-                if fk in ("session_id", "turn_id") and _pending_value(fv):
-                    continue
                 setattr(t, fk, fv)
-            t.container_name = config.TaskPaths(p.task_no).container_name
+            # 双跑要按分支 clone 两份，仓库地址必须在导入时就拿到，
+            # 不然领题时得回头再解析一遍题块
+            t.repo_url = gsb_repo.parse_repo_url(p.meta)
             db.add(t)
             db.flush()
             added.append(p.task_no)
             added_ids.append(t.id)
     return {"parsed": len(parsed), "added": added, "added_ids": added_ids, "skipped": skipped}
-
-
-def _rewrite_block(lines: list[str], start: int, end: int, session_id: str, turn_id: str) -> tuple[list[str], int]:
-    changed = 0
-    for i in range(start, end):
-        text = lines[i]
-        stripped = text.rstrip("\r\n")
-        eol = text[len(stripped):]
-        kv = _KV_LINE.match(stripped)
-        if not kv:
-            continue
-        key = kv.group(1).strip()
-        sep_idx = stripped.find("：") if "：" in stripped else stripped.find(":")
-        prefix = stripped[: sep_idx + 1]
-        if key == "SessionID" and session_id:
-            lines[i] = f"{prefix}{session_id}{eol}"
-            changed += 1
-        elif key == "TurnID/PromptID" and turn_id:
-            lines[i] = f"{prefix}{turn_id}{eol}"
-            changed += 1
-    return lines, changed
-
-
-def backfill_file(path: Path, task_no: str, prompt_hash: str, session_id: str, turn_id: str) -> int:
-    """在单个文件中定位题块（题号 + 正文哈希双重匹配）并回填。返回修改行数。"""
-    if not path.exists():
-        return 0
-    text = path.read_text(encoding="utf-8")
-    lines = text.splitlines(keepends=True)
-    total = 0
-    for s, e in split_blocks(lines):
-        p = parse_block(lines, s, e)
-        if p.task_no != task_no or p.prompt_hash != prompt_hash:
-            continue
-        lines, changed = _rewrite_block(lines, s, e, session_id, turn_id)
-        total += changed
-    if total:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        shutil.copy2(path, path.with_name(f"{path.name}.bak.{stamp}"))
-        path.write_text("".join(lines), encoding="utf-8")
-    return total
-
-
-def backfill(task: Task) -> dict:
-    """回填 prompt.md 与 出题/prompts/NN.md。"""
-    paths = config.TaskPaths(task.task_no)
-    results = {}
-    for label, path in (("prompt.md", config.prompt_file()), ("archive", paths.prompt_archive)):
-        try:
-            results[label] = backfill_file(path, task.task_no, task.prompt_hash, task.session_id, task.turn_id)
-        except OSError as exc:
-            results[label] = f"error: {exc}"
-    return results
