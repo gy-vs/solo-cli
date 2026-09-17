@@ -13,11 +13,11 @@ const models = ref<string[]>([])
 const modelsSource = ref('')
 const loadingModels = ref(false)
 
-const GROUP_PROBE: Record<string, { key: 'qa' | 'gateway' | 'cursor' | 'docker' | 'qc'; label: string }> = {
-  'solo-qa 身份': { key: 'qa', label: '测试 solo-qa 身份' },
+const GROUP_PROBE: Record<string, { key: 'gsb' | 'gateway' | 'cursor' | 'docker' | 'dedup'; label: string }> = {
+  'GSB 平台': { key: 'gsb', label: '测试平台身份' },
   'Claude Code 容器': { key: 'docker', label: '检查 Docker 与镜像' },
   'Cursor CLI 分析': { key: 'cursor', label: '测试 Cursor（pong）' },
-  'solo-qa 质检': { key: 'qc', label: '测试质检通道' },
+  '题目查重': { key: 'dedup', label: '测试查重通道' },
 }
 const probes = reactive<Record<string, { busy: boolean; ok: boolean | null; message: string; at: string }>>({})
 

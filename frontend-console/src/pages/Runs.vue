@@ -2,25 +2,26 @@
 import { NButton, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, type TaskBrief } from '../api'
+import { api, SIDES, type Side, type TaskBrief } from '../api'
 import RunCard from '../components/RunCard.vue'
 import StatusPill from '../components/StatusPill.vue'
-import { fmtDuration, fmtTime } from '../status'
+import { fmtDuration, fmtTime, RUN_END, SIDE_HEX, VERDICT_LABEL } from '../status'
 import { liveTasks, nowMs, refreshTasks, store } from '../store'
 
 const router = useRouter()
 const msg = useMessage()
 const active = computed(() => liveTasks.value.filter((t) => t.status === 'RUNNING' || t.status === 'QUEUED'))
 const ended = computed(() => liveTasks.value
-  .filter((t) => ['FINISHED', 'FAILED', 'TIMEOUT', 'INTERRUPTED', 'REVIEWED', 'UPLOADED'].includes(t.status))
+  .filter((t) => ['RUN_DONE', 'ANALYZING', 'ANALYZED', 'UPLOADED', 'NEEDS_ATTENTION'].includes(t.status))
   .sort((a, b) => (b.finished_at || '').localeCompare(a.finished_at || '')))
-const uploadable = computed(() => ended.value.filter((t) => t.status === 'REVIEWED' && t.verify_overall !== 'block'))
+const uploadable = computed(() => ended.value.filter((t) => t.status === 'ANALYZED'
+  && t.verify_overall !== 'block' && SIDES.every((s) => t.screencast?.[s])))
 
 const batching = ref(false)
 async function uploadAll() {
   const ids = uploadable.value.map((t) => t.id)
   if (!ids.length) return
-  if (!confirm(`将上传 ${ids.length} 道已评审的题到 solo-qa，继续？`)) return
+  if (!confirm(`将上传 ${ids.length} 道题的 GSB 结论，继续？`)) return
   batching.value = true
   try {
     const r = await api.batchUpload(ids)
@@ -29,14 +30,23 @@ async function uploadAll() {
     await refreshTasks()
   } catch (e: any) { msg.error(e.message) } finally { batching.value = false }
 }
+/** 列表右侧那行小字：这题现在到底卡在哪 */
 function stage(t: TaskBrief): { text: string; cls: string } {
+  if (t.status === 'NEEDS_ATTENTION') return { text: '重跑用尽 · 需人工', cls: 'text-err' }
   if (t.status === 'UPLOADED') return { text: `已上传 #${t.submission_id ?? ''}`, cls: 'text-info' }
-  if (t.status === 'REVIEWED') return { text: t.verify_overall === 'warn' ? '已评审 · 有提醒' : '已评审 · 可上传', cls: 'text-ok' }
-  if (t.analysis_status === 'RUNNING') return { text: 'Cursor 分析中', cls: 'text-run' }
-  if (t.analysis_status === 'DONE') return { text: t.verify_overall === 'block' ? '核验有红项' : '待人工评审', cls: t.verify_overall === 'block' ? 'text-err' : 'text-warn' }
+  if (t.status === 'ANALYZED') {
+    const missing = SIDES.filter((s) => !t.screencast?.[s])
+    if (missing.length) return { text: `等 ${missing.join('、')} 侧录屏`, cls: 'text-warn' }
+    if (t.verify_overall === 'block') return { text: '自检有红项', cls: 'text-err' }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 可上传`, cls: 'text-ok' }
+  }
+  if (t.analysis_status === 'RUNNING') return { text: '对比分析中', cls: 'text-run' }
   if (t.analysis_status === 'FAILED') return { text: '分析失败', cls: 'text-err' }
-  return { text: '待分析', cls: 'text-fg1' }
+  return { text: '待提交产物与分析', cls: 'text-fg1' }
 }
+const doneRuns = (t: TaskBrief) => t.runs.filter((r) => RUN_END.includes(r.status)).length
+const containers = (t: TaskBrief) => t.runs.filter((r) => r.container_exists).length
+const changed = (t: TaskBrief, s: Side) => t.runs.find((r) => r.side === s)?.artifact?.changed_files ?? '—'
 </script>
 
 <template>
@@ -44,17 +54,19 @@ function stage(t: TaskBrief): { text: string; cls: string } {
     <div class="flex items-center gap-3">
       <div>
         <div class="h1">运行舱</div>
-        <div class="text-fg1 text-xs mt-0.5">每题一个容器，结束后在此进入分析、评审、上传，最后手动点「完成」销毁</div>
+        <div class="text-fg1 text-xs mt-0.5">一题两个容器，A、B 同时跑；两侧跑完自动对比，出结论后补录屏链接再上传</div>
       </div>
       <div class="ml-auto inner px-3 h-8 flex items-center gap-2 text-xs">
-        <span class="text-fg1">槽位</span>
+        <span class="text-fg1">容器槽位</span>
         <span class="mono nums text-fg0">{{ store.status?.scheduler.running ?? 0 }} / {{ store.status?.scheduler.max_parallel ?? '-' }}</span>
       </div>
     </div>
 
     <div>
-      <div class="flex items-center gap-3 mb-3"><div class="h2">进行中</div><span class="text-xs text-fg2">{{ active.length }}</span></div>
-      <div v-if="active.length" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+      <div class="flex items-center gap-3 mb-3">
+        <div class="h2">进行中</div><span class="text-xs text-fg2">{{ active.length }} 题 · {{ store.status?.running_sides ?? 0 }} 侧在跑</span>
+      </div>
+      <div v-if="active.length" class="grid grid-cols-1 xl:grid-cols-2 gap-4">
         <RunCard v-for="t in active" :key="t.id" :task="t" @stop="refreshTasks" />
       </div>
       <div v-else class="card empty">没有运行中的容器 · 去题库领题</div>
@@ -70,7 +82,7 @@ function stage(t: TaskBrief): { text: string; cls: string } {
       </div>
       <div v-if="!ended.length" class="empty">暂无</div>
       <div v-for="t in ended" :key="t.id"
-        class="px-4 py-3 border-t border-line grid grid-cols-[56px_120px_1fr_150px_90px_130px_auto] items-center gap-3 hover:bg-bg3/40 cursor-pointer"
+        class="px-4 py-3 border-t border-line grid grid-cols-[56px_120px_1fr_130px_120px_130px_auto] items-center gap-3 hover:bg-bg3/40 cursor-pointer"
         @click="router.push(`/tasks/${t.id}`)">
         <span class="mono text-xs text-fg0">#{{ t.task_no }}</span>
         <StatusPill :status="t.status" small />
@@ -79,12 +91,20 @@ function stage(t: TaskBrief): { text: string; cls: string } {
           <div class="text-[12px] truncate" :class="stage(t).cls">{{ stage(t).text }}</div>
         </div>
         <div class="mono text-[12px] text-fg1 nums">
-          <div>{{ fmtDuration(t.started_at, t.finished_at, nowMs) }} · {{ t.protocol?.num_turns ?? '—' }} 轮</div>
-          <div class="text-fg2">exit {{ t.exit_code ?? '—' }} · 改动 {{ t.artifact?.changed_files ?? '—' }}</div>
+          <div>{{ fmtDuration(t.claimed_at, t.finished_at, nowMs) }} · {{ doneRuns(t) }}/2 侧</div>
+          <div class="text-fg2">改动 A {{ changed(t, 'A') }} · B {{ changed(t, 'B') }}</div>
         </div>
-        <div class="mono text-[12px] text-fg2 truncate" :title="t.session_id">{{ t.session_id ? t.session_id.slice(0, 8) : '无轨迹' }}</div>
+        <div class="flex items-center gap-1.5 mono text-[12px]">
+          <span v-if="t.gsb_verdict" class="pill h-5 text-[12px]"
+            :style="{ color: SIDE_HEX[t.gsb_verdict as Side] || '#475569', borderColor: (SIDE_HEX[t.gsb_verdict as Side] || '#475569') + '55' }">
+            {{ VERDICT_LABEL[t.gsb_verdict] }}
+          </span>
+          <span v-else class="text-fg2">无结论</span>
+        </div>
         <div class="mono text-[12px] text-fg2 nums">{{ fmtTime(t.finished_at) }}</div>
-        <span class="dot" :class="t.container_exists ? 'bg-run' : 'bg-fg2'" :title="t.container_exists ? '容器保留中' : '容器已销毁'" />
+        <span class="mono text-[12px] text-fg2" :title="`${containers(t)} 个容器保留中`">
+          <span class="dot mr-1" :class="containers(t) ? 'bg-run' : 'bg-fg2'" />{{ containers(t) }}/2
+        </span>
       </div>
     </div>
   </div>

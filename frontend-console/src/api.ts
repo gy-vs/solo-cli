@@ -27,9 +27,52 @@ const post = <T>(p: string, body?: any) => request<T>(p, { method: 'POST', body:
 const put = <T>(p: string, body?: any) => request<T>(p, { method: 'PUT', body: JSON.stringify(body) })
 
 // ---------- 类型 ----------
+/** 题级状态：只描述这道题走到哪一步，单侧容器跑得怎样看 TaskRun.status */
 export type Status =
-  | 'AVAILABLE' | 'CLAIMED' | 'QUEUED' | 'RUNNING' | 'FINISHED' | 'FAILED'
-  | 'TIMEOUT' | 'INTERRUPTED' | 'REVIEWED' | 'UPLOADED' | 'DONE' | 'DISCARDED'
+  | 'AVAILABLE' | 'CLAIMED' | 'QUEUED' | 'RUNNING' | 'RUN_DONE' | 'ANALYZING'
+  | 'ANALYZED' | 'UPLOADED' | 'DONE' | 'NEEDS_ATTENTION' | 'DISCARDED'
+
+/** 单侧运行状态。取值与题级有同名的，比较时别混用 */
+export type RunStatus = 'PENDING' | 'QUEUED' | 'RUNNING' | 'FINISHED' | 'FAILED' | 'TIMEOUT' | 'INTERRUPTED'
+
+export type Side = 'A' | 'B'
+export const SIDES: Side[] = ['A', 'B']
+
+/** GSB 结论。库里存短值，上传时才换成平台的中文标签 */
+export type Verdict = 'A' | 'B' | 'Same'
+
+export interface TaskRunBrief {
+  id: number
+  side: Side
+  status: RunStatus
+  /** 第几次跑。重跑加一，超过上限就转人工 */
+  attempt: number
+  container_name: string
+  container_exists: boolean
+  image_tag: string
+  exit_code: number | null
+  session_id: string
+  turn_id: string
+  trace_file: string
+  artifact_sha: string
+  artifact_url: string
+  protocol: { subtype?: string; num_turns?: number; duration_ms?: number; cost_usd?: number; usage?: any; thinking_tokens?: number | null }
+  artifact: { trace_found?: boolean; trace_count?: number; tool_calls?: number; tool_errors?: number; human_turns?: number; changed_files?: number }
+  /** 网关 5xx / 429。按平台规则不作为 GSB 判断依据，只触发重跑 */
+  gateway_errors: string[]
+  notes: string[]
+  abnormal: { reason?: string; at?: string; attempt?: number; gave_up?: boolean }
+  error: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface TaskRunDetail extends TaskRunBrief {
+  result: any
+  verdict: any
+  trace_summary: any
+  git_diff_stat: string
+}
 
 export interface TaskBrief {
   id: number
@@ -44,75 +87,82 @@ export interface TaskBrief {
   os_platform: string
   repro_level: string
   env_snapshot: string
-  repo_id: string
+  repo_url: string
+  repo_slug: string
+  branch_check: { ok?: boolean; message?: string; at?: string }
   prompt_preview: string
   prompt_chars: number
-  session_id: string
-  turn_id: string
-  container_name: string
-  container_exists: boolean
-  image_tag: string
-  exit_code: number | null
-  round_no: number
-  rounds: RoundRecord[]
-  can_continue: boolean
   meta: Record<string, string>
-  verdict_notes: string[]
-  protocol: { subtype?: string; num_turns?: number; duration_ms?: number; cost_usd?: number; usage?: any }
-  artifact: { trace_found?: boolean; trace_count?: number; tool_calls?: number; tool_errors?: number; changed_files?: number }
-  verify_overall: 'pass' | 'warn' | 'block' | null
+  gsb_verdict: Verdict | ''
+  gsb_reason_chars: number
+  screencast: Partial<Record<Side, string>>
+  verify_overall: 'ok' | 'warn' | 'block' | null
+  verify_blocked: number
   upload_ok: boolean | null
   submission_id: number | null
-  error: string
+  priority: number
+  origin: 'bank' | 'designed'
+  design_run_id: number
+  auto_stage: string
+  auto_error: string
+  dedup_verdict: '' | 'pass' | 'discard' | 'unknown'
+  dedup_reason: string
   created_at: string | null
   claimed_at: string | null
-  started_at: string | null
   finished_at: string | null
   uploaded_at: string | null
   done_at: string | null
   discarded_at: string | null
   discarded_from: string
-  qc_status: QcStatus
-  qc_conclusion: string
-  qc_summary: string
-  qc_failed_count: number
-  qc_at: string | null
-  priority: number
-  origin: 'bank' | 'designed'
-  design_run_id: number
-  auto_stage: '' | 'destroy' | 'analyze' | 'qc' | 'done'
-  auto_error: string
-  dedup_verdict: '' | 'pass' | 'discard' | 'unknown'
-  dedup_reason: string
+  runs: TaskRunBrief[]
 }
 
-export type QcStatus = 'IDLE' | 'RUNNING' | 'DONE' | 'FAILED'
+/** GSB 对比结论。分析产出，每一项都可人工改 */
+export interface Gsb {
+  verdict: Verdict | ''
+  reason: string
+  a_findings: { good: string[]; bad: string[] }
+  b_findings: { good: string[]; bad: string[] }
+  a_startup: Startup
+  b_startup: Startup
+  evidence: { side?: string; step?: number; file?: string; quote?: string }[]
+  remark: string
+  validity?: string
+}
 
-export interface ResetStep {
-  step: string
+/** 启动说明。录屏要照着这个把项目跑起来 */
+export interface Startup {
+  steps: string[]
+  commands: string[]
+  note: string
+}
+
+export interface VerifyItem { name: string; level: 'ok' | 'warn' | 'block'; message: string }
+export interface VerifyReport {
+  overall: 'ok' | 'warn' | 'block'
+  blocked: number
+  warnings: number
+  items: VerifyItem[]
+}
+
+export interface TaskDetail extends TaskBrief {
+  user_prompt: string
+  gsb: Gsb | Record<string, never>
+  analysis: any
+  verify: VerifyReport | Record<string, never>
+  upload: any
+  dedup: any
+  runs: TaskRunDetail[]
+}
+
+export interface GateCheck { name: string; level: 'ok' | 'warn' | 'block'; message: string; fix: string }
+export interface GateReport { passed: boolean; blocked: number; warnings: number; checks: GateCheck[] }
+
+/** 领题时先 clone 两侧，分支不合规就不往下走 */
+export interface PrepareResult {
   ok: boolean
   message: string
-}
-
-export interface QcCheck {
-  name: string
-  passed: boolean
-  summary: string
-  detail: string
-  rule?: string
-}
-export interface QcResult {
-  ok: boolean
-  error?: string
-  conclusion?: 'PASS' | 'REJECT' | 'DISCARD' | 'INCOMPLETE'
-  hit_rule?: string
-  summary?: string
-  confidence?: number
-  needs_review?: boolean
-  checks?: QcCheck[]
-  failed_checks?: QcCheck[]
-  llm_ms?: number
-  elapsed_ms?: number
+  sides: Partial<Record<Side, { ok: boolean; reused: boolean; message: string }>>
 }
 
 export interface DesignRun {
@@ -141,55 +191,6 @@ export interface DesignRun {
 
 export interface DesignCheck { name: string; ok: boolean; message: string }
 
-export interface Evidence { step?: number; file?: string; quote?: string }
-export interface Review {
-  scores: Record<string, number | null>
-  descs: Record<string, string>
-  evidence: Record<string, Evidence[]>
-  other_issues: string
-  coverage: { point: string; status: string; evidence?: string }[]
-  verification?: { commands?: string[]; summary?: string }
-}
-export interface VerifyItem { dim?: string; level: 'ok' | 'warn' | 'block'; code: string; message: string; words?: string[] }
-export interface VerifyReport {
-  overall: 'pass' | 'warn' | 'block'
-  blocks: number
-  warns: number
-  evidence_total: number
-  evidence_hit: number
-  evidence_hit_rate: number | null
-  items: VerifyItem[]
-}
-
-/** 上传成功后把工作区产物提交到 solo/* 分支的结果 */
-export interface CommitResult {
-  ok: boolean
-  skipped?: boolean
-  message: string
-  branch?: string
-  commit?: string
-  short?: string
-  changed_files?: number
-}
-
-export interface TaskDetail extends TaskBrief {
-  user_prompt: string
-  result: any
-  verdict: any
-  trace_summary: any
-  trace_file: string
-  git_diff_stat: string
-  analysis: any
-  review: Review
-  verify: VerifyReport | Record<string, never>
-  upload: any
-  qc: QcResult | Record<string, never>
-  dedup: any
-}
-
-export interface GateCheck { name: string; level: 'ok' | 'warn' | 'block'; message: string; fix: string }
-export interface GateReport { passed: boolean; blocked: number; warnings: number; checks: GateCheck[] }
-
 export interface SettingItem {
   key: string; label: string; group: string; secret: boolean; kind: string; help: string
   default: string; configured: boolean; value: string
@@ -198,41 +199,27 @@ export interface SettingItem {
 export interface SystemStatus {
   docker: { ok: boolean; message: string }
   image: { name: string; present: boolean }
-  scheduler: {
-    running: number; max_parallel: number; running_ids: number[]; queued: number; paused: boolean
-    /** 有槽位也起不来的题：同项目已有一道在跑 */
-    repo_waiting: { id: number; task_no: string; repo_id: string; blocked_by: string }[]
-  }
-  pipeline: { running: number[]; max_parallel: number; destroy: boolean; analyze: boolean; qc: boolean }
-  qc: { ok: boolean; message: string; image: string }
+  /** 额度单位是容器：一道题占两个 */
+  scheduler: { running: number; max_parallel: number; running_ids: number[]; queued: number; paused: boolean }
+  watchdog: { interval_seconds: number; max_retries: number }
+  dedup: { ok: boolean; message: string; image: string }
   design: { running: number[] }
   counts: Record<Status, number>
+  running_sides: number
   totals: { finished: number; uploaded: number; date: string }
   containers: { name: string; status: string; task_no: string }[]
   configured: Record<string, boolean>
   paths: { coder_root_host: string; coder_root_mount: string; prompt_file: string; prompt_exists: boolean }
 }
 
-export interface RunEvent { seq: number; round_no?: number; kind: string; summary: string; ts: string | null; payload: any }
-
-/** 一轮续跑的留痕。镜像不支持 --resume，所以每轮是独立会话与独立轨迹。 */
-export interface RoundRecord {
-  round_no: number
-  status: Status
-  exit_code: number | null
-  container: string
-  trace_file: string
-  session_id: string
-  changed_files: number
-  prompt: string
-  finished_at: string
-}
+export interface RunEvent { seq: number; side?: Side; kind: string; summary: string; ts: string | null; payload: any }
 
 // ---------- 接口 ----------
 export const api = {
   health: () => get<{ ok: boolean }>('/api/health'),
   status: () => get<SystemStatus>('/api/system/status'),
-  probe: (target: 'qa' | 'gateway' | 'cursor' | 'docker' | 'qc') => post<{ ok: boolean; message: string }>(`/api/system/probe/${target}`),
+  probe: (target: 'gsb' | 'gateway' | 'cursor' | 'docker' | 'dedup') =>
+    post<{ ok: boolean; message: string }>(`/api/system/probe/${target}`),
 
   settings: () => get<{ items: SettingItem[] }>('/api/settings'),
   saveSettings: (values: Record<string, string>) => put<{ written: string[]; items: SettingItem[] }>('/api/settings', { values }),
@@ -247,48 +234,55 @@ export const api = {
   },
   task: (id: number) => get<TaskDetail>(`/api/tasks/${id}`),
   importBank: () => post<{ parsed: number; added: string[]; skipped: number }>('/api/tasks/import'),
+
+  // ---- 领取与门禁 ----
   gate: (id: number) => post<GateReport>(`/api/tasks/${id}/gate`),
   claim: (id: number, force = false) =>
-    post<{ queued: boolean; gate: GateReport; waits_repo: boolean }>(`/api/tasks/${id}/claim${force ? '?force=true' : ''}`),
+    post<{ queued: boolean; prepare: PrepareResult; gate: GateReport | null }>(`/api/tasks/${id}/claim${force ? '?force=true' : ''}`),
   release: (id: number) => post<{ ok: boolean }>(`/api/tasks/${id}/release`),
   discard: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/discard`),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
-  // 默认不归档：还原就是彻底清掉轨迹与分析产物
-  resetTask: (id: number, keepTraces = false) =>
-    post<{ ok: boolean; steps: ResetStep[] }>(`/api/tasks/${id}/reset?keep_traces=${keepTraces}`),
-  fix: (id: number, action: string) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/fix/${action}`),
-  stop: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/stop`),
-  continueRun: (id: number, prompt: string) =>
-    post<{ ok: boolean; round_no: number; container: string; message: string }>(`/api/tasks/${id}/continue`, { prompt }),
-  events: (id: number) => get<{ items: RunEvent[] }>(`/api/tasks/${id}/events/list`),
-  traceIndex: (id: number) => get<any>(`/api/tasks/${id}/trace-index`),
+  fix: (id: number, action: 'clone_sides' | 'reset_sides' | 'archive_traces' | 'remove_containers') =>
+    post<{ ok: boolean; message: string }>(`/api/tasks/${id}/fix/${action}`),
+
+  // ---- 运行 ----
+  /** 不给 side 就把两侧都停了 */
+  stop: (id: number, side?: Side) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/stop${side ? '?side=' + side : ''}`),
+  /** 人工重跑。留空 sides 表示两侧都重跑；不看次数上限并把计数清零 */
+  rerun: (id: number, sides: Side[] = []) =>
+    post<{ ok: boolean; message: string }>(`/api/tasks/${id}/rerun`, { sides }),
+  events: (id: number, side?: Side) =>
+    get<{ items: RunEvent[]; total: number; truncated: boolean }>(`/api/tasks/${id}/events/list${side ? '?side=' + side : ''}`),
+  traceIndex: (id: number, side: Side) => get<any>(`/api/tasks/${id}/trace-index?side=${side}`),
+  traceUrl: (id: number, side: Side) => `/api/tasks/${id}/trace?side=${side}`,
+
+  // ---- GSB 分析与结论 ----
   analyze: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/analyze`),
-  saveReview: (id: number, body: { scores: Record<string, number | null>; descs: Record<string, string>; other_issues: string; evidence?: any; coverage?: any }) =>
-    put<{ verify: VerifyReport; task: TaskBrief }>(`/api/tasks/${id}/review`, body),
+  /** 手动走一遍推产物加开分析，给推送失败后重试用 */
+  advance: (id: number) => post<{ ok: boolean; message?: string; error?: string }>(`/api/tasks/${id}/advance`),
+  saveGsb: (id: number, body: { verdict?: string; reason: string; a_startup?: Startup; b_startup?: Startup; validity?: string; remark?: string }) =>
+    put<{ verify: VerifyReport; task: TaskBrief }>(`/api/tasks/${id}/gsb`, body),
   verify: (id: number) => post<VerifyReport>(`/api/tasks/${id}/verify`),
-  upload: (id: number) =>
-    post<{ ok: boolean; message: string; submission_id?: number; commit?: CommitResult }>(`/api/tasks/${id}/upload`),
+
+  // ---- 录屏 ----
+  saveScreencast: (id: number, body: Partial<Record<Side, string>>) =>
+    put<{ verify: VerifyReport; task: TaskBrief }>(`/api/tasks/${id}/screencast`, body),
+  uploadScreencast: (id: number, side: Side, path: string) =>
+    post<{ ok: boolean; url: string; message: string }>(`/api/tasks/${id}/screencast/upload?side=${side}&path=${encodeURIComponent(path)}`),
+
+  // ---- 上传与收尾 ----
+  upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),
   batchUpload: (ids: number[]) => post<{ results: any[] }>('/api/tasks/batch/upload', { ids }),
   batchClaim: (ids: number[]) => post<{ results: any[] }>('/api/tasks/batch/claim', { ids }),
   complete: (id: number, force = false) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/complete${force ? '?force=true' : ''}`),
   destroyContainer: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/destroy-container`),
-  traceUrl: (id: number) => `/api/tasks/${id}/trace`,
-
-  // ---- 质检 ----
-  qc: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/qc`),
-  batchQc: (ids: number[]) => post<{ ok: boolean; started: number }>('/api/tasks/batch/qc', { ids }),
-  rerunPipeline: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/pipeline`),
 
   // ---- 队列 ----
-  queue: () => get<{
-    items: TaskBrief[]
-    scheduler: SystemStatus['scheduler']
-    pipeline: { running: number[]; max_parallel: number }
-  }>('/api/tasks/queue/list'),
+  queue: () => get<{ items: TaskBrief[]; scheduler: SystemStatus['scheduler'] }>('/api/tasks/queue/list'),
   queueMove: (id: number, direction: 'top' | 'up' | 'down' | 'bottom') =>
     post<{ ok: boolean; priority: number }>(`/api/tasks/${id}/queue/move`, { direction }),
   queuePause: (paused: boolean) => post<{ ok: boolean; paused: boolean; message: string }>(`/api/tasks/queue/pause?paused=${paused}`),
-  queueParallel: (value: number) => post<{ ok: boolean; max_parallel: number }>(`/api/tasks/queue/parallel?value=${value}`),
+  queueParallel: (value: number) => post<{ ok: boolean; max_parallel: number; message: string }>(`/api/tasks/queue/parallel?value=${value}`),
 
   // ---- 题目设计 ----
   designPreflight: () => get<{ checks: DesignCheck[]; ready: boolean; default_count: number; auto_dedup: boolean }>('/api/design/preflight'),

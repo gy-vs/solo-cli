@@ -11,10 +11,10 @@ const dialog = useDialog()
 const busy = ref('')
 
 const FIX_LABEL: Record<string, string> = {
-  reset_snapshot: '重置到初始快照',
+  clone_sides: '重新拉取两侧',
+  reset_sides: '重置到初始快照',
   archive_traces: '归档现有轨迹',
-  remove_container: '删除残留容器',
-  switch_branch: '切到题目分支',
+  remove_containers: '删除残留容器',
 }
 const color = (l: string) => LEVEL_HEX[l] || LEVEL_HEX.block
 
@@ -22,16 +22,16 @@ async function run(action: string) {
   if (!props.task) return
   busy.value = action
   try {
-    const r = await api.fix(props.task.id, action)
+    const r = await api.fix(props.task.id, action as any)
     r.ok ? msg.success(r.message || '已处理') : msg.error(r.message)
     emit('recheck')
   } catch (e: any) { msg.error(e.message) } finally { busy.value = '' }
 }
 function fix(action: string) {
-  if (action !== 'reset_snapshot') return run(action)
+  if (action !== 'reset_sides') return run(action)
   dialog.warning({
-    title: '重置到初始快照',
-    content: '在题目分支上执行 git reset --hard 与 git clean -fdx，清空工作目录里所有未提交改动与被忽略的文件。'
+    title: '重置两侧到初始快照',
+    content: '在 A、B 两个工作目录里各执行 git reset --hard 与 git clean -fdx，清空未提交改动与被忽略的文件。'
       + '分支上已有的交付提交会先备份到 refs/solo-backup/*，之后能用 git log 找回。',
     positiveText: '确认重置',
     negativeText: '取消',
@@ -55,7 +55,7 @@ function fix(action: string) {
         <div class="mono text-[12px] text-fg2">{{ c.name }}</div>
         <div class="text-fg0 text-xs break-all">{{ c.message }}</div>
       </div>
-      <NButton v-if="c.fix" size="tiny" secondary :type="c.fix === 'reset_snapshot' ? 'warning' : 'default'"
+      <NButton v-if="c.fix" size="tiny" secondary :type="c.fix === 'reset_sides' ? 'warning' : 'default'"
         :loading="busy === c.fix" @click="fix(c.fix)">{{ FIX_LABEL[c.fix] || c.fix }}</NButton>
     </div>
   </div>

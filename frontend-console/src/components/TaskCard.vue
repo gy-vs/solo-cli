@@ -1,23 +1,22 @@
 <script setup lang="ts">
 import { NButton } from 'naive-ui'
+import { computed } from 'vue'
 import type { TaskBrief } from '../api'
+import SideStrip from './SideStrip.vue'
 import StatusPill from './StatusPill.vue'
-import { fmtTime, HEX } from '../status'
+import { fmtTime, HEX, VERDICT_LABEL } from '../status'
 
-const props = defineProps<{ task: TaskBrief; busy?: boolean; mates?: TaskBrief[] }>()
+const props = defineProps<{ task: TaskBrief; busy?: boolean }>()
 const emit = defineEmits<{
   (e: 'claim'): void; (e: 'release'): void; (e: 'open'): void
-  (e: 'discard'): void; (e: 'restore'): void; (e: 'reset'): void
+  (e: 'discard'): void; (e: 'restore'): void
 }>()
 const diffColor = (d: string) => (d.includes('困难') ? HEX.warn : d.includes('中') ? HEX.run : HEX.fg1)
 const claimable = () => props.task.status === 'AVAILABLE' || props.task.status === 'CLAIMED'
-// 同项目的题同时跑会互相盖改动，卡片上直接点名，正在跑的额外标红
-const mates = () => props.mates || []
-const runningMates = () => mates().filter((m) => m.status === 'RUNNING')
-const mateText = (t: TaskBrief) => `#${t.task_no}${t.status === 'RUNNING' ? '（运行中）' : t.status === 'QUEUED' ? '（排队中）' : ''}`
-const discardable = () => !['RUNNING', 'QUEUED', 'DISCARDED'].includes(props.task.status)
-// 跑过或动过的题才需要还原；从没碰过的待领取题没什么可退的
-const resettable = () => !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(props.task.status)
+const discardable = () => !['RUNNING', 'QUEUED', 'ANALYZING', 'DISCARDED'].includes(props.task.status)
+/** 跑起来之后两侧状态比题级状态有用，卡片上直接铺开 */
+const showSides = computed(() => props.task.runs?.length > 0 && props.task.status !== 'DISCARDED')
+const branchBad = computed(() => props.task.branch_check?.ok === false)
 </script>
 
 <template>
@@ -36,16 +35,18 @@ const resettable = () => !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(props.task
     <div class="flex items-center gap-3 text-[12px] text-fg2 mono">
       <span>{{ task.prompt_chars }} 字</span>
       <span>·</span>
-      <span class="truncate" :title="task.env_snapshot">{{ task.env_snapshot.split('/commit/')[1]?.slice(0, 12) || '无快照 SHA' }}</span>
+      <span class="truncate" :title="task.repo_url">{{ task.repo_slug || '无仓库' }}</span>
       <span class="ml-auto">{{ task.harness }} {{ task.harness_version }}</span>
     </div>
-    <div v-if="mates().length" class="text-[12px] flex items-start gap-1.5"
-      :class="runningMates().length ? 'text-warn' : 'text-fg2'">
-      <span class="dot mt-1.5 shrink-0" :class="runningMates().length ? 'bg-warn' : 'bg-fg2'" />
-      <span :title="task.repo_id">
-        与 {{ mates().map(mateText).join('、') }} 共用项目 <span class="mono">{{ task.repo_id.split('/')[1] }}</span>
-        <template v-if="runningMates().length">，现在领取会排队等它跑完</template>
-      </span>
+
+    <SideStrip v-if="showSides" :runs="task.runs" compact />
+
+    <div v-if="branchBad" class="text-[12px] text-err flex items-start gap-1.5">
+      <span class="dot mt-1.5 shrink-0 bg-err" />
+      <span>{{ task.branch_check?.message || '分支结构不合规，需先建好 A、B 分支' }}</span>
+    </div>
+    <div v-if="task.gsb_verdict" class="text-[12px] text-fg1 flex items-center gap-1.5">
+      <span class="dot bg-ok" />结论 {{ VERDICT_LABEL[task.gsb_verdict] }} · 理由 {{ task.gsb_reason_chars }} 字
     </div>
     <div v-if="task.status === 'DISCARDED'" class="text-[12px] text-fg2">
       废弃于 {{ fmtTime(task.discarded_at) }}<span v-if="task.discarded_from">，废弃前为 {{ task.discarded_from }}</span>
@@ -63,8 +64,6 @@ const resettable = () => !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(props.task
       <NButton v-if="task.status === 'DISCARDED'" size="small" type="primary" secondary class="flex-1" :loading="busy" @click="emit('restore')">恢复</NButton>
       <NButton v-if="task.status === 'CLAIMED' || task.status === 'QUEUED'" size="small" tertiary @click="emit('release')">放回</NButton>
       <NButton size="small" tertiary @click="emit('open')">详情</NButton>
-      <NButton v-if="resettable()" size="small" quaternary :loading="busy" title="工作区、轨迹、回填、评审记录全部退回做题前"
-        @click="emit('reset')">还原</NButton>
       <NButton v-if="discardable()" size="small" quaternary type="error" :loading="busy" @click="emit('discard')">废弃</NButton>
     </div>
   </div>

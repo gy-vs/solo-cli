@@ -1,17 +1,18 @@
 <script setup lang="ts">
-import { NButton, NInput, NTag, useDialog, useMessage } from 'naive-ui'
+import { NButton, NTag, useDialog, useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, type GateReport, type Review, type TaskDetail, type VerifyReport } from '../api'
+import { api, SIDES, type GateReport, type Gsb, type Side, type TaskDetail, type TaskRunDetail, type VerifyReport } from '../api'
 import GateChecks from '../components/GateChecks.vue'
-import QcPanel from '../components/QcPanel.vue'
-import ScoreEditor from '../components/ScoreEditor.vue'
+import GsbEditor from '../components/GsbEditor.vue'
+import ScreencastPanel from '../components/ScreencastPanel.vue'
+import SideStrip from '../components/SideStrip.vue'
 import StatusPill from '../components/StatusPill.vue'
 import Timeline from '../components/Timeline.vue'
 import VerifyBar from '../components/VerifyBar.vue'
 import { useGlobalEvents, useRunEvents } from '../sse'
-import { DIMS, fmtDuration, fmtMs, fmtTime, HEX, RUN_END } from '../status'
-import { nowMs, refreshTasks, repoMates, store } from '../store'
+import { fmtDuration, fmtMs, fmtTime, HEX, RUN_END, RUN_LABEL, SIDE_HEX, VERDICT_LABEL } from '../status'
+import { nowMs, refreshTasks, store } from '../store'
 
 const route = useRoute()
 const router = useRouter()
@@ -19,76 +20,87 @@ const msg = useMessage()
 const dialog = useDialog()
 const id = Number(route.params.id)
 
-type Tab = 'verdict' | 'review' | 'qc' | 'upload' | 'steps' | 'prompt'
+type Tab = 'runs' | 'gsb' | 'screencast' | 'upload' | 'steps' | 'prompt'
 const task = ref<TaskDetail | null>(null)
 const loading = ref(true)
 const tab = ref<Tab>('prompt')
-const tabPinned = ref(false)   // 用户手动切过 tab 后不再自动跳转
-const review = ref<Review>({ scores: {}, descs: {}, evidence: {}, other_issues: '', coverage: [] })
+const tabPinned = ref(false)   // 手动切过 tab 后不再自动跳转
+const gsb = ref<Gsb>(emptyGsb())
 const dirty = ref(false)
 const verifyReport = ref<VerifyReport | null>(null)
-const traceIndex = ref<any>(null)
+/** 轨迹索引按侧各存一份 */
+const traceIndex = ref<Partial<Record<Side, any>>>({})
 const highlightStep = ref<number | null>(null)
+/** 事件流和轨迹步骤都只看一侧，省得两列挤在一起 */
+const viewSide = ref<Side>('A')
 
-async function load(keepReview = false) {
+function emptyGsb(): Gsb {
+  const startup = { steps: [], commands: [], note: '' }
+  return {
+    verdict: '', reason: '', a_findings: { good: [], bad: [] }, b_findings: { good: [], bad: [] },
+    a_startup: { ...startup }, b_startup: { ...startup }, evidence: [], remark: '',
+  }
+}
+function normalizeGsb(g: any): Gsb {
+  const e = emptyGsb()
+  if (!g || !Object.keys(g).length) return e
+  return {
+    ...e, ...g,
+    a_findings: { good: g.a_findings?.good || [], bad: g.a_findings?.bad || [] },
+    b_findings: { good: g.b_findings?.good || [], bad: g.b_findings?.bad || [] },
+    a_startup: { ...e.a_startup, ...(g.a_startup || {}) },
+    b_startup: { ...e.b_startup, ...(g.b_startup || {}) },
+    evidence: g.evidence || [],
+  }
+}
+
+async function load(keepEdits = false) {
   const t = await api.task(id)
   task.value = t
-  if (!keepReview || !dirty.value) {
-    review.value = normalizeReview(t.review)
+  if (!keepEdits || !dirty.value) {
+    gsb.value = normalizeGsb(t.gsb)
     dirty.value = false
   }
   verifyReport.value = t.verify && 'overall' in t.verify ? (t.verify as VerifyReport) : null
   loading.value = false
-  const isEnded = RUN_END.includes(t.status) || ['REVIEWED', 'UPLOADED', 'DONE'].includes(t.status)
-  if (isEnded && !traceIndex.value && t.artifact?.trace_found) {
-    traceIndex.value = await api.traceIndex(id).catch(() => null)
-  }
-  // 没跑过的题先看题目信息；跑完看判定；分析完直接进评审
+  // 跑完就看两侧判定；分析出结论后直接进 GSB；等录屏时停在录屏页
   if (!tabPinned.value && !dirty.value) {
-    tab.value = !isEnded ? 'prompt' : (t.analysis_status === 'DONE' ? 'review' : 'verdict')
+    if (!pairEnded(t)) tab.value = t.runs?.length ? 'runs' : 'prompt'
+    else if (t.status === 'ANALYZED' || t.status === 'UPLOADED' || t.status === 'DONE') {
+      tab.value = SIDES.every((s) => t.screencast?.[s]) ? 'gsb' : 'screencast'
+    } else tab.value = 'runs'
   }
 }
-function normalizeReview(r: any): Review {
-  const scores: Record<string, number | null> = {}
-  const descs: Record<string, string> = {}
-  const evidence: Record<string, any[]> = {}
-  for (const d of DIMS) {
-    scores[d] = r?.scores?.[d] ?? null
-    descs[d] = r?.descs?.[d] ?? ''
-    evidence[d] = r?.evidence?.[d] ?? []
-  }
-  return { scores, descs, evidence, other_issues: r?.other_issues ?? '', coverage: r?.coverage ?? [], verification: r?.verification }
-}
-// 直接从地址栏进来时全局列表可能还是空的，共用项目提示要靠它
+const pairEnded = (t: TaskDetail) => (t.runs?.length === 2) && t.runs.every((r) => RUN_END.includes(r.status))
+
 onMounted(() => { load(); if (!store.tasks.length) refreshTasks() })
 useGlobalEvents((p) => { if (p.type === 'task' && p.id === id) load(true) })
-const { events, total: eventTotal, truncated: eventsTruncated, thinkingTokens } = useRunEvents(id, { onFinished: () => load() })
+const { events, total: eventTotal, truncated: eventsTruncated, thinking } = useRunEvents(id, { onFinished: () => load(true) })
+const sideEvents = computed(() => events.value.filter((e) => (e.side || 'A') === viewSide.value))
 
-const isRunning = computed(() => task.value?.status === 'RUNNING' || task.value?.status === 'QUEUED')
-const ended = computed(() => !!task.value && (RUN_END.includes(task.value.status) || ['REVIEWED', 'UPLOADED', 'DONE'].includes(task.value.status)))
+const run = (s: Side) => task.value?.runs?.find((r) => r.side === s) as TaskRunDetail | undefined
+const anyRunning = computed(() => !!task.value?.runs?.some((r) => r.status === 'RUNNING' || r.status === 'QUEUED'))
+const ended = computed(() => !!task.value && pairEnded(task.value))
 const locked = computed(() => task.value?.status === 'UPLOADED' || task.value?.status === 'DONE')
-const canUpload = computed(() => task.value?.status === 'REVIEWED' && verifyReport.value?.overall !== 'block' && !dirty.value)
+const screencastReady = computed(() => SIDES.every((s) => !!task.value?.screencast?.[s]))
+const canUpload = computed(() => task.value?.status === 'ANALYZED' && verifyReport.value?.overall !== 'block'
+  && !dirty.value && screencastReady.value)
 const canComplete = computed(() => ended.value && task.value?.status !== 'DONE')
 const discarded = computed(() => task.value?.status === 'DISCARDED')
 const claimable = computed(() => task.value?.status === 'AVAILABLE' || task.value?.status === 'CLAIMED')
-const discardable = computed(() => !!task.value && !['RUNNING', 'QUEUED', 'DISCARDED'].includes(task.value.status))
-// 跑过或动过的题才有东西可退；从没碰过的待领取题没必要还原
-const resettable = computed(() => !!task.value && !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(task.value.status))
-// 共用同一个项目的其他题：一个项目同时只跑一道
-const mates = computed(() => (task.value ? repoMates(task.value) : []))
-const runningMates = computed(() => mates.value.filter((m) => m.status === 'RUNNING'))
-/** 没跑过的题只有「题目信息」，跑完才出判定/评审/质检/上传/轨迹 */
-const tabs = computed<[Tab, string][]>(() => ended.value || isRunning.value
-  ? [['verdict', '判定'], ['review', '五维评审'], ['qc', '质检'], ['upload', '上传'], ['steps', '轨迹步骤'], ['prompt', '题目信息']]
-  : [['prompt', '题目信息']])
-/** 质检结论在标签上直接给个色点，不用点进去看 */
-const qcDot = computed(() => {
+const discardable = computed(() => !!task.value && !['RUNNING', 'QUEUED', 'ANALYZING', 'DISCARDED'].includes(task.value.status))
+const containersLeft = computed(() => task.value?.runs?.filter((r) => r.container_exists).length || 0)
+
+const tabs = computed<[Tab, string][]>(() => (task.value?.runs?.length
+  ? [['runs', '两侧运行'], ['gsb', 'GSB 结论'], ['screencast', '录屏'], ['upload', '上传'], ['steps', '轨迹步骤'], ['prompt', '题目信息']]
+  : [['prompt', '题目信息']]))
+/** 分析状态和录屏缺口在标签上点个色，不用翻页找 */
+const gsbDot = computed(() => {
   const t = task.value
   if (!t) return ''
-  if (t.qc_status === 'RUNNING') return 'bg-run animate-breathe'
-  if (t.qc_conclusion === 'PASS') return 'bg-ok'
-  if (t.qc_conclusion) return 'bg-err'
-  if (t.qc_status === 'FAILED') return 'bg-warn'
+  if (t.analysis_status === 'RUNNING') return 'bg-run animate-breathe'
+  if (t.analysis_status === 'FAILED') return 'bg-err'
+  if (t.gsb_verdict) return 'bg-ok'
   return ''
 })
 
@@ -116,81 +128,63 @@ async function act(name: string, fn: () => Promise<any>, ok?: string) {
     await load(true)
   } finally { busy.value = '' }
 }
-const stop = () => act('stop', () => api.stop(id), '已发送停止')
+const stop = (side?: Side) => act('stop' + (side || ''), () => api.stop(id, side), '已发送停止')
 
-// 续跑：首轮 504 或报错后，带一句新指令接着上一轮改动往下做
-const continuable = computed(() => !!task.value?.can_continue)
-const showContinue = ref(false)
-const continuePrompt = ref('')
-const nextRound = computed(() => (task.value?.round_no || 1) + 1)
-function openContinue() {
-  continuePrompt.value = ''
-  showContinue.value = true
+/** 人工重跑。次数上限归零，用在看护已经放弃、但环境修好了的时候 */
+function rerun(sides: Side[]) {
+  const label = sides.length ? sides.join(' 和 ') + ' 侧' : '两侧'
+  dialog.warning({
+    title: `重跑 ${label}`,
+    content: `会销毁${label}容器、把工作目录重置回初始快照、归档已有轨迹，然后重新排队跑一遍。`
+      + '重跑次数会清零，之前的轨迹归档在 traces 目录下可以找回。',
+    positiveText: '确认重跑',
+    negativeText: '取消',
+    onPositiveClick: () => act('rerun', () => api.rerun(id, sides), '已排队重跑'),
+  })
 }
-const submitContinue = () => act('continue', async () => {
-  const r = await api.continueRun(id, continuePrompt.value)
-  showContinue.value = false
-  continuePrompt.value = ''
-  return r
-}, `已排入第 ${nextRound.value} 轮，等调度器出队`)
+
 async function claim() {
   busy.value = 'claim'
   try {
     const r = await api.claim(id)
     if (r.queued) {
-      const blocker = runningMates.value[0]
-      if (r.waits_repo && blocker) msg.info(`已进入队列，等 #${blocker.task_no} 跑完再启动（同一个项目）`, { duration: 6000 })
-      else msg.success('已进入队列，等待空闲槽位')
-      await load()
-      await refreshTasks()
+      msg.success('两侧已进入队列，等待空闲槽位')
     } else {
       gateReport.value = r.gate
-      msg.warning(`门禁 ${r.gate.blocked} 项阻断，处理后再启动`)
-      await load()
+      const bad = Object.entries(r.prepare?.sides || {}).filter(([, v]) => !v.ok)
+      if (bad.length) msg.error(`${bad.map(([s, v]) => `${s} 侧：${v.message}`).join('；')}`, { duration: 8000 })
+      else msg.warning(`门禁 ${r.gate?.blocked} 项阻断，处理后再启动`)
     }
+    await load()
+    await refreshTasks()
   } catch (e: any) { msg.error(e.message) } finally { busy.value = '' }
 }
 function discard() {
   dialog.warning({
     title: `废弃题 ${task.value?.task_no}`,
-    content: '废弃后该题不再出现在题库与运行舱，残留容器会一并销毁。轨迹与工作目录仍保留在磁盘上，之后可在题库「已废弃」里恢复。',
+    content: '废弃后该题不再出现在题库与运行舱，两侧残留容器会一并销毁。轨迹与工作目录仍保留在磁盘上，之后可在题库「已废弃」里恢复。',
     positiveText: '确认废弃',
     negativeText: '取消',
     onPositiveClick: () => act('discard', () => api.discard(id), '已废弃'),
   })
 }
 const restore = () => act('restore', () => api.restore(id), '已恢复')
-function resetTask() {
-  dialog.warning({
-    title: `还原题 ${task.value?.task_no} 到做题前`,
-    content: '销毁各轮残留容器；工作区 git clean 并回到初始快照 commit；删除各轮轨迹目录、导出的轨迹副本、'
-      + '分析中间产物，以及以前还原时归档下来的目录；prompt.md 里回填过的 SessionID 与 TurnID 改回占位；'
-      + '清空运行、续跑、分析、评审、质检记录。做完这道题回到「待领取」，可以重新跑。'
-      + '轨迹与分析产物是直接删除、不留归档的，工作区里未提交的改动也会被清掉。',
-    positiveText: '确认还原',
-    negativeText: '取消',
-    onPositiveClick: () => act('reset', async () => {
-      const r = await api.resetTask(id)
-      const bad = r.steps.filter((s) => !s.ok)
-      if (bad.length) throw new Error(bad.map((s) => `${s.step}（${s.message}）`).join('；'))
-      return r
-    }, '已还原到做题前'),
-  })
-}
-const analyze = () => { tab.value = 'review'; return act('analyze', () => api.analyze(id), 'Cursor 分析已启动，完成后自动填入') }
+const advance = () => act('advance', async () => {
+  const r = await api.advance(id)
+  if (!r.ok) throw new Error(r.error || r.message || '推进失败')
+  return r
+}, '已提交两侧产物并启动对比分析')
+const analyze = () => { tab.value = 'gsb'; return act('analyze', () => api.analyze(id), '对比分析已启动，完成后自动填入') }
 const save = () => act('save', async () => {
-  const r = await api.saveReview(id, { scores: review.value.scores, descs: review.value.descs, other_issues: review.value.other_issues })
+  const r = await api.saveGsb(id, {
+    verdict: gsb.value.verdict, reason: gsb.value.reason,
+    a_startup: gsb.value.a_startup, b_startup: gsb.value.b_startup, remark: gsb.value.remark,
+  })
   dirty.value = false
   verifyReport.value = r.verify
   return r
-}, '评审已保存并完成核验')
-const upload = () => act('upload', async () => {
-  const r = await api.upload(id)
-  const c = r.commit
-  msg.success(c?.ok && !c.skipped ? `上传成功，${c.message}` : '上传成功')
-  if (c && !c.ok && !c.skipped) msg.warning(`代码没提交上：${c.message}`, { duration: 8000 })
-  return r
-})
+}, '结论已保存并完成自检')
+const upload = () => act('upload', () => api.upload(id), '已提交到 GSB 平台')
 function complete() {
   const t = task.value!
   const force = t.status !== 'UPLOADED'
@@ -198,7 +192,7 @@ function complete() {
     title: '完成并销毁容器',
     content: force
       ? `该题状态为「${t.status}」，尚未上传。销毁后容器内环境不可恢复（轨迹与工作目录仍在宿主机保留）。确认放弃并销毁？`
-      : `将删除容器 ${t.container_name} 并把该题标记为完成。`,
+      : '将删除两侧容器并把该题标记为完成。',
     positiveText: force ? '仍然销毁' : '确认',
     negativeText: '取消',
     onPositiveClick: () => act('complete', () => api.complete(id, force), '容器已销毁，题目已完成'),
@@ -206,21 +200,29 @@ function complete() {
 }
 const destroyOnly = () => act('destroy', () => api.destroyContainer(id), '容器已销毁')
 
-function onReview(r: Review) { review.value = r; dirty.value = true }
-async function jump(step: number) {
+function onGsb(g: Gsb) { gsb.value = g; dirty.value = true }
+async function jump(p: { side?: string; step: number }) {
+  if (p.side === 'A' || p.side === 'B') viewSide.value = p.side
   tab.value = 'steps'
-  highlightStep.value = step
-  if (!traceIndex.value) traceIndex.value = await api.traceIndex(id).catch(() => null)
+  tabPinned.value = true
+  highlightStep.value = p.step
+  await ensureIndex(viewSide.value)
   await nextTick()
-  document.getElementById(`step-${step}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  document.getElementById(`step-${p.step}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
 }
-watch(tab, (v) => { if (v !== 'steps') highlightStep.value = null })
+async function ensureIndex(s: Side) {
+  if (traceIndex.value[s] || !run(s)?.artifact?.trace_found) return
+  const r = await api.traceIndex(id, s).catch(() => null)
+  traceIndex.value = { ...traceIndex.value, [s]: r }
+}
+watch(tab, (v) => {
+  if (v !== 'steps') highlightStep.value = null
+  else ensureIndex(viewSide.value)
+})
+watch(viewSide, (s) => { if (tab.value === 'steps') ensureIndex(s) })
 function pickTab(v: Tab) { tab.value = v; tabPinned.value = true }
+const steps = computed(() => traceIndex.value[viewSide.value]?.steps || [])
 
-const verdict = computed(() => task.value?.verdict || {})
-const ts = computed(() => task.value?.trace_summary || {})
-const covColor = (s: string) => (s === 'done' ? HEX.ok : s === 'partial' ? HEX.warn : HEX.err)
-const covLabel = (s: string) => ({ done: '已实现', partial: '部分', missing: '未实现' } as Record<string, string>)[s] || s
 function copy(text: string) { navigator.clipboard?.writeText(text); msg.success('已复制') }
 
 const paramRows = computed<[string, string][]>(() => {
@@ -229,36 +231,36 @@ const paramRows = computed<[string, string][]>(() => {
   return [
     ['任务类型', t.question_type], ['任务难度', t.difficulty], ['语言/框架', t.languages],
     ['Harness', t.harness], ['Harness 版本', t.harness_version], ['操作系统', t.os_platform],
-    ['复现等级', t.repro_level], ['初始快照', t.env_snapshot],
-    ['SessionID', t.session_id], ['TurnID/PromptID', t.turn_id],
-    ['容器名', t.container_name], ['镜像', t.image_tag],
-    ['续跑轮次', t.round_no > 1 ? `第 ${t.round_no} 轮` : '首轮'],
+    ['复现等级', t.repro_level], ['仓库', t.repo_url], ['初始快照', t.env_snapshot],
   ]
 })
 const timeRows = computed<[string, string][]>(() => {
   const t = task.value
   if (!t) return []
   return [
-    ['导入', fmtTime(t.created_at)], ['领取', fmtTime(t.claimed_at)], ['开始运行', fmtTime(t.started_at)],
-    ['结束', fmtTime(t.finished_at)], ['上传', fmtTime(t.uploaded_at)], ['完成', fmtTime(t.done_at)],
-    ['废弃', fmtTime(t.discarded_at)],
+    ['导入', fmtTime(t.created_at)], ['领取', fmtTime(t.claimed_at)], ['两侧跑完', fmtTime(t.finished_at)],
+    ['上传', fmtTime(t.uploaded_at)], ['完成', fmtTime(t.done_at)], ['废弃', fmtTime(t.discarded_at)],
   ]
 })
-
-const payloadPreview = computed(() => {
+/** 上传字段预览。除了录屏链接，其余都是自动带出来的 */
+const payloadPreview = computed<[string, string][]>(() => {
   const t = task.value
   if (!t) return []
-  const r = review.value
-  const rows: [string, string][] = [
+  const a = run('A'), b = run('B')
+  return [
     ['question_type', t.question_type], ['difficulty', t.difficulty], ['languages', t.languages],
     ['harness', t.harness || 'Claude Code'], ['harness_version', `${t.harness_version}（上传时以镜像实测为准）`],
     ['os_platform', t.os_platform], ['repro_level', t.repro_level], ['env_snapshot', t.env_snapshot],
-    ['session_id', t.session_id], ['turn_id', t.turn_id],
-    ['trace_file', t.trace_file ? t.trace_file.split('/').pop() || '' : ''],
+    ['a_session_id', a?.session_id || ''], ['b_session_id', b?.session_id || ''],
+    ['a_artifact_snapshot', a?.artifact_url || ''], ['b_artifact_snapshot', b?.artifact_url || ''],
+    ['a_trace_file', a?.trace_file ? a.trace_file.split('/').pop() || '' : ''],
+    ['b_trace_file', b?.trace_file ? b.trace_file.split('/').pop() || '' : ''],
+    ['a_screencast', t.screencast?.A || ''], ['b_screencast', t.screencast?.B || ''],
+    ['gsb_verdict', t.gsb_verdict ? VERDICT_LABEL[t.gsb_verdict] : ''],
+    ['gsb_reason', t.gsb_reason_chars ? `${t.gsb_reason_chars} 字` : ''],
+    ['validity', (task.value?.gsb as any)?.validity || '有效'],
+    ['user_prompt', `${t.user_prompt.length} 字`],
   ]
-  for (const d of DIMS) rows.push([`score_${d}`, r.scores[d] == null ? '' : String(r.scores[d])])
-  rows.push(['user_prompt', `${t.user_prompt.length} 字`], ['other_issues', r.other_issues ? `${r.other_issues.length} 字` : '（空）'])
-  return rows
 })
 </script>
 
@@ -270,104 +272,84 @@ const payloadPreview = computed(() => {
       <div class="flex items-center gap-3 flex-wrap">
         <span class="mono text-sm px-2.5 h-7 inline-flex items-center rounded-md bg-bg3 text-fg0 border border-line">#{{ task.task_no }}</span>
         <StatusPill :status="task.status" />
-        <span v-if="task.analysis_status === 'RUNNING'" class="pill text-run border-run/50"><span class="dot bg-run animate-breathe" />Cursor 分析中</span>
+        <span v-if="task.analysis_status === 'RUNNING'" class="pill text-run border-run/50"><span class="dot bg-run animate-breathe" />对比分析中</span>
         <span v-else-if="task.analysis_status === 'FAILED'" class="pill text-err border-err/50">分析失败</span>
-        <span class="text-fg1 text-xs">{{ task.question_type }} · {{ task.difficulty }} · {{ task.languages }}</span>
-        <span class="ml-auto mono text-[12px] text-fg2 flex items-center gap-2">
-          <span class="dot" :class="task.container_exists ? 'bg-run' : 'bg-fg2'" />
-          {{ task.container_name }} {{ task.container_exists ? '保留中' : (task.started_at ? '已销毁' : '未创建') }}
+        <span v-if="task.gsb_verdict" class="pill" :style="{ color: SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1, borderColor: (SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1) + '55' }">
+          {{ VERDICT_LABEL[task.gsb_verdict] }}
         </span>
+        <span class="text-fg1 text-xs">{{ task.question_type }} · {{ task.difficulty }} · {{ task.languages }}</span>
+        <a v-if="task.repo_url" :href="task.repo_url" target="_blank"
+          class="mono text-[12px] text-accent underline decoration-dotted">{{ task.repo_slug }}</a>
+        <span class="ml-auto mono text-[12px] text-fg2">容器保留 {{ containersLeft }} / 2</span>
       </div>
       <div class="mt-3 flex items-center gap-2 flex-wrap">
         <NButton size="small" quaternary @click="router.back()">← 返回</NButton>
-        <NButton v-if="claimable" size="small" type="primary" :loading="busy === 'claim'" @click="claim">领取并启动</NButton>
+        <NButton v-if="claimable" size="small" type="primary" :loading="busy === 'claim'" @click="claim">领取并启动两侧</NButton>
         <NButton v-if="claimable" size="small" secondary :loading="gateChecking" @click="runGate">门禁检查</NButton>
         <NButton v-if="discarded" size="small" type="primary" secondary :loading="busy === 'restore'" @click="restore">恢复该题</NButton>
-        <NButton v-if="isRunning" size="small" type="error" secondary :loading="busy === 'stop'" @click="stop">停止容器</NButton>
-        <NButton v-if="continuable" size="small" type="primary" :secondary="task.status === 'REVIEWED'"
-          title="上一轮的代码改动都还在，输入下一轮要做什么，接着往下跑" @click="openContinue">
-          继续对话{{ task.round_no > 1 ? `（已跑 ${task.round_no} 轮）` : '' }}
+        <NButton v-if="anyRunning" size="small" type="error" secondary :loading="busy === 'stop'" @click="stop()">停止两侧</NButton>
+        <NButton v-if="task.runs.length && !locked" size="small" tertiary :loading="busy === 'rerun'" @click="rerun([])">重跑两侧</NButton>
+        <NButton v-if="ended && !locked && !task.gsb_verdict" size="small" type="primary" :loading="busy === 'advance'"
+          title="提交两侧产物到 A / B 分支，然后开始对比分析" @click="advance">提交产物并分析</NButton>
+        <NButton v-if="ended && !locked && task.gsb_verdict" size="small" secondary :loading="busy === 'analyze'"
+          :disabled="task.analysis_status === 'RUNNING'" @click="analyze">重新分析</NButton>
+        <NButton v-if="ended && !locked" size="small" :type="dirty ? 'primary' : 'default'" :secondary="!dirty"
+          :loading="busy === 'save'" :disabled="!dirty && !!verifyReport" @click="save">
+          {{ dirty ? '保存结论并自检' : '重新自检' }}
         </NButton>
-        <NButton v-if="ended && !locked" size="small" type="primary" :secondary="task.analysis_status === 'DONE'" :loading="busy === 'analyze'"
-          :disabled="task.analysis_status === 'RUNNING'" @click="analyze">
-          {{ task.analysis_status === 'DONE' ? '重新分析' : 'Cursor 五维分析' }}
-        </NButton>
-        <NButton v-if="ended && !locked" size="small" :type="dirty ? 'primary' : 'default'" :secondary="!dirty" :loading="busy === 'save'" :disabled="!dirty && !!verifyReport" @click="save">
-          {{ dirty ? '保存评审并核验' : '重新核验' }}
-        </NButton>
-        <NButton v-if="ended && !locked" size="small" type="info" :secondary="!canUpload" :disabled="!canUpload" :loading="busy === 'upload'" @click="upload">
-          上传 solo-qa
-        </NButton>
-        <a v-if="task.trace_file" :href="api.traceUrl(id)" class="inline-flex"><NButton size="small" tertiary>下载轨迹</NButton></a>
+        <NButton v-if="ended && !locked" size="small" type="info" :secondary="!canUpload" :disabled="!canUpload"
+          :loading="busy === 'upload'" @click="upload">上传 GSB</NButton>
         <span class="ml-auto" />
-        <NButton v-if="task.container_exists && ended && task.status !== 'DONE'" size="small" tertiary :loading="busy === 'destroy'" @click="destroyOnly">仅销毁容器</NButton>
-        <NButton v-if="canComplete" size="small" :type="task.status === 'UPLOADED' ? 'success' : 'warning'" :secondary="task.status !== 'UPLOADED'" :loading="busy === 'complete'" @click="complete">
-          完成并销毁
-        </NButton>
-        <NButton v-if="resettable" size="small" quaternary :loading="busy === 'reset'"
-          title="工作区、轨迹、回填、评审记录全部退回做题前" @click="resetTask">还原到做题前</NButton>
+        <NButton v-if="containersLeft && ended && task.status !== 'DONE'" size="small" tertiary :loading="busy === 'destroy'" @click="destroyOnly">仅销毁容器</NButton>
+        <NButton v-if="canComplete" size="small" :type="task.status === 'UPLOADED' ? 'success' : 'warning'"
+          :secondary="task.status !== 'UPLOADED'" :loading="busy === 'complete'" @click="complete">完成并销毁</NButton>
         <NButton v-if="discardable" size="small" quaternary type="error" :loading="busy === 'discard'" @click="discard">废弃</NButton>
       </div>
-      <div v-if="mates.length" class="mt-3 text-xs flex items-start gap-1.5"
-        :class="runningMates.length ? 'text-warn' : 'text-fg1'">
-        <span class="dot mt-1.5 shrink-0" :class="runningMates.length ? 'bg-warn' : 'bg-fg2'" />
-        <span>
-          项目 <span class="mono">{{ task.repo_id }}</span> 还被
-          <RouterLink v-for="m in mates" :key="m.id" :to="`/tasks/${m.id}`" class="mono mx-0.5 underline decoration-dotted">
-            #{{ m.task_no }}{{ m.status === 'RUNNING' ? '（运行中）' : m.status === 'QUEUED' ? '（排队中）' : '' }}
-          </RouterLink>
-          用着。一个项目同时只跑一道题{{ runningMates.length ? '，这道题现在只能排队等它结束' : '' }}
-        </span>
+      <div v-if="task.branch_check?.ok === false" class="mt-3 text-xs text-err flex items-start gap-1.5">
+        <span class="dot mt-1.5 shrink-0 bg-err" />
+        <span>{{ task.branch_check.message }}。仓库要恰好是 main/master 加 A、B 三个分支，A、B 从初始快照切出来。</span>
       </div>
-      <div v-if="showContinue" class="mt-3 inner p-3">
-        <div class="text-xs text-fg1">
-          第 {{ nextRound }} 轮续跑。镜像不支持恢复会话，这一轮是全新对话，但
-          <span class="mono">workspace</span> 里上一轮的改动都还在，指令会连同原始需求和已有改动一起交给模型。
-          留空就是「按原需求继续做完」。
-        </div>
-        <NInput v-model:value="continuePrompt" type="textarea" class="mt-2" :autosize="{ minRows: 3, maxRows: 10 }"
-          placeholder="例如：继续。上一轮网关 504 中断了，接着把剩下的用例补完，不要重写已经改好的文件。" />
-        <div class="mt-2 flex items-center gap-2">
-          <NButton size="small" type="primary" :loading="busy === 'continue'" @click="submitContinue">
-            排入第 {{ nextRound }} 轮
-          </NButton>
-          <NButton size="small" quaternary @click="showContinue = false">取消</NButton>
-          <span class="ml-auto text-xs text-fg2 mono">solo-cc-{{ task.task_no }}-r{{ nextRound }}</span>
-        </div>
+      <div v-if="task.status === 'NEEDS_ATTENTION'" class="mt-3 inner p-3 text-xs text-err leading-5">
+        看护已经放弃自动重跑{{ task.auto_error ? `：${task.auto_error}` : '' }}。
+        环境修好后点「重跑两侧」或到两侧运行页单独重跑某一侧，重跑次数会清零。
       </div>
-      <div v-if="task.rounds?.length > 1" class="mt-3 text-xs">
-        <div class="text-fg1 mb-1">续跑记录（每轮一份独立轨迹，上传只能交一份，需人工确认用哪轮）</div>
-        <div v-for="r in task.rounds" :key="r.round_no" class="flex items-center gap-2 py-0.5">
-          <span class="mono text-fg2 shrink-0">第 {{ r.round_no }} 轮</span>
-          <StatusPill :status="r.status" small />
-          <span class="mono text-fg2 shrink-0">改动 {{ r.changed_files }}</span>
-          <span class="text-fg1 truncate" :title="r.prompt">{{ r.prompt || '（按原需求）' }}</span>
-        </div>
+      <div v-if="ended && !task.gsb_verdict && task.analysis_status !== 'RUNNING'" class="mt-3 text-xs text-fg1">
+        两侧都跑完了。看护会自动提交产物并开始对比分析，也可以点「提交产物并分析」立刻走一遍。
+      </div>
+      <div v-if="task.status === 'ANALYZED' && !screencastReady" class="mt-3 text-xs text-warn flex items-start gap-1.5">
+        <span class="dot mt-1.5 shrink-0 bg-warn" />
+        <span>结论已经出了，就等录屏。按录屏页给的步骤把两侧项目分别跑起来录完，把链接贴回来就能上传。</span>
       </div>
       <div v-if="discarded" class="mt-3 text-xs text-fg1">
         该题已于 {{ fmtTime(task.discarded_at) }} 废弃，不再出现在题库与运行舱列表中。
       </div>
-      <div v-if="task.error" class="mt-3 inner p-3 text-xs text-err mono whitespace-pre-wrap">{{ task.error }}</div>
-      <div v-if="!canUpload && task.status === 'REVIEWED' && verifyReport?.overall === 'block'" class="mt-3 text-xs text-err">核验存在红项，上传按钮已禁用。</div>
+      <div v-if="!canUpload && task.status === 'ANALYZED' && verifyReport?.overall === 'block'" class="mt-3 text-xs text-err">
+        自检存在红项，上传按钮已禁用。
+      </div>
     </div>
 
     <div class="grid grid-cols-1 xl:grid-cols-12 gap-4">
       <!-- 左：跑过的题看事件流，没跑过的看运行前检查 -->
       <div class="xl:col-span-5 card p-4 flex flex-col"
-        :class="ended || isRunning ? 'h-[calc(100vh-300px)] min-h-[520px]' : ''">
-        <template v-if="ended || isRunning">
-          <div class="flex items-center gap-3 mb-2">
+        :class="task.runs.length ? 'h-[calc(100vh-300px)] min-h-[520px]' : ''">
+        <template v-if="task.runs.length">
+          <div class="flex items-center gap-2 mb-2">
             <div class="h2">事件流</div>
-            <span class="mono text-[12px] text-fg2">{{ fmtDuration(task.started_at, task.finished_at, nowMs) }}</span>
-            <span v-if="isRunning" class="ml-auto pill h-6 text-[12px] text-run border-run/50"><span class="dot bg-run animate-breathe" />实时</span>
+            <div class="flex gap-1">
+              <button v-for="s in SIDES" :key="s" class="w-7 h-6 rounded-md mono text-[12px] border transition-colors"
+                :class="viewSide === s ? 'text-white font-semibold border-transparent' : 'border-line text-fg1 hover:text-fg0'"
+                :style="viewSide === s ? { background: SIDE_HEX[s] } : {}" @click="viewSide = s">{{ s }}</button>
+            </div>
+            <span class="mono text-[12px] text-fg2">{{ fmtDuration(run(viewSide)?.started_at, run(viewSide)?.finished_at, nowMs) }}</span>
+            <span v-if="run(viewSide)?.status === 'RUNNING'" class="ml-auto pill h-6 text-[12px] text-run border-run/50"><span class="dot bg-run animate-breathe" />实时</span>
           </div>
           <div v-if="eventsTruncated" class="inner px-3 py-1.5 mb-2 text-[12px] text-fg2 leading-5">
-            共 {{ eventTotal }} 条事件，这里只显示最后 {{ events.length }} 条。完整过程看轨迹 jsonl。
+            两侧共 {{ eventTotal }} 条事件，这里只留了最后 {{ events.length }} 条。完整过程看轨迹 jsonl。
           </div>
-          <div v-if="isRunning && thinkingTokens" class="inner px-3 py-1.5 mb-2 text-[12px] text-run flex items-center gap-2">
-            <span class="dot bg-run animate-breathe" />模型思考中 · 约 {{ thinkingTokens }} tokens
+          <div v-if="thinking[viewSide]" class="inner px-3 py-1.5 mb-2 text-[12px] text-run flex items-center gap-2">
+            <span class="dot bg-run animate-breathe" />{{ viewSide }} 侧思考中 · 约 {{ thinking[viewSide] }} tokens
           </div>
-          <Timeline :events="events" :follow="isRunning" class="flex-1 min-h-0" />
+          <Timeline :events="sideEvents" :follow="run(viewSide)?.status === 'RUNNING'" class="flex-1 min-h-0" />
         </template>
         <template v-else>
           <div class="flex items-center gap-3 mb-3">
@@ -385,118 +367,96 @@ const payloadPreview = computed(() => {
       <div class="xl:col-span-7 space-y-4">
         <div class="flex items-center gap-1">
           <button v-for="t in tabs" :key="t[0]"
-            class="px-3 h-9 rounded-inner text-xs transition-colors flex items-center gap-1.5" :class="tab === t[0] ? 'bg-accent/15 text-accent' : 'text-fg1 hover:text-fg0 hover:bg-bg3/60'"
+            class="px-3 h-9 rounded-inner text-xs transition-colors flex items-center gap-1.5"
+            :class="tab === t[0] ? 'bg-accent/15 text-accent' : 'text-fg1 hover:text-fg0 hover:bg-bg3/60'"
             @click="pickTab(t[0])">
             {{ t[1] }}
-            <span v-if="t[0] === 'qc' && qcDot" class="dot" :class="qcDot" />
+            <span v-if="t[0] === 'gsb' && gsbDot" class="dot" :class="gsbDot" />
+            <span v-else-if="t[0] === 'screencast' && task.status === 'ANALYZED' && !screencastReady" class="dot bg-warn animate-breathe" />
           </button>
         </div>
 
-        <!-- 判定 -->
-        <template v-if="tab === 'verdict'">
-          <div v-if="!ended" class="card empty">运行结束后显示三层判定</div>
-          <template v-else>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div class="card p-4 space-y-1.5">
-                <div class="h2">进程层</div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">退出码</span><span class="mono" :class="task.exit_code === 0 ? 'text-ok' : 'text-err'">{{ task.exit_code ?? '—' }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">超时</span><span class="mono">{{ verdict.process?.timed_out ? '是' : '否' }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">人工停止</span><span class="mono">{{ verdict.process?.manual_stop ? '是' : '否' }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">镜像</span><span class="mono text-fg2 truncate max-w-[140px]" :title="task.image_tag">{{ task.image_tag.split(':').pop() }}</span></div>
+        <!-- 两侧运行 -->
+        <template v-if="tab === 'runs'">
+          <SideStrip :runs="task.runs" />
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div v-for="s in SIDES" :key="s" class="card p-4 space-y-2">
+              <div class="flex items-center gap-2">
+                <span class="mono text-[12px] font-semibold w-5 h-5 inline-flex items-center justify-center rounded"
+                  :style="{ color: SIDE_HEX[s], background: SIDE_HEX[s] + '1f' }">{{ s }}</span>
+                <span class="text-fg0 font-medium text-sm">{{ run(s) ? RUN_LABEL[run(s)!.status] : '未建' }}</span>
+                <span v-if="run(s)?.attempt && run(s)!.attempt > 1" class="pill h-5 text-[12px] text-warn border-warn/40">第 {{ run(s)!.attempt }} 次</span>
+                <NButton v-if="run(s) && !locked" size="tiny" quaternary class="ml-auto" :loading="busy === 'rerun'" @click="rerun([s])">重跑</NButton>
               </div>
-              <div class="card p-4 space-y-1.5">
-                <div class="h2">协议层</div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">subtype</span><span class="mono" :class="verdict.protocol?.subtype === 'success' ? 'text-ok' : 'text-err'">{{ verdict.protocol?.subtype || '无 result' }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">轮次</span><span class="mono nums">{{ verdict.protocol?.num_turns ?? '—' }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">模型耗时</span><span class="mono nums">{{ fmtMs(verdict.protocol?.duration_ms) }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">费用</span><span class="mono nums">{{ verdict.protocol?.cost_usd != null ? '$' + Number(verdict.protocol.cost_usd).toFixed(3) : '—' }}</span></div>
-              </div>
-              <div class="card p-4 space-y-1.5">
-                <div class="h2">产物层</div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">轨迹</span><span class="mono" :class="verdict.artifact?.trace_found ? 'text-ok' : 'text-err'">{{ verdict.artifact?.trace_found ? `${verdict.artifact.trace_count} 份` : '缺失' }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">工具调用 / 报错</span><span class="mono nums">{{ verdict.artifact?.tool_calls ?? '—' }} / <span class="text-warn">{{ verdict.artifact?.tool_errors ?? '—' }}</span></span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">改动文件</span><span class="mono nums" :class="verdict.artifact?.changed_files ? 'text-ok' : 'text-warn'">{{ verdict.artifact?.changed_files ?? '—' }}</span></div>
-                <div class="text-xs flex justify-between"><span class="text-fg1">stop_reason</span><span class="mono text-fg2">{{ ts.stop_reason || '—' }}</span></div>
-              </div>
-            </div>
-            <div v-if="verdict.notes?.length" class="card p-4 space-y-1">
-              <div class="h2 mb-1">备注</div>
-              <div v-for="n in verdict.notes" :key="n" class="text-xs text-warn flex gap-2"><span class="dot bg-warn mt-1.5 shrink-0" />{{ n }}</div>
-            </div>
-            <div class="card p-4 space-y-2">
-              <div class="h2">回填</div>
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
-                <div class="inner p-3 cursor-pointer" @click="task.session_id && copy(task.session_id)">
+              <template v-if="run(s)">
+                <div class="text-xs flex justify-between"><span class="text-fg1">退出码</span><span class="mono" :class="run(s)!.exit_code === 0 ? 'text-ok' : 'text-err'">{{ run(s)!.exit_code ?? '—' }}</span></div>
+                <div class="text-xs flex justify-between"><span class="text-fg1">subtype</span><span class="mono" :class="run(s)!.protocol?.subtype === 'success' ? 'text-ok' : 'text-err'">{{ run(s)!.protocol?.subtype || '无 result' }}</span></div>
+                <div class="text-xs flex justify-between"><span class="text-fg1">轮次 / 人类回合</span><span class="mono nums">{{ run(s)!.protocol?.num_turns ?? '—' }} / {{ run(s)!.artifact?.human_turns ?? '—' }}</span></div>
+                <div class="text-xs flex justify-between"><span class="text-fg1">模型耗时</span><span class="mono nums">{{ fmtMs(run(s)!.protocol?.duration_ms) }}</span></div>
+                <div class="text-xs flex justify-between"><span class="text-fg1">轨迹</span><span class="mono" :class="run(s)!.artifact?.trace_found ? 'text-ok' : 'text-err'">{{ run(s)!.artifact?.trace_found ? `${run(s)!.artifact.trace_count} 份` : '缺失' }}</span></div>
+                <div class="text-xs flex justify-between"><span class="text-fg1">工具调用 / 报错</span><span class="mono nums">{{ run(s)!.artifact?.tool_calls ?? '—' }} / <span class="text-warn">{{ run(s)!.artifact?.tool_errors ?? '—' }}</span></span></div>
+                <div class="text-xs flex justify-between"><span class="text-fg1">改动文件</span><span class="mono nums" :class="run(s)!.artifact?.changed_files ? 'text-ok' : 'text-warn'">{{ run(s)!.artifact?.changed_files ?? '—' }}</span></div>
+                <div class="text-xs flex justify-between gap-2"><span class="text-fg1 shrink-0">容器</span><span class="mono text-fg2 truncate" :title="run(s)!.container_name">{{ run(s)!.container_name }} {{ run(s)!.container_exists ? '保留中' : '已销毁' }}</span></div>
+                <div class="inner px-2.5 py-2 cursor-pointer" @click="run(s)!.session_id && copy(run(s)!.session_id)">
                   <div class="label">SessionID（轨迹文件名）</div>
-                  <div class="mono text-xs break-all" :class="task.session_id ? 'text-fg0' : 'text-err'">{{ task.session_id || '未获取' }}</div>
+                  <div class="mono text-[12px] break-all" :class="run(s)!.session_id ? 'text-fg0' : 'text-err'">{{ run(s)!.session_id || '未获取' }}</div>
                 </div>
-                <div class="inner p-3 cursor-pointer" @click="task.turn_id && copy(task.turn_id)">
-                  <div class="label">TurnID / PromptID</div>
-                  <div class="mono text-xs break-all" :class="task.turn_id ? 'text-fg0' : 'text-err'">{{ task.turn_id || '未获取' }}</div>
+                <div class="inner px-2.5 py-2">
+                  <div class="label">产物提交</div>
+                  <a v-if="run(s)!.artifact_url" :href="run(s)!.artifact_url" target="_blank"
+                    class="mono text-[12px] text-accent break-all underline decoration-dotted">{{ run(s)!.artifact_url }}</a>
+                  <div v-else class="mono text-[12px] text-warn">未提交</div>
                 </div>
-              </div>
-              <div class="text-[12px] text-fg2">两项齐全时已自动写回 prompt.md（原文件另存 .bak）。点击可复制。</div>
+                <div v-if="run(s)!.gateway_errors?.length" class="text-[12px] text-warn">
+                  网关报错 {{ run(s)!.gateway_errors.join('、') }}（不作为 GSB 判断依据，只触发重跑）
+                </div>
+                <div v-if="run(s)!.abnormal?.reason" class="text-[12px] text-warn break-all">
+                  异常：{{ run(s)!.abnormal.reason }}{{ run(s)!.abnormal.gave_up ? '（已放弃自动重跑）' : '' }}
+                </div>
+                <div v-for="n in run(s)!.notes" :key="n" class="text-[12px] text-warn break-all">{{ n }}</div>
+                <div v-if="run(s)!.error" class="inner p-2 text-[12px] text-err mono whitespace-pre-wrap">{{ run(s)!.error }}</div>
+                <div class="pt-1">
+                  <div class="label mb-1">git diff --stat</div>
+                  <pre class="mono text-[11px] text-fg1 whitespace-pre-wrap max-h-40 overflow-auto inner p-2">{{ run(s)!.git_diff_stat || '（无改动）' }}</pre>
+                </div>
+                <a v-if="run(s)!.trace_file" :href="api.traceUrl(id, s)" class="inline-flex"><NButton size="tiny" tertiary>下载 {{ s }} 侧轨迹</NButton></a>
+              </template>
+              <div v-else class="empty">尚未创建</div>
             </div>
-            <div class="card p-4 space-y-2">
-              <div class="flex items-center gap-3"><div class="h2">工作目录改动</div><span class="mono text-[12px] text-fg2">git diff --stat</span></div>
-              <pre class="mono text-[12px] text-fg1 whitespace-pre-wrap max-h-64 overflow-auto inner p-3">{{ task.git_diff_stat || '（无改动）' }}</pre>
-            </div>
-            <div v-if="ts.last_assistant_text" class="card p-4 space-y-2">
-              <div class="flex items-center gap-3"><div class="h2">模型最后一段话</div><span class="mono text-[12px] text-fg2">{{ ts.model }}</span></div>
-              <pre class="text-xs text-fg1 whitespace-pre-wrap max-h-64 overflow-auto inner p-3">{{ ts.last_assistant_text }}</pre>
-            </div>
-          </template>
+          </div>
         </template>
 
-        <!-- 评审 -->
-        <template v-if="tab === 'review'">
-          <div v-if="!ended" class="card empty">运行结束后可发起 Cursor 分析</div>
+        <!-- GSB 结论 -->
+        <template v-if="tab === 'gsb'">
+          <div v-if="!ended" class="card empty">两侧都跑完后才能对比</div>
           <template v-else>
             <div class="card p-4 flex items-center gap-4 flex-wrap">
-              <div>
-                <div class="label">分析模型</div>
-                <div class="mono text-xs text-fg0">{{ task.analysis?.model || '—' }}</div>
-              </div>
-              <div>
-                <div class="label">分析耗时</div>
-                <div class="mono text-xs text-fg0 nums">{{ task.analysis?.duration_s ? task.analysis.duration_s + 's' : '—' }}</div>
-              </div>
-              <div>
-                <div class="label">完成时间</div>
-                <div class="mono text-xs text-fg0 nums">{{ fmtTime(task.analysis?.finished_at) }}</div>
-              </div>
-              <div class="min-w-0 flex-1">
-                <div class="label">agent 实际验证</div>
-                <div class="text-xs text-fg1 truncate" :title="review.verification?.summary">{{ review.verification?.summary || '—' }}</div>
+              <div><div class="label">分析模型</div><div class="mono text-xs text-fg0">{{ task.analysis?.model || '—' }}</div></div>
+              <div><div class="label">分析耗时</div><div class="mono text-xs text-fg0 nums">{{ task.analysis?.duration_s ? task.analysis.duration_s + 's' : '—' }}</div></div>
+              <div><div class="label">完成时间</div><div class="mono text-xs text-fg0 nums">{{ fmtTime(task.analysis?.finished_at) }}</div></div>
+              <div v-if="gsb.validity" class="min-w-0 flex-1">
+                <div class="label">有效性</div>
+                <div class="text-xs text-warn truncate" :title="gsb.validity">{{ gsb.validity }}</div>
               </div>
               <NTag v-if="dirty" size="small" type="warning" :bordered="false">有未保存修改</NTag>
               <NTag v-else-if="locked" size="small" :bordered="false">已上传 · 只读</NTag>
             </div>
             <div v-if="task.analysis_status === 'RUNNING'" class="card p-4 text-xs text-run flex items-center gap-2">
-              <span class="dot bg-run animate-breathe" />Cursor agent 正在读轨迹、跑产物验证，通常需要 5–20 分钟，完成后自动填入下方。
+              <span class="dot bg-run animate-breathe" />正在读两侧轨迹和改动做对比，通常 5–20 分钟，完成后自动填入下方。
             </div>
-            <div v-if="review.coverage?.length" class="card p-4">
-              <div class="h2 mb-2">需求覆盖</div>
-              <div class="space-y-1">
-                <div v-for="(c, i) in review.coverage" :key="i" class="inner px-3 py-2 flex items-start gap-3 text-xs">
-                  <span class="pill h-5 text-[12px] shrink-0" :style="{ color: covColor(c.status), borderColor: covColor(c.status) + '55' }">{{ covLabel(c.status) }}</span>
-                  <span class="text-fg0">{{ c.point }}</span>
-                  <span class="ml-auto text-fg2 mono text-[12px] truncate max-w-[40%]" :title="c.evidence">{{ c.evidence }}</span>
-                </div>
-              </div>
+            <div v-else-if="task.analysis_status === 'FAILED'" class="card p-4 space-y-1">
+              <div class="text-err text-sm font-medium">分析没跑完</div>
+              <div class="text-fg1 text-xs leading-5">{{ task.analysis?.error || task.auto_error || '未知原因' }}</div>
             </div>
-            <ScoreEditor :review="review" :verify-items="verifyReport?.items || []" :readonly="locked" @update="onReview" @jump="jump" />
+            <GsbEditor :gsb="gsb" :readonly="locked" @update="onGsb" @jump="jump" />
             <VerifyBar :report="verifyReport" />
-            <div v-if="review.verification?.commands?.length" class="card p-4">
-              <div class="h2 mb-2">agent 跑过的命令</div>
-              <pre class="mono text-[12px] text-fg1 inner p-3 whitespace-pre-wrap">{{ review.verification.commands.join('\n') }}</pre>
-            </div>
           </template>
         </template>
 
-        <!-- 质检 -->
-        <template v-if="tab === 'qc'">
-          <QcPanel :task="task" @done="load(true)" />
+        <!-- 录屏 -->
+        <template v-if="tab === 'screencast'">
+          <div v-if="!task.gsb_verdict" class="card empty">分析出结论后再录屏，那时才知道两侧各自怎么启动</div>
+          <ScreencastPanel v-else :task="task" :gsb="gsb" @saved="load(true)" />
         </template>
 
         <!-- 上传 -->
@@ -504,43 +464,32 @@ const payloadPreview = computed(() => {
           <div class="card p-4">
             <div class="flex items-center gap-3 mb-3">
               <div class="h2">提交字段预览</div>
-              <span class="text-xs text-fg2">POST {{ '/api/v1/submissions' }}</span>
+              <span class="mono text-[12px] text-fg2">POST /api/v1/gsb/submissions</span>
               <NButton size="tiny" type="info" class="ml-auto" :disabled="!canUpload" :loading="busy === 'upload'" @click="upload">上传</NButton>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-1.5">
               <div v-for="[k, v] in payloadPreview" :key="k" class="inner px-3 py-1.5 flex items-center gap-3 text-xs">
-                <span class="mono text-fg2 w-32 shrink-0">{{ k }}</span>
+                <span class="mono text-fg2 w-[168px] shrink-0">{{ k }}</span>
                 <span class="mono truncate" :class="v ? 'text-fg0' : 'text-err'" :title="v">{{ v || '缺失' }}</span>
               </div>
             </div>
             <div class="text-[12px] text-fg2 mt-3">
-              状态需为「已评审」且核验无红项。五维描述以评审页保存的内容为准。
-            </div>
-            <div v-if="task.qc_conclusion && task.qc_conclusion !== 'PASS'"
-              class="inner px-3 py-2 mt-2 text-[12px] text-err leading-5">
-              质检结论是「{{ task.qc_conclusion }}」，有 {{ task.qc_failed_count }} 项没过。
-              直接上传大概率会被 solo-qa 打回，建议先去质检页按未通过项改描述。
+              除了两条录屏链接，其余字段都是自动带出来的。状态需为「待录屏上传」且自检无红项。
             </div>
           </div>
           <div v-if="task.upload && Object.keys(task.upload).length" class="card p-4 space-y-2">
             <div class="flex items-center gap-3">
               <div class="h2">上次上传</div>
-              <span class="pill h-5 text-[12px]" :class="task.upload.ok ? 'text-ok border-ok/50' : 'text-err border-err/50'">{{ task.upload.ok ? `成功 · #${task.upload.submission_id}` : '失败' }}</span>
+              <span class="pill h-5 text-[12px]" :class="task.upload.ok ? 'text-ok border-ok/50' : 'text-err border-err/50'">
+                {{ task.upload.ok ? `成功 · #${task.upload.submission_id}` : '失败' }}
+              </span>
               <span class="mono text-[12px] text-fg2 ml-auto">{{ fmtTime(task.upload.started_at) }}</span>
             </div>
             <div v-if="task.upload.message" class="text-xs" :class="task.upload.ok ? 'text-fg1' : 'text-err'">{{ task.upload.message }}</div>
-            <div v-if="task.upload.commit" class="inner px-3 py-2 text-xs flex items-start gap-2"
-              :class="task.upload.commit.ok ? 'text-fg1' : 'text-warn'">
-              <span class="text-fg2 shrink-0">代码提交</span>
-              <span>
-                {{ task.upload.commit.message }}
-                <span v-if="task.upload.commit.branch" class="text-fg2">
-                  · 原分支仍停在初始快照，还原不会删掉这个分支
-                </span>
-              </span>
-            </div>
             <div v-if="task.upload.fields" class="space-y-1">
-              <div v-for="(m, f) in task.upload.fields" :key="f" class="inner px-3 py-1.5 text-xs flex gap-3"><span class="mono text-warn w-32 shrink-0">{{ f }}</span><span class="text-fg0">{{ m }}</span></div>
+              <div v-for="(m, f) in task.upload.fields" :key="f" class="inner px-3 py-1.5 text-xs flex gap-3">
+                <span class="mono text-warn w-[168px] shrink-0">{{ f }}</span><span class="text-fg0">{{ m }}</span>
+              </div>
             </div>
             <pre v-if="task.upload.steps?.length" class="mono text-[12px] text-fg2 inner p-2 whitespace-pre-wrap">{{ task.upload.steps.join('\n') }}</pre>
           </div>
@@ -549,13 +498,18 @@ const payloadPreview = computed(() => {
         <!-- 轨迹步骤 -->
         <template v-if="tab === 'steps'">
           <div class="card p-4">
-            <div class="flex items-center gap-3 mb-3">
+            <div class="flex items-center gap-2 mb-3">
               <div class="h2">轨迹步骤索引</div>
-              <span class="mono text-[12px] text-fg2">{{ traceIndex?.steps?.length ?? 0 }} 步 · 供评审证据引用</span>
+              <div class="flex gap-1">
+                <button v-for="s in SIDES" :key="s" class="w-7 h-6 rounded-md mono text-[12px] border transition-colors"
+                  :class="viewSide === s ? 'text-white font-semibold border-transparent' : 'border-line text-fg1 hover:text-fg0'"
+                  :style="viewSide === s ? { background: SIDE_HEX[s] } : {}" @click="viewSide = s">{{ s }}</button>
+              </div>
+              <span class="mono text-[12px] text-fg2">{{ steps.length }} 步 · 供结论证据引用</span>
             </div>
-            <div v-if="!traceIndex?.steps?.length" class="empty">无轨迹或尚未解析</div>
+            <div v-if="!steps.length" class="empty">无轨迹或尚未解析</div>
             <div v-else class="space-y-1 max-h-[calc(100vh-360px)] overflow-auto pr-1">
-              <div v-for="s in traceIndex.steps" :key="s.step" :id="`step-${s.step}`"
+              <div v-for="s in steps" :key="s.step" :id="`step-${s.step}`"
                 class="inner px-3 py-2 text-xs border transition-colors"
                 :class="highlightStep === s.step ? 'border-accent bg-accent/10' : 'border-transparent'">
                 <div class="flex items-center gap-2 mono text-[12px]">
@@ -587,7 +541,7 @@ const payloadPreview = computed(() => {
           <div class="card p-4">
             <div class="flex items-center gap-3 mb-3">
               <div class="h2">发送给模型的 prompt</div>
-              <span class="mono text-[12px] text-fg2">{{ task.user_prompt.length }} 字 · 容器只接收这一段</span>
+              <span class="mono text-[12px] text-fg2">{{ task.user_prompt.length }} 字 · 两侧发的是同一段</span>
               <NButton size="tiny" tertiary class="ml-auto" @click="copy(task.user_prompt)">复制</NButton>
             </div>
             <pre class="text-xs text-fg0 whitespace-pre-wrap inner p-4 leading-6 max-h-[520px] overflow-auto">{{ task.user_prompt }}</pre>

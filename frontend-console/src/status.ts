@@ -1,17 +1,16 @@
-import type { Status } from './api'
+import type { RunStatus, Side, Status, Verdict } from './api'
 
 export const STATUS_LABEL: Record<Status, string> = {
   AVAILABLE: '待领取',
   CLAIMED: '已领取',
   QUEUED: '排队中',
   RUNNING: '运行中',
-  FINISHED: '正常结束',
-  FAILED: '异常结束',
-  TIMEOUT: '超时',
-  INTERRUPTED: '中断',
-  REVIEWED: '已评审',
+  RUN_DONE: '两侧跑完',
+  ANALYZING: '对比中',
+  ANALYZED: '待录屏上传',
   UPLOADED: '已上传',
   DONE: '已完成',
+  NEEDS_ATTENTION: '需人工',
   DISCARDED: '已废弃',
 }
 
@@ -21,15 +20,30 @@ export const STATUS_COLOR: Record<Status, string> = {
   CLAIMED: 'fg1',
   QUEUED: 'run',
   RUNNING: 'run',
-  FINISHED: 'ok',
-  FAILED: 'err',
-  TIMEOUT: 'warn',
-  INTERRUPTED: 'err',
-  REVIEWED: 'ok',
+  RUN_DONE: 'info',
+  ANALYZING: 'run',
+  ANALYZED: 'ok',
   UPLOADED: 'info',
   DONE: 'fg2',
+  NEEDS_ATTENTION: 'err',
   DISCARDED: 'fg2',
 }
+
+/** 单侧运行状态 */
+export const RUN_LABEL: Record<RunStatus, string> = {
+  PENDING: '待排队',
+  QUEUED: '排队中',
+  RUNNING: '运行中',
+  FINISHED: '正常结束',
+  FAILED: '异常结束',
+  TIMEOUT: '超时',
+  INTERRUPTED: '中断',
+}
+export const RUN_COLOR: Record<RunStatus, string> = {
+  PENDING: 'fg2', QUEUED: 'run', RUNNING: 'run',
+  FINISHED: 'ok', FAILED: 'err', TIMEOUT: 'warn', INTERRUPTED: 'err',
+}
+export const RUN_END: RunStatus[] = ['FINISHED', 'FAILED', 'TIMEOUT', 'INTERRUPTED']
 
 /** 浅色主题调色板（与 tailwind.config.js 保持一致） */
 export const HEX: Record<string, string> = {
@@ -38,28 +52,15 @@ export const HEX: Record<string, string> = {
 }
 
 /** 核验/门禁等级 → 颜色 */
-export const LEVEL_HEX: Record<string, string> = { ok: HEX.ok, pass: HEX.ok, warn: HEX.warn, block: HEX.err }
+export const LEVEL_HEX: Record<string, string> = { ok: HEX.ok, warn: HEX.warn, block: HEX.err }
 
-export const RUN_END: Status[] = ['FINISHED', 'FAILED', 'TIMEOUT', 'INTERRUPTED']
+/** GSB 结论。标签与平台下拉框一致 */
+export const VERDICT_LABEL: Record<Verdict, string> = { A: 'A 更好', B: 'B 更好', Same: 'Same' }
+export const VERDICT_COLOR: Record<Verdict, string> = { A: 'accent', B: 'info', Same: 'fg1' }
+export const VERDICTS: Verdict[] = ['A', 'Same', 'B']
 
-/** 质检结论（solo-qa 的口径） */
-export const QC_LABEL: Record<string, string> = {
-  PASS: '质检通过',
-  REJECT: '质检打回',
-  DISCARD: '建议废弃',
-  INCOMPLETE: '信息不全',
-}
-export const QC_COLOR: Record<string, string> = {
-  PASS: 'ok', REJECT: 'err', DISCARD: 'err', INCOMPLETE: 'warn',
-}
-
-/** 自动流水线阶段 */
-export const STAGE_LABEL: Record<string, string> = {
-  destroy: '销毁容器',
-  analyze: '五维分析',
-  qc: '质检中',
-  done: '流水线完成',
-}
+/** 两侧的配色。A、B 全程用同一组颜色，扫一眼就知道在看哪边 */
+export const SIDE_HEX: Record<Side, string> = { A: '#4F6BED', B: '#0284C7' }
 
 export const DESIGN_LABEL: Record<string, string> = {
   QUEUED: '等待开始',
@@ -71,15 +72,6 @@ export const DESIGN_LABEL: Record<string, string> = {
 }
 export const DESIGN_COLOR: Record<string, string> = {
   QUEUED: 'fg1', RUNNING: 'run', DEDUP: 'run', DONE: 'ok', FAILED: 'err', CANCELLED: 'fg2',
-}
-
-export const DIMS = ['delivery', 'instruction', 'planning', 'reasoning', 'execution'] as const
-export const DIM_LABEL: Record<string, string> = {
-  delivery: '交付完整性',
-  instruction: '指令遵循',
-  planning: '任务规划',
-  reasoning: '推理能力',
-  execution: '执行能力',
 }
 
 export function fmtTime(iso: string | null | undefined): string {
