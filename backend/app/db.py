@@ -27,7 +27,9 @@ engine = create_engine(
 def _pragmas(dbapi_conn, _record) -> None:  # noqa: ANN001
     cur = dbapi_conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA synchronous=NORMAL")
+    # NORMAL 下提交不 fsync，Docker Desktop 的 bind mount 在容器重建时会把还没落盘的
+    # 提交丢掉——设置改完一重启就回退，任务状态同样会丢。写入量很小，换成 FULL。
+    cur.execute("PRAGMA synchronous=FULL")
     cur.execute("PRAGMA foreign_keys=ON")
     cur.close()
 

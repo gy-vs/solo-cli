@@ -4,13 +4,17 @@ import type { TaskBrief } from '../api'
 import StatusPill from './StatusPill.vue'
 import { fmtTime, HEX } from '../status'
 
-const props = defineProps<{ task: TaskBrief; busy?: boolean }>()
+const props = defineProps<{ task: TaskBrief; busy?: boolean; mates?: TaskBrief[] }>()
 const emit = defineEmits<{
   (e: 'claim'): void; (e: 'release'): void; (e: 'open'): void
   (e: 'discard'): void; (e: 'restore'): void; (e: 'reset'): void
 }>()
 const diffColor = (d: string) => (d.includes('困难') ? HEX.warn : d.includes('中') ? HEX.run : HEX.fg1)
 const claimable = () => props.task.status === 'AVAILABLE' || props.task.status === 'CLAIMED'
+// 同项目的题同时跑会互相盖改动，卡片上直接点名，正在跑的额外标红
+const mates = () => props.mates || []
+const runningMates = () => mates().filter((m) => m.status === 'RUNNING')
+const mateText = (t: TaskBrief) => `#${t.task_no}${t.status === 'RUNNING' ? '（运行中）' : t.status === 'QUEUED' ? '（排队中）' : ''}`
 const discardable = () => !['RUNNING', 'QUEUED', 'DISCARDED'].includes(props.task.status)
 // 跑过或动过的题才需要还原；从没碰过的待领取题没什么可退的
 const resettable = () => !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(props.task.status)
@@ -34,6 +38,14 @@ const resettable = () => !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(props.task
       <span>·</span>
       <span class="truncate" :title="task.env_snapshot">{{ task.env_snapshot.split('/commit/')[1]?.slice(0, 12) || '无快照 SHA' }}</span>
       <span class="ml-auto">{{ task.harness }} {{ task.harness_version }}</span>
+    </div>
+    <div v-if="mates().length" class="text-[12px] flex items-start gap-1.5"
+      :class="runningMates().length ? 'text-warn' : 'text-fg2'">
+      <span class="dot mt-1.5 shrink-0" :class="runningMates().length ? 'bg-warn' : 'bg-fg2'" />
+      <span :title="task.repo_id">
+        与 {{ mates().map(mateText).join('、') }} 共用项目 <span class="mono">{{ task.repo_id.split('/')[1] }}</span>
+        <template v-if="runningMates().length">，现在领取会排队等它跑完</template>
+      </span>
     </div>
     <div v-if="task.status === 'DISCARDED'" class="text-[12px] text-fg2">
       废弃于 {{ fmtTime(task.discarded_at) }}<span v-if="task.discarded_from">，废弃前为 {{ task.discarded_from }}</span>

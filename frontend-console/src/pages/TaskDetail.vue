@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { NButton, NTag, useDialog, useMessage } from 'naive-ui'
+import { NButton, NInput, NTag, useDialog, useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, type GateReport, type Review, type TaskDetail, type VerifyReport } from '../api'
@@ -11,7 +11,7 @@ import Timeline from '../components/Timeline.vue'
 import VerifyBar from '../components/VerifyBar.vue'
 import { useGlobalEvents, useRunEvents } from '../sse'
 import { DIMS, fmtDuration, fmtMs, fmtTime, HEX, RUN_END } from '../status'
-import { nowMs, refreshTasks } from '../store'
+import { nowMs, refreshTasks, repoMates, store } from '../store'
 
 const route = useRoute()
 const router = useRouter()
@@ -59,7 +59,8 @@ function normalizeReview(r: any): Review {
   }
   return { scores, descs, evidence, other_issues: r?.other_issues ?? '', coverage: r?.coverage ?? [], verification: r?.verification }
 }
-onMounted(() => load())
+// 直接从地址栏进来时全局列表可能还是空的，共用项目提示要靠它
+onMounted(() => { load(); if (!store.tasks.length) refreshTasks() })
 useGlobalEvents((p) => { if (p.type === 'task' && p.id === id) load(true) })
 const { events, total: eventTotal, truncated: eventsTruncated, thinkingTokens } = useRunEvents(id, { onFinished: () => load() })
 
@@ -73,6 +74,9 @@ const claimable = computed(() => task.value?.status === 'AVAILABLE' || task.valu
 const discardable = computed(() => !!task.value && !['RUNNING', 'QUEUED', 'DISCARDED'].includes(task.value.status))
 // 跑过或动过的题才有东西可退；从没碰过的待领取题没必要还原
 const resettable = computed(() => !!task.value && !['AVAILABLE', 'RUNNING', 'QUEUED'].includes(task.value.status))
+// 共用同一个项目的其他题：一个项目同时只跑一道
+const mates = computed(() => (task.value ? repoMates(task.value) : []))
+const runningMates = computed(() => mates.value.filter((m) => m.status === 'RUNNING'))
 /** 没跑过的题只有「题目信息」，跑完才出判定/评审/质检/上传/轨迹 */
 const tabs = computed<[Tab, string][]>(() => ended.value || isRunning.value
   ? [['verdict', '判定'], ['review', '五维评审'], ['qc', '质检'], ['upload', '上传'], ['steps', '轨迹步骤'], ['prompt', '题目信息']]
@@ -113,12 +117,30 @@ async function act(name: string, fn: () => Promise<any>, ok?: string) {
   } finally { busy.value = '' }
 }
 const stop = () => act('stop', () => api.stop(id), '已发送停止')
+
+// 续跑：首轮 504 或报错后，带一句新指令接着上一轮改动往下做
+const continuable = computed(() => !!task.value?.can_continue)
+const showContinue = ref(false)
+const continuePrompt = ref('')
+const nextRound = computed(() => (task.value?.round_no || 1) + 1)
+function openContinue() {
+  continuePrompt.value = ''
+  showContinue.value = true
+}
+const submitContinue = () => act('continue', async () => {
+  const r = await api.continueRun(id, continuePrompt.value)
+  showContinue.value = false
+  continuePrompt.value = ''
+  return r
+}, `已排入第 ${nextRound.value} 轮，等调度器出队`)
 async function claim() {
   busy.value = 'claim'
   try {
     const r = await api.claim(id)
     if (r.queued) {
-      msg.success('已进入队列，等待空闲槽位')
+      const blocker = runningMates.value[0]
+      if (r.waits_repo && blocker) msg.info(`已进入队列，等 #${blocker.task_no} 跑完再启动（同一个项目）`, { duration: 6000 })
+      else msg.success('已进入队列，等待空闲槽位')
       await load()
       await refreshTasks()
     } else {
@@ -141,9 +163,10 @@ const restore = () => act('restore', () => api.restore(id), '已恢复')
 function resetTask() {
   dialog.warning({
     title: `还原题 ${task.value?.task_no} 到做题前`,
-    content: '销毁残留容器；工作区 git clean 并回到初始快照 commit；轨迹目录归档；删除导出的轨迹副本与分析中间产物；'
-      + 'prompt.md 里回填过的 SessionID 与 TurnID 改回占位；清空运行、分析、评审、质检记录。'
-      + '做完这道题回到「待领取」，可以重新跑。工作区里未提交的改动会被清掉。',
+    content: '销毁各轮残留容器；工作区 git clean 并回到初始快照 commit；删除各轮轨迹目录、导出的轨迹副本、'
+      + '分析中间产物，以及以前还原时归档下来的目录；prompt.md 里回填过的 SessionID 与 TurnID 改回占位；'
+      + '清空运行、续跑、分析、评审、质检记录。做完这道题回到「待领取」，可以重新跑。'
+      + '轨迹与分析产物是直接删除、不留归档的，工作区里未提交的改动也会被清掉。',
     positiveText: '确认还原',
     negativeText: '取消',
     onPositiveClick: () => act('reset', async () => {
@@ -161,7 +184,13 @@ const save = () => act('save', async () => {
   verifyReport.value = r.verify
   return r
 }, '评审已保存并完成核验')
-const upload = () => act('upload', () => api.upload(id), '上传成功')
+const upload = () => act('upload', async () => {
+  const r = await api.upload(id)
+  const c = r.commit
+  msg.success(c?.ok && !c.skipped ? `上传成功，${c.message}` : '上传成功')
+  if (c && !c.ok && !c.skipped) msg.warning(`代码没提交上：${c.message}`, { duration: 8000 })
+  return r
+})
 function complete() {
   const t = task.value!
   const force = t.status !== 'UPLOADED'
@@ -203,6 +232,7 @@ const paramRows = computed<[string, string][]>(() => {
     ['复现等级', t.repro_level], ['初始快照', t.env_snapshot],
     ['SessionID', t.session_id], ['TurnID/PromptID', t.turn_id],
     ['容器名', t.container_name], ['镜像', t.image_tag],
+    ['续跑轮次', t.round_no > 1 ? `第 ${t.round_no} 轮` : '首轮'],
   ]
 })
 const timeRows = computed<[string, string][]>(() => {
@@ -254,6 +284,10 @@ const payloadPreview = computed(() => {
         <NButton v-if="claimable" size="small" secondary :loading="gateChecking" @click="runGate">门禁检查</NButton>
         <NButton v-if="discarded" size="small" type="primary" secondary :loading="busy === 'restore'" @click="restore">恢复该题</NButton>
         <NButton v-if="isRunning" size="small" type="error" secondary :loading="busy === 'stop'" @click="stop">停止容器</NButton>
+        <NButton v-if="continuable" size="small" type="primary" :secondary="task.status === 'REVIEWED'"
+          title="上一轮的代码改动都还在，输入下一轮要做什么，接着往下跑" @click="openContinue">
+          继续对话{{ task.round_no > 1 ? `（已跑 ${task.round_no} 轮）` : '' }}
+        </NButton>
         <NButton v-if="ended && !locked" size="small" type="primary" :secondary="task.analysis_status === 'DONE'" :loading="busy === 'analyze'"
           :disabled="task.analysis_status === 'RUNNING'" @click="analyze">
           {{ task.analysis_status === 'DONE' ? '重新分析' : 'Cursor 五维分析' }}
@@ -273,6 +307,42 @@ const payloadPreview = computed(() => {
         <NButton v-if="resettable" size="small" quaternary :loading="busy === 'reset'"
           title="工作区、轨迹、回填、评审记录全部退回做题前" @click="resetTask">还原到做题前</NButton>
         <NButton v-if="discardable" size="small" quaternary type="error" :loading="busy === 'discard'" @click="discard">废弃</NButton>
+      </div>
+      <div v-if="mates.length" class="mt-3 text-xs flex items-start gap-1.5"
+        :class="runningMates.length ? 'text-warn' : 'text-fg1'">
+        <span class="dot mt-1.5 shrink-0" :class="runningMates.length ? 'bg-warn' : 'bg-fg2'" />
+        <span>
+          项目 <span class="mono">{{ task.repo_id }}</span> 还被
+          <RouterLink v-for="m in mates" :key="m.id" :to="`/tasks/${m.id}`" class="mono mx-0.5 underline decoration-dotted">
+            #{{ m.task_no }}{{ m.status === 'RUNNING' ? '（运行中）' : m.status === 'QUEUED' ? '（排队中）' : '' }}
+          </RouterLink>
+          用着。一个项目同时只跑一道题{{ runningMates.length ? '，这道题现在只能排队等它结束' : '' }}
+        </span>
+      </div>
+      <div v-if="showContinue" class="mt-3 inner p-3">
+        <div class="text-xs text-fg1">
+          第 {{ nextRound }} 轮续跑。镜像不支持恢复会话，这一轮是全新对话，但
+          <span class="mono">workspace</span> 里上一轮的改动都还在，指令会连同原始需求和已有改动一起交给模型。
+          留空就是「按原需求继续做完」。
+        </div>
+        <NInput v-model:value="continuePrompt" type="textarea" class="mt-2" :autosize="{ minRows: 3, maxRows: 10 }"
+          placeholder="例如：继续。上一轮网关 504 中断了，接着把剩下的用例补完，不要重写已经改好的文件。" />
+        <div class="mt-2 flex items-center gap-2">
+          <NButton size="small" type="primary" :loading="busy === 'continue'" @click="submitContinue">
+            排入第 {{ nextRound }} 轮
+          </NButton>
+          <NButton size="small" quaternary @click="showContinue = false">取消</NButton>
+          <span class="ml-auto text-xs text-fg2 mono">solo-cc-{{ task.task_no }}-r{{ nextRound }}</span>
+        </div>
+      </div>
+      <div v-if="task.rounds?.length > 1" class="mt-3 text-xs">
+        <div class="text-fg1 mb-1">续跑记录（每轮一份独立轨迹，上传只能交一份，需人工确认用哪轮）</div>
+        <div v-for="r in task.rounds" :key="r.round_no" class="flex items-center gap-2 py-0.5">
+          <span class="mono text-fg2 shrink-0">第 {{ r.round_no }} 轮</span>
+          <StatusPill :status="r.status" small />
+          <span class="mono text-fg2 shrink-0">改动 {{ r.changed_files }}</span>
+          <span class="text-fg1 truncate" :title="r.prompt">{{ r.prompt || '（按原需求）' }}</span>
+        </div>
       </div>
       <div v-if="discarded" class="mt-3 text-xs text-fg1">
         该题已于 {{ fmtTime(task.discarded_at) }} 废弃，不再出现在题库与运行舱列表中。
@@ -459,6 +529,16 @@ const payloadPreview = computed(() => {
               <span class="mono text-[12px] text-fg2 ml-auto">{{ fmtTime(task.upload.started_at) }}</span>
             </div>
             <div v-if="task.upload.message" class="text-xs" :class="task.upload.ok ? 'text-fg1' : 'text-err'">{{ task.upload.message }}</div>
+            <div v-if="task.upload.commit" class="inner px-3 py-2 text-xs flex items-start gap-2"
+              :class="task.upload.commit.ok ? 'text-fg1' : 'text-warn'">
+              <span class="text-fg2 shrink-0">代码提交</span>
+              <span>
+                {{ task.upload.commit.message }}
+                <span v-if="task.upload.commit.branch" class="text-fg2">
+                  · 原分支仍停在初始快照，还原不会删掉这个分支
+                </span>
+              </span>
+            </div>
             <div v-if="task.upload.fields" class="space-y-1">
               <div v-for="(m, f) in task.upload.fields" :key="f" class="inner px-3 py-1.5 text-xs flex gap-3"><span class="mono text-warn w-32 shrink-0">{{ f }}</span><span class="text-fg0">{{ m }}</span></div>
             </div>

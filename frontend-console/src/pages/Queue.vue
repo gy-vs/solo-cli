@@ -63,6 +63,11 @@ async function setParallel(v: number | null) {
     msg.success(`并发上限已改为 ${v}`)
   } catch (e: any) { msg.error(e.message) }
 }
+/** 有槽位也起不来的原因：同项目有题在跑，一个项目同时只跑一道 */
+function waitReason(t: TaskBrief): string {
+  const w = sch.value?.repo_waiting?.find((x) => x.id === t.id)
+  return w ? `等 #${w.blocked_by} 跑完（同项目）` : ''
+}
 function stageText(t: TaskBrief): string {
   if (t.auto_error) return t.auto_error
   return STAGE_LABEL[t.auto_stage] || '等待'
@@ -75,7 +80,8 @@ function stageText(t: TaskBrief): string {
       <div>
         <div class="h1">队列</div>
         <div class="text-fg1 text-xs mt-0.5">
-          超出并发的题在这里排队，前面的一结束就自动补位；结束后自动销毁容器、分析、质检，不用人工点
+          超出并发的题在这里排队，前面的一结束就自动补位；一个项目同时只跑一道题；
+          结束后自动销毁容器、分析、质检，不用人工点
         </div>
       </div>
       <div class="ml-auto flex items-center gap-3">
@@ -136,7 +142,9 @@ function stageText(t: TaskBrief): string {
           <div class="text-xs text-fg0 truncate">{{ t.question_type }} · {{ t.languages }}</div>
           <div class="text-[12px] text-fg2 truncate">{{ t.prompt_preview }}</div>
         </div>
-        <div class="mono text-[12px] text-fg2 nums">领取 {{ fmtTime(t.claimed_at) }}</div>
+        <div class="text-[12px] nums" :class="waitReason(t) ? 'text-warn' : 'text-fg2 mono'">
+          {{ waitReason(t) || `领取 ${fmtTime(t.claimed_at)}` }}
+        </div>
         <div class="flex items-center gap-1">
           <NButton size="tiny" quaternary :disabled="i === 0" :loading="busy === t.id" @click="move(t, 'top')">置顶</NButton>
           <NButton size="tiny" quaternary :disabled="i === 0" :loading="busy === t.id" @click="move(t, 'up')">↑</NButton>

@@ -11,7 +11,7 @@ import httpx
 from app.db import session
 from app.events import bus
 from app.models import UPLOADED, Task, utc_now
-from app.services import dockerx, settings_store
+from app.services import dockerx, repo, settings_store
 from app.services.verifier import DIMS
 
 log = logging.getLogger("uploader")
@@ -151,6 +151,7 @@ async def upload_task(task_id: int) -> dict:
                 body = {"detail": resp.text[:500]}
             record["response"] = body
             if resp.status_code == 201:
+                info = None
                 with session() as db:
                     t = db.get(Task, task_id)
                     if t is not None:
@@ -159,10 +160,12 @@ async def upload_task(task_id: int) -> dict:
                         record["ok"] = True
                         record["submission_id"] = body.get("id")
                         t.upload = record
+                        info = repo.CommitInfo.of(t)
                 bus.publish("tasks", {"type": "task", "id": task_id})
                 log.info("题 %s 上传成功 id=%s", task_no, body.get("id"))
+                commit = await _commit_code(task_id, record, info)
                 return {"ok": True, "message": body.get("message") or "提交成功", "submission_id": body.get("id"),
-                        "status": body.get("status"), "round_no": body.get("round_no")}
+                        "status": body.get("status"), "round_no": body.get("round_no"), "commit": commit}
             if resp.status_code == 422:
                 errors = body.get("errors") or []
                 fields = {e.get("field"): e.get("message") for e in errors if isinstance(e, dict)}
@@ -174,6 +177,28 @@ async def upload_task(task_id: int) -> dict:
         return _fail(task_id, record, str(exc), auth=True)
     except httpx.HTTPError as exc:
         return _fail(task_id, record, f"请求失败：{exc}")
+
+
+async def _commit_code(task_id: int, record: dict, info: "repo.CommitInfo | None") -> dict:
+    """上传成功后固化工作区产物。提交失败只记一笔，不把成功的上传判为失败。"""
+    if info is None:
+        return {"ok": False, "skipped": True, "message": "任务已不存在，跳过提交"}
+    if not settings_store.get_bool("git.commit_on_upload"):
+        return {"ok": False, "skipped": True, "message": "已关闭上传后提交"}
+    try:
+        res = await repo.commit_after_upload(info)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("题 %s 上传后提交异常", info.task_no)
+        res = {"ok": False, "message": f"提交异常：{exc}"}
+    if not res.get("ok") and not res.get("skipped"):
+        log.warning("题 %s 上传后提交失败：%s", info.task_no, res.get("message"))
+    record["commit"] = res
+    with session() as db:
+        t = db.get(Task, task_id)
+        if t is not None:
+            t.upload = dict(record)
+    bus.publish("tasks", {"type": "task", "id": task_id})
+    return res
 
 
 def _fail(task_id: int, record: dict, message: str, *, fields: dict | None = None, auth: bool = False) -> dict:

@@ -35,6 +35,22 @@ ABS_PATH_RE = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/){1,}")
 HOST_DIR_WORDS = ("/host", "/data/", "/Users/", "分析/", "出题/")
 CONTAINER_DIR = "/workspace"
 
+# 步数说法：位置该用文件名、函数名、命令来指，步号只属于 evidence 字段
+STEP_REF_RE = re.compile(r"第\s*\d+\s*(?:[、,，和及到至~-]\s*\d+\s*)*[步轮]|步骤\s*\d+")
+
+# 开场的总评与表态。评审方看的是现象，第一句就该落在具体东西上
+OPENER_WORDS = (
+    "我认可", "都做对了", "做对了", "都对了", "对了产物", "逐条对", "一条条核", "都准确", "都到位",
+    "没什么问题", "没有问题", "都挺", "都很", "整体", "总体", "大体", "基本没", "完成度",
+    "紧凑", "到位", "扎实", "靠谱", "合格", "不错", "还行", "一般",
+)
+# 首句里有这些才算落到了具体东西上
+ANCHOR_RE = re.compile(
+    r"[A-Za-z_][\w./-]*\.(?:js|mjs|cjs|jsx|ts|tsx|py|go|java|rs|rb|php|c|h|cpp|json|md|ya?ml|toml|css|scss|html|sh|sql|lock)\b"
+    r"|[A-Za-z_]\w{2,}\s*\(\)"
+    r"|\b(?:npm|pnpm|yarn|npx|pytest|python|node|cargo|go|git|make|docker|tsc|eslint|vitest|jest)\b"
+)
+
 # 对分析环境的自述：说的是我这次怎么核验的，不是被评模型的能力，写进去既没意义也显得荒唐
 META_TALK_WORDS = (
     "node_modules", "产物副本", "沙箱", "我这边", "我的环境", "本地环境", "跑不起来", "跑不了",
@@ -72,9 +88,37 @@ def check_text_style(text: str) -> list[dict]:
     if meta:
         items.append({"level": "block", "code": "meta_talk", "words": meta,
                       "message": f"在讲我自己的核验环境而不是被评模型：{'、'.join(meta[:6])}，删掉这部分只留基于代码与轨迹的结论"})
+    steps = [m.group(0) for m in STEP_REF_RE.finditer(text)]
+    if steps:
+        items.append({"level": "block", "code": "step_ref", "words": list(dict.fromkeys(steps))[:6],
+                      "message": f"用步数指位置：{'、'.join(dict.fromkeys(steps))[:60]}，改成文件名、函数名或命令"})
+    items += _check_opener(text)
     if "我" not in text:
         items.append({"level": "warn", "code": "not_first_person", "message": "没有出现第一人称「我」"})
     return items
+
+
+def _first_sentence(text: str) -> str:
+    return re.split(r"[。！？\n]", text.strip(), maxsplit=1)[0].strip()
+
+
+def _check_opener(text: str) -> list[dict]:
+    """第一句必须落在具体东西上。总评开头一眼就是机器写的，评审方最先看到的就是它。"""
+    head = _first_sentence(text)
+    if not head:
+        return []
+    hits = [w for w in OPENER_WORDS if w in head]
+    anchored = bool(ANCHOR_RE.search(head))
+    if hits and not anchored:
+        return [{"level": "block", "code": "opener_talk", "words": hits,
+                 "message": f"第一句是总评而不是现象（{'、'.join(hits[:4])}），改成从具体文件或函数写起"}]
+    if hits:
+        return [{"level": "warn", "code": "opener_judgement", "words": hits,
+                 "message": f"第一句夹了评价用词（{'、'.join(hits[:4])}），只留现象更好"}]
+    if not anchored:
+        return [{"level": "warn", "code": "vague_opener",
+                 "message": "第一句没点到具体的文件、函数或命令，读起来像先给结论"}]
+    return []
 
 
 def _find_step(steps: list[dict], no: Any) -> dict | None:

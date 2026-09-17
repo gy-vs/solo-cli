@@ -94,6 +94,20 @@ async def remove_container(name: str) -> CmdResult:
     return await run(["docker", "rm", "-f", name], timeout=60)
 
 
+async def remove_task_containers(task_no: str) -> CmdResult:
+    """删掉这道题所有轮次的容器。
+
+    续跑每轮一个容器（solo-cc-01、solo-cc-01-r2……），只按当前名字删会把前几轮
+    的落下。各轮都带同一个 task 标签，按标签一次清干净。
+    """
+    ls = await run(["docker", "ps", "-aq", "--filter",
+                    f"label={config.CONTAINER_LABEL}={task_no}"], timeout=30)
+    ids = ls.out.split()
+    if not ids:
+        return CmdResult(0, "", "")
+    return await run(["docker", "rm", "-f", *ids], timeout=120)
+
+
 async def list_task_containers() -> list[dict]:
     r = await run(["docker", "ps", "-a", "--filter", f"label={config.CONTAINER_LABEL}",
                    "--format", "{{.Names}}\t{{.Status}}\t{{.Label \"" + config.CONTAINER_LABEL + "\"}}"], timeout=20)

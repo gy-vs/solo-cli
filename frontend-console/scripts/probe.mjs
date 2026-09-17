@@ -129,12 +129,19 @@ await tab('待领取')
 await sleep(700)
 check('待领取的题不给还原按钮', (await countResetBtns()) === 0)
 
+// 5c. 共用项目标注：同一个仓库的题不能同时跑，列表得点名
+await tab('全部')
+await sleep(700)
+check('题库汇总共用项目', await has('共用同一个项目的题'))
+check('题卡点名同项目的题', await has('共用项目'))
+
 // 6. 队列管理台（走侧边栏，整页重载会等上设置页的模型探测）
 check('侧边栏有队列入口', await nav('队列'))
 await sleep(1200)
 check('队列页渲染', await has('并发上限'))
 check('队列页有自动流水线区', await has('自动流水线'))
 check('队列页说明自动补位', await has('自动补位'))
+check('队列页说明一项目一并发', await has('一个项目同时只跑一道题'))
 await page.screenshot({ path: '/tmp/solo-shots/probe-queue.png' })
 
 // 7. 设计题目

@@ -44,6 +44,7 @@ export interface TaskBrief {
   os_platform: string
   repro_level: string
   env_snapshot: string
+  repo_id: string
   prompt_preview: string
   prompt_chars: number
   session_id: string
@@ -52,6 +53,9 @@ export interface TaskBrief {
   container_exists: boolean
   image_tag: string
   exit_code: number | null
+  round_no: number
+  rounds: RoundRecord[]
+  can_continue: boolean
   meta: Record<string, string>
   verdict_notes: string[]
   protocol: { subtype?: string; num_turns?: number; duration_ms?: number; cost_usd?: number; usage?: any }
@@ -157,6 +161,17 @@ export interface VerifyReport {
   items: VerifyItem[]
 }
 
+/** 上传成功后把工作区产物提交到 solo/* 分支的结果 */
+export interface CommitResult {
+  ok: boolean
+  skipped?: boolean
+  message: string
+  branch?: string
+  commit?: string
+  short?: string
+  changed_files?: number
+}
+
 export interface TaskDetail extends TaskBrief {
   user_prompt: string
   result: any
@@ -183,7 +198,11 @@ export interface SettingItem {
 export interface SystemStatus {
   docker: { ok: boolean; message: string }
   image: { name: string; present: boolean }
-  scheduler: { running: number; max_parallel: number; running_ids: number[]; queued: number; paused: boolean }
+  scheduler: {
+    running: number; max_parallel: number; running_ids: number[]; queued: number; paused: boolean
+    /** 有槽位也起不来的题：同项目已有一道在跑 */
+    repo_waiting: { id: number; task_no: string; repo_id: string; blocked_by: string }[]
+  }
   pipeline: { running: number[]; max_parallel: number; destroy: boolean; analyze: boolean; qc: boolean }
   qc: { ok: boolean; message: string; image: string }
   design: { running: number[] }
@@ -194,7 +213,20 @@ export interface SystemStatus {
   paths: { coder_root_host: string; coder_root_mount: string; prompt_file: string; prompt_exists: boolean }
 }
 
-export interface RunEvent { seq: number; kind: string; summary: string; ts: string | null; payload: any }
+export interface RunEvent { seq: number; round_no?: number; kind: string; summary: string; ts: string | null; payload: any }
+
+/** 一轮续跑的留痕。镜像不支持 --resume，所以每轮是独立会话与独立轨迹。 */
+export interface RoundRecord {
+  round_no: number
+  status: Status
+  exit_code: number | null
+  container: string
+  trace_file: string
+  session_id: string
+  changed_files: number
+  prompt: string
+  finished_at: string
+}
 
 // ---------- 接口 ----------
 export const api = {
@@ -216,21 +248,26 @@ export const api = {
   task: (id: number) => get<TaskDetail>(`/api/tasks/${id}`),
   importBank: () => post<{ parsed: number; added: string[]; skipped: number }>('/api/tasks/import'),
   gate: (id: number) => post<GateReport>(`/api/tasks/${id}/gate`),
-  claim: (id: number, force = false) => post<{ queued: boolean; gate: GateReport }>(`/api/tasks/${id}/claim${force ? '?force=true' : ''}`),
+  claim: (id: number, force = false) =>
+    post<{ queued: boolean; gate: GateReport; waits_repo: boolean }>(`/api/tasks/${id}/claim${force ? '?force=true' : ''}`),
   release: (id: number) => post<{ ok: boolean }>(`/api/tasks/${id}/release`),
   discard: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/discard`),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
-  resetTask: (id: number, keepTraces = true) =>
+  // 默认不归档：还原就是彻底清掉轨迹与分析产物
+  resetTask: (id: number, keepTraces = false) =>
     post<{ ok: boolean; steps: ResetStep[] }>(`/api/tasks/${id}/reset?keep_traces=${keepTraces}`),
   fix: (id: number, action: string) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/fix/${action}`),
   stop: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/stop`),
+  continueRun: (id: number, prompt: string) =>
+    post<{ ok: boolean; round_no: number; container: string; message: string }>(`/api/tasks/${id}/continue`, { prompt }),
   events: (id: number) => get<{ items: RunEvent[] }>(`/api/tasks/${id}/events/list`),
   traceIndex: (id: number) => get<any>(`/api/tasks/${id}/trace-index`),
   analyze: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/analyze`),
   saveReview: (id: number, body: { scores: Record<string, number | null>; descs: Record<string, string>; other_issues: string; evidence?: any; coverage?: any }) =>
     put<{ verify: VerifyReport; task: TaskBrief }>(`/api/tasks/${id}/review`, body),
   verify: (id: number) => post<VerifyReport>(`/api/tasks/${id}/verify`),
-  upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),
+  upload: (id: number) =>
+    post<{ ok: boolean; message: string; submission_id?: number; commit?: CommitResult }>(`/api/tasks/${id}/upload`),
   batchUpload: (ids: number[]) => post<{ results: any[] }>('/api/tasks/batch/upload', { ids }),
   batchClaim: (ids: number[]) => post<{ results: any[] }>('/api/tasks/batch/claim', { ids }),
   complete: (id: number, force = false) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/complete${force ? '?force=true' : ''}`),

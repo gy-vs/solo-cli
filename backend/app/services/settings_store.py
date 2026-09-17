@@ -67,6 +67,10 @@ SPECS: tuple[Spec, ...] = (
     Spec("design.timeout_minutes", "设计超时（分钟）", "题目设计", default="90", kind="number"),
     Spec("design.auto_dedup", "设计后自动查重（规则 A+C）", "题目设计", default="1", kind="bool",
          help="命中规则 A 或 C 的题直接废弃，通过的留在题库队列"),
+    Spec("git.commit_on_upload", "上传后提交工作区代码", "交付", default="1", kind="bool",
+         help="上传 solo-qa 成功后，把改动提交到这道题自己的分支；还原时会先备份到 refs/solo-backup/*"),
+    Spec("git.task_branch", "题目分支命名", "交付", default="q{no}",
+         help="一个项目里一道题一个分支，{no} 替换成题号。做题前门禁会检查是否落在这个分支上"),
     Spec("gh.token", "GitHub Token", "题目设计", secret=True,
          help="出题要建仓库和推快照。本机执行 gh auth token 取值，需要 repo 权限"),
 )

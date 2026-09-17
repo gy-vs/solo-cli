@@ -16,9 +16,9 @@ from app.models import (
     ANALYSIS_RUNNING, ANALYZABLE, AVAILABLE, CLAIMED, DISCARDED, DONE, QC_RUNNING, QUEUED,
     RUN_END_STATUSES, RUNNING, REVIEWED, UPLOADED, RunEvent, Task, utc_now,
 )
-from app.schemas import IdList, QueueMove, ReviewUpdate, task_brief, task_detail
+from app.schemas import ContinueRun, IdList, QueueMove, ReviewUpdate, task_brief, task_detail
 from app.services import (
-    analyzer, dockerx, gate, pipeline, prompt_bank, qa_bridge, runner, scheduler, task_reset,
+    analyzer, dockerx, gate, pipeline, prompt_bank, qa_bridge, repo, runner, scheduler, task_reset,
     uploader, settings_store,
 )
 
@@ -145,14 +145,20 @@ async def claim(task_id: int, force: bool = Query(default=False)) -> dict:
         t.claimed_at = t.claimed_at or utc_now()
         db.flush()
         snapshot = t
+    # 一道题一个分支，开工前先落到自己的分支上；切不了就让门禁把原因报出来
+    await repo.ensure_task_branch(snapshot.task_no)
     report = gate.summarize(await gate.run_checks(snapshot))
-    if report["passed"] or force:
+    # 同项目有题在跑不该挡住排队：进队列等着，调度器保证不会两道一起跑
+    blocks = [c for c in report["checks"] if c["level"] == "block"]
+    waits_repo = bool(blocks) and all(c["name"] == "repo_busy" for c in blocks)
+    queued = report["passed"] or waits_repo or force
+    if queued:
         with session() as db:
             t = _get(db, task_id)
             t.status = QUEUED
             t.claimed_at = utc_now()
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return {"queued": report["passed"] or force, "gate": report}
+    return {"queued": queued, "gate": report, "waits_repo": waits_repo}
 
 
 @router.post("/{task_id}/release")
@@ -178,10 +184,10 @@ async def discard(task_id: int) -> dict:
             raise HTTPException(409, "排队中不能废弃，请先放回题库")
         if t.status == DISCARDED:
             return {"ok": True, "message": "该题已是废弃状态"}
-        name, had_container = t.container_name, t.container_exists
+        task_no, had_container = t.task_no, t.container_exists
     removed = False
     if had_container:
-        removed = (await dockerx.remove_container(name)).ok
+        removed = (await dockerx.remove_task_containers(task_no)).ok
     with session() as db:
         t = _get(db, task_id)
         t.discarded_from = t.status
@@ -211,8 +217,11 @@ async def restore(task_id: int) -> dict:
 
 
 @router.post("/{task_id}/reset")
-async def reset(task_id: int, keep_traces: bool = Query(default=True)) -> dict:
-    """恢复到做题前：容器、工作区、轨迹、prompt.md 回填、评审与质检记录全部还原。"""
+async def reset(task_id: int, keep_traces: bool = Query(default=False)) -> dict:
+    """恢复到做题前：容器、工作区、轨迹、prompt.md 回填、评审与质检记录全部还原。
+
+    默认把轨迹与分析产物直接删掉；要留一份改名归档的证据就传 keep_traces=true。
+    """
     r = await task_reset.reset_task(task_id, archive=keep_traces)
     if r.get("blocked"):
         raise HTTPException(409, r["steps"][0]["message"])
@@ -229,6 +238,8 @@ async def gate_fix(task_id: int, action: str) -> dict:
         return await gate.reset_to_snapshot(t)
     if action == "archive_traces":
         return gate.archive_traces(t.task_no)
+    if action == "switch_branch":
+        return await repo.switch_to_task_branch(t.task_no)
     if action == "remove_container":
         r = await dockerx.remove_container(t.container_name)
         with session() as db:
@@ -242,6 +253,17 @@ async def stop(task_id: int) -> dict:
     return await runner.stop_task(task_id)
 
 
+@router.post("/{task_id}/continue")
+async def continue_run(task_id: int, body: ContinueRun) -> dict:
+    """续跑一轮：首轮 504 或报错后，带着新指令接着上一轮的改动往下做。"""
+    with session() as db:
+        _get(db, task_id)
+    res = await runner.queue_continue(task_id, body.prompt)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("message", "无法续跑"))
+    return res
+
+
 # ---------------- 事件流 ----------------
 
 REPLAY_LIMIT = 600      # 回放上限：一次运行可能几万条事件，全推过去浏览器会卡死
@@ -249,8 +271,8 @@ REPLAY_LIMIT = 600      # 回放上限：一次运行可能几万条事件，全
 
 def _event_row(e: RunEvent) -> dict:
     # type 是 SSE 的分发标记，前端靠它区分事件与状态消息，缺了事件流会整段丢掉
-    return {"type": "event", "seq": e.seq, "kind": e.kind, "summary": e.summary,
-            "ts": e.ts.isoformat() if e.ts else None, "payload": e.payload}
+    return {"type": "event", "seq": e.seq, "round_no": max(1, e.round_no or 1), "kind": e.kind,
+            "summary": e.summary, "ts": e.ts.isoformat() if e.ts else None, "payload": e.payload}
 
 
 def _load_events(db, task_id: int, limit: int) -> tuple[list[dict], int]:  # noqa: ANN001
@@ -436,8 +458,9 @@ async def complete(task_id: int, force: bool = Query(default=False)) -> dict:
         trace_ok = bool(t.trace_file and Path(t.trace_file).exists())
         if not trace_ok and not force:
             raise HTTPException(409, "轨迹尚未导出，销毁会丢失数据；确认请带 force=true")
-        name = t.container_name
-    r = await dockerx.remove_container(name)
+        task_no = t.task_no
+    # 续跑过的题每轮一个容器，按标签一起收掉，别把前几轮落下
+    r = await dockerx.remove_task_containers(task_no)
     with session() as db:
         t = _get(db, task_id)
         t.container_exists = False
@@ -454,8 +477,8 @@ async def destroy_container(task_id: int) -> dict:
         t = _get(db, task_id)
         if t.status == RUNNING:
             raise HTTPException(409, "运行中不能销毁，请先停止")
-        name = t.container_name
-    r = await dockerx.remove_container(name)
+        task_no = t.task_no
+    r = await dockerx.remove_task_containers(task_no)
     with session() as db:
         _get(db, task_id).container_exists = False
     bus.publish("tasks", {"type": "task", "id": task_id})

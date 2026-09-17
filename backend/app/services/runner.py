@@ -13,7 +13,8 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import (
-    FAILED, FINISHED, INTERRUPTED, RUN_END_STATUSES, RUNNING, TIMEOUT, RunEvent, Task, utc_now,
+    CONTINUABLE, FAILED, FINISHED, INTERRUPTED, QUEUED, RUN_END_STATUSES, RUNNING, STAGE_IDLE, TIMEOUT,
+    RunEvent, Task, utc_now,
 )
 from app.services import dockerx, prompt_bank, settings_store, trace
 
@@ -29,6 +30,46 @@ THINKING_PUSH_INTERVAL_S = 2.0
 # 单题落库上限。防的是以后出现别的高频事件把库和浏览器一起拖死；
 # 超过之后只留生命周期、结束事件与 stderr。
 MAX_EVENTS_PER_TASK = 8000
+
+# 单行上限与读取块大小。tool_result 会把整份文件连同 structuredPatch 塞进一行，
+# 几百 KB 很常见，所以留足余量；真超过就截断，不能让缓冲无上限地涨。
+MAX_LINE_BYTES = 8 * 1024 * 1024
+READ_CHUNK_BYTES = 65536
+
+
+async def _iter_lines(stream: asyncio.StreamReader):
+    """按块读、自己切行，第二个返回值表示这行是否因超长被截断。
+
+    不能用 StreamReader.readline：它的上限是 create_subprocess_exec 的 limit（默认
+    64KiB），单行超过就抛 ValueError 把读取协程打死。协程一死管道没人排空，容器写
+    stdout 被背压堵住，题就卡在原地不动，一直挂到超时。
+    """
+    buf = bytearray()
+    dropping = False  # 当前行已超限，余下的字节丢到换行为止
+    while True:
+        chunk = await stream.read(READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        buf += chunk
+        while (nl := buf.find(b"\n")) >= 0:
+            line = bytes(buf[:nl])
+            del buf[:nl + 1]
+            if dropping:
+                dropping = False
+                continue
+            if len(line) > MAX_LINE_BYTES:
+                yield line[:MAX_LINE_BYTES], True
+            else:
+                yield line, False
+        if dropping:
+            buf.clear()
+        elif len(buf) > MAX_LINE_BYTES:
+            # 还没见到换行就已经超限，先把读到的交出去，剩下的丢到行尾
+            yield bytes(buf[:MAX_LINE_BYTES]), True
+            buf.clear()
+            dropping = True
+    if buf and not dropping:
+        yield bytes(buf), False
 
 
 def _now_iso() -> str:
@@ -69,15 +110,57 @@ def _summarize_event(obj: dict) -> str:
     return typ or "event"
 
 
-def _record_event(task_id: int, seq: int, kind: str, summary: str, payload: dict) -> None:
+def _record_event(task_id: int, seq: int, kind: str, summary: str, payload: dict, round_no: int = 1) -> None:
     raw = json.dumps(payload, ensure_ascii=False)
     if len(raw) > 20000:
         payload = {"truncated": True, "type": payload.get("type"), "preview": raw[:20000]}
     with session() as db:
-        db.add(RunEvent(task_id=task_id, seq=seq, kind=kind, summary=summary[:2000],
+        db.add(RunEvent(task_id=task_id, seq=seq, round_no=round_no, kind=kind, summary=summary[:2000],
                         payload_json=json.dumps(payload, ensure_ascii=False)))
-    bus.publish(f"run:{task_id}", {"type": "event", "seq": seq, "kind": kind, "summary": summary[:2000],
-                                   "ts": _now_iso(), "payload": payload})
+    bus.publish(f"run:{task_id}", {"type": "event", "seq": seq, "round_no": round_no, "kind": kind,
+                                   "summary": summary[:2000], "ts": _now_iso(), "payload": payload})
+
+
+def _max_seq(task_id: int) -> int:
+    """续跑的事件要接在已有时间线后面，不能从 1 重新开始撞上上一轮的 seq。"""
+    from sqlalchemy import func, select
+
+    with session() as db:
+        return int(db.execute(select(func.max(RunEvent.seq)).where(RunEvent.task_id == task_id)).scalar() or 0)
+
+
+async def build_continue_prompt(task: Task, paths: config.TaskPaths) -> str:
+    """组装续跑指令。
+
+    镜像不支持 --resume，所以每一轮都是全新会话，模型看不到上一轮的对话。但
+    workspace 是挂载的宿主目录，上一轮改的代码都还在，所以把「原始需求 + 上一轮
+    留下的改动 + 这一轮要做什么」讲清楚，模型就能接着做而不是从头重来。
+    """
+    ws = paths.workspace
+    diff_stat = ""
+    changed: list[str] = []
+    if (ws / ".git").exists():
+        ds = await dockerx.run(["git", "-C", str(ws), "diff", "--stat"], timeout=60)
+        diff_stat = ds.out.strip()
+        st = await dockerx.run(["git", "-C", str(ws), "status", "--porcelain", "--untracked-files=all"], timeout=60)
+        changed = [line.strip() for line in st.out.splitlines() if line.strip()][:50]
+
+    # 这些列可能是 ALTER TABLE 补出来的 NULL，取值一律兜一层
+    why = (task.error or "").strip() or (task.verdict.get("protocol") or {}).get("subtype") or task.status
+    progress = diff_stat or "（git diff 为空）"
+    if changed:
+        progress += "\n未提交/未跟踪的文件：\n" + "\n".join(changed)
+
+    return (
+        f"【续跑说明】这是同一道题的第 {paths.round_no} 轮。上一轮没有正常跑完，"
+        f"原因：{str(why)[:300]}。\n"
+        f"你是一个全新的会话，读不到上一轮的对话记录，但上一轮对 {config.CONTAINER_WORKSPACE} "
+        f"的代码改动都还在。请先用 git status、git diff 等工具确认当前进度，"
+        f"在已有改动的基础上继续，不要从头重做、也不要把已完成的部分推翻重写。\n\n"
+        f"【本题原始需求】\n{task.user_prompt or ''}\n\n"
+        f"【上一轮已经留下的改动】\n{progress}\n\n"
+        f"【本轮要求】\n{(task.continue_prompt or '').strip() or '继续完成上面的原始需求。'}\n"
+    )
 
 
 def _publish_task(task_id: int) -> None:
@@ -100,15 +183,16 @@ async def run_task(task_id: int) -> None:
         t = db.get(Task, task_id)
         if t is None:
             return
-        task_no, prompt = t.task_no, t.user_prompt
-    paths = config.TaskPaths(task_no)
+        task_no, round_no = t.task_no, max(1, t.round_no or 1)
+        paths = config.TaskPaths(task_no, round_no)
+        prompt = t.user_prompt if round_no <= 1 else await build_continue_prompt(t, paths)
     image = settings_store.get("cc.image")
     api_key = settings_store.get("cc.api_key")
     timeout_s = max(60, settings_store.get_int("run.timeout_minutes", 120) * 60)
 
     paths.traces.mkdir(parents=True, exist_ok=True)
     _set(task_id, status=RUNNING, started_at=utc_now(), container_exists=True, image_tag=image,
-         error="", exit_code=None, result_json="{}")
+         container_name=paths.container_name, error="", exit_code=None, result_json="{}")
     _publish_task(task_id)
 
     cmd = [
@@ -122,10 +206,15 @@ async def run_task(task_id: int) -> None:
         "--cpus", settings_store.get("cc.cpus") or "2",
         image, "print",
     ]
-    seq = 0
+    # 续跑的事件接在上一轮后面，界面上就是一条连续的时间线
+    seq = _max_seq(task_id) if round_no > 1 else 0
     seq += 1
-    _record_event(task_id, seq, "lifecycle", f"启动容器 {paths.container_name} · {image}",
-                  {"type": "lifecycle", "image": image, "container": paths.container_name})
+    label = f"启动容器 {paths.container_name} · {image}"
+    if round_no > 1:
+        label = f"第 {round_no} 轮续跑 · " + label
+    _record_event(task_id, seq, "lifecycle", label,
+                  {"type": "lifecycle", "image": image, "container": paths.container_name,
+                   "round_no": round_no, "prompt_preview": prompt[:2000]}, round_no)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -144,20 +233,22 @@ async def run_task(task_id: int) -> None:
     dropped = 0
     last_push = 0.0
 
-    async def read_stdout() -> None:
+    async def pump_stdout() -> None:
         nonlocal seq, result_event, thinking_tokens, dropped, last_push
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
+        async for line, truncated in _iter_lines(proc.stdout):
             text = line.decode("utf-8", "replace").strip()
             if not text:
+                continue
+            if truncated:
+                seq += 1
+                _record_event(task_id, seq, "stdout", f"单行输出超过 {MAX_LINE_BYTES >> 20} MB，已截断",
+                              {"type": "stdout", "truncated": True, "text": text[:2000]}, round_no)
                 continue
             try:
                 obj = json.loads(text)
             except json.JSONDecodeError:
                 seq += 1
-                _record_event(task_id, seq, "stdout", text[:500], {"type": "stdout", "text": text[:2000]})
+                _record_event(task_id, seq, "stdout", text[:500], {"type": "stdout", "text": text[:2000]}, round_no)
                 continue
             kind = str(obj.get("type", "event"))
             if kind == "system" and obj.get("subtype") in NOISY_SUBTYPES:
@@ -172,24 +263,37 @@ async def run_task(task_id: int) -> None:
                 dropped += 1
                 continue
             seq += 1
-            _record_event(task_id, seq, kind, _summarize_event(obj), obj)
+            _record_event(task_id, seq, kind, _summarize_event(obj), obj, round_no)
             if kind == "result":
                 result_event = obj
 
+    async def read_stdout() -> None:
+        """解析出错也要把管道读到底，否则容器写 stdout 会被背压堵死。"""
+        nonlocal seq
+        try:
+            await pump_stdout()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("题 %s 解析 stdout 中断，转为只排空管道", task_id)
+            seq += 1
+            _record_event(task_id, seq, "stderr", f"stdout 解析中断，后续过程以轨迹 jsonl 为准：{exc}",
+                          {"type": "stderr", "text": repr(exc)[:2000]}, round_no)
+            try:
+                while await proc.stdout.read(READ_CHUNK_BYTES):
+                    pass
+            except Exception:  # noqa: BLE001
+                log.exception("题 %s 排空 stdout 失败", task_id)
+
     async def read_stderr() -> None:
         nonlocal seq
-        while True:
-            line = await proc.stderr.readline()
-            if not line:
-                break
+        async for line, _ in _iter_lines(proc.stderr):
             text = line.decode("utf-8", "replace").rstrip()
             if text:
                 stderr_tail.append(text)
                 del stderr_tail[:-50]
                 seq += 1
-                _record_event(task_id, seq, "stderr", text[:500], {"type": "stderr", "text": text[:2000]})
+                _record_event(task_id, seq, "stderr", text[:500], {"type": "stderr", "text": text[:2000]}, round_no)
 
-    readers = asyncio.gather(read_stdout(), read_stderr())
+    readers = asyncio.gather(read_stdout(), read_stderr(), return_exceptions=True)
     timed_out = False
     try:
         await asyncio.wait_for(proc.wait(), timeout=timeout_s)
@@ -197,23 +301,26 @@ async def run_task(task_id: int) -> None:
         timed_out = True
         seq += 1
         _record_event(task_id, seq, "lifecycle", f"超过 {timeout_s // 60} 分钟，停止容器",
-                      {"type": "lifecycle", "timeout": True})
+                      {"type": "lifecycle", "timeout": True}, round_no)
         await dockerx.stop_container(paths.container_name, grace=30)
         try:
             await asyncio.wait_for(proc.wait(), timeout=60)
         except asyncio.TimeoutError:
             proc.kill()
     try:
-        await asyncio.wait_for(readers, timeout=30)
+        results = await asyncio.wait_for(readers, timeout=30)
     except asyncio.TimeoutError:
-        pass
+        results = []
+    for r in results:
+        if isinstance(r, BaseException):
+            log.error("题 %s 输出读取协程异常: %r", task_id, r)
 
     exit_code = proc.returncode if proc.returncode is not None else await dockerx.container_exit_code(paths.container_name)
     manual = task_id in _manual_stop
     _manual_stop.discard(task_id)
     seq += 1
     _record_event(task_id, seq, "lifecycle", f"容器退出 · exit={exit_code}",
-                  {"type": "lifecycle", "exit_code": exit_code, "stderr_tail": stderr_tail[-10:]})
+                  {"type": "lifecycle", "exit_code": exit_code, "stderr_tail": stderr_tail[-10:]}, round_no)
 
     await finalize(task_id, exit_code=exit_code, result_event=result_event,
                    timed_out=timed_out, manual_stop=manual, stderr_tail=stderr_tail,
@@ -253,7 +360,8 @@ async def finalize(task_id: int, *, exit_code: int | None, result_event: dict,
         if t is None:
             return
         task_no, since = t.task_no, t.started_at
-    paths = config.TaskPaths(task_no)
+        round_no = max(1, t.round_no or 1)
+    paths = config.TaskPaths(task_no, round_no)
     ws = paths.workspace
 
     # ---- 产物层：轨迹 ----
@@ -300,6 +408,9 @@ async def finalize(task_id: int, *, exit_code: int | None, result_event: dict,
         notes.append("后端重启后接管的容器，没有 result 事件；状态按退出码 0 与本轮轨迹判定，轮次与用量为空")
     if stderr_tail:
         notes.append("stderr: " + " / ".join(stderr_tail[-3:])[:300])
+    if round_no > 1:
+        notes.append(f"这是第 {round_no} 轮续跑，每轮一份独立轨迹（各轮目录 {config.TRACES_DIR}/{task_no}[-rN]）；"
+                     f"上传只能交一份，需人工确认用哪一轮")
 
     verdict = {
         "process": {"exit_code": exit_code, "timed_out": timed_out, "manual_stop": manual_stop},
@@ -338,6 +449,21 @@ async def finalize(task_id: int, *, exit_code: int | None, result_event: dict,
             t.turn_id = turn_id
         if not result_event and stderr_tail:
             t.error = "\n".join(stderr_tail[-5:])[:2000]
+        # 每轮留一条痕：哪一轮、什么指令、跑出什么结果、轨迹在哪
+        history = [r for r in t.rounds if r.get("round_no") != round_no]
+        history.append({
+            "round_no": round_no,
+            "status": status,
+            "exit_code": exit_code,
+            "container": paths.container_name,
+            "trace_file": export_path,
+            "session_id": session_id,
+            "changed_files": changed_files,
+            "prompt": (t.user_prompt if round_no <= 1 else t.continue_prompt)[:2000],
+            "finished_at": utc_now().isoformat(),
+        })
+        t.rounds = sorted(history, key=lambda r: r.get("round_no") or 0)
+        t.continue_prompt = ""
         db.flush()
         should_backfill = bool(session_id and turn_id)
         snapshot = t
@@ -368,3 +494,49 @@ async def stop_task(task_id: int) -> dict:
     _manual_stop.add(task_id)
     r = await dockerx.stop_container(name, grace=30)
     return {"ok": r.ok, "message": r.err.strip() or "已发送停止"}
+
+
+async def queue_continue(task_id: int, prompt: str) -> dict:
+    """把一道跑完或跑挂的题排进下一轮续跑。
+
+    首轮 504、报错、超时之后，workspace 里往往已经有一半改动，整题重跑等于白扔。
+    这里只递增轮次并记下这轮要做什么，出队仍然走调度器，照样受并发额度和
+    「一个项目同时只跑一道」的约束。
+    """
+    prompt = (prompt or "").strip()
+    with session() as db:
+        t = db.get(Task, task_id)
+        if t is None:
+            return {"ok": False, "message": "任务不存在"}
+        if t.status not in CONTINUABLE:
+            return {"ok": False, "message": f"当前状态 {t.status} 不能续跑，只有跑完或中断的题可以"}
+        task_no = t.task_no
+        nxt = max(1, t.round_no or 1) + 1
+
+    paths = config.TaskPaths(task_no, nxt)
+    if not paths.workspace.is_dir():
+        return {"ok": False, "message": f"工作目录不存在：{paths.workspace}"}
+    state = await dockerx.container_state(paths.container_name)
+    if state:
+        return {"ok": False, "message": f"容器 {paths.container_name} 已存在（{state}），需先销毁再续跑"}
+    # 镜像要求挂进去的轨迹目录必须是空的，非空会在 entrypoint 直接拒绝启动
+    if paths.traces.exists() and any(paths.traces.iterdir()):
+        return {"ok": False, "message": f"第 {nxt} 轮的轨迹目录非空：{paths.traces}，请先归档"}
+
+    with session() as db:
+        t = db.get(Task, task_id)
+        if t is None:
+            return {"ok": False, "message": "任务不存在"}
+        t.round_no = nxt
+        t.continue_prompt = prompt
+        t.status = QUEUED
+        t.container_name = paths.container_name
+        t.container_exists = False
+        t.error = ""
+        t.exit_code = None
+        t.auto_stage = STAGE_IDLE
+        t.auto_error = ""
+        t.finished_at = None
+    _publish_task(task_id)
+    return {"ok": True, "round_no": nxt, "container": paths.container_name,
+            "message": f"已排入第 {nxt} 轮续跑，等调度器出队"}

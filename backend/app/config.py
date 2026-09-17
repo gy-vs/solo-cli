@@ -56,10 +56,25 @@ CONTAINER_LABEL = "solo-cli.task"
 
 
 class TaskPaths:
-    """一道题涉及的全部目录，同时给出宿主路径与挂载路径。"""
+    """一道题涉及的全部目录，同时给出宿主路径与挂载路径。
 
-    def __init__(self, task_no: str):
+    round_no 是续跑轮次。镜像不接受 --resume，也拒绝复用容器、要求挂进去的轨迹
+    目录必须是空的，所以第 2 轮起必须换一个容器名和一个干净的轨迹目录；后缀取
+    平级的 `-r{n}` 而不是子目录，否则第 1 轮的 rglob 会把后面几轮的 jsonl 一起扫出来。
+    workspace 不带后缀：续跑的前提正是接着上一轮改过的代码往下做。
+    """
+
+    def __init__(self, task_no: str, round_no: int = 1):
         self.task_no = task_no
+        self.round_no = max(1, int(round_no or 1))
+
+    @property
+    def round_suffix(self) -> str:
+        return "" if self.round_no <= 1 else f"-r{self.round_no}"
+
+    @property
+    def slug(self) -> str:
+        return f"{self.task_no}{self.round_suffix}"
 
     # ---- 后端可读写的路径 ----
     @property
@@ -68,7 +83,7 @@ class TaskPaths:
 
     @property
     def traces(self) -> Path:
-        return CODER_ROOT_MOUNT / TRACES_DIR / self.task_no
+        return CODER_ROOT_MOUNT / TRACES_DIR / self.slug
 
     @property
     def analysis(self) -> Path:
@@ -80,11 +95,11 @@ class TaskPaths:
 
     @property
     def export(self) -> Path:
-        return EXPORT_DIR / self.task_no
+        return EXPORT_DIR / self.slug
 
     @property
     def export_host(self) -> str:
-        return f"{DATA_DIR_HOST}/exports/{self.task_no}"
+        return f"{DATA_DIR_HOST}/exports/{self.slug}"
 
     @property
     def prompt_archive(self) -> Path:
@@ -97,11 +112,11 @@ class TaskPaths:
 
     @property
     def traces_host(self) -> str:
-        return f"{CODER_ROOT_HOST}/{TRACES_DIR}/{self.task_no}"
+        return f"{CODER_ROOT_HOST}/{TRACES_DIR}/{self.slug}"
 
     @property
     def container_name(self) -> str:
-        return f"{CONTAINER_NAME_PREFIX}{self.task_no}"
+        return f"{CONTAINER_NAME_PREFIX}{self.slug}"
 
 
 def prompt_file() -> Path:

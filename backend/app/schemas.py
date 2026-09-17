@@ -7,7 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.models import Task
+from app.models import CONTINUABLE, Task
+from app.services import qa_bridge
 
 
 class SettingsUpdate(BaseModel):
@@ -38,6 +39,12 @@ class QueueMove(BaseModel):
     priority: int | None = None
 
 
+class ContinueRun(BaseModel):
+    """续跑指令。留空表示「就按原需求继续」。"""
+
+    prompt: str = ""
+
+
 def _iso(dt) -> str | None:  # noqa: ANN001
     """SQLite 不保存时区，统一按 UTC 补 Z，前端再转本地时间。"""
     if not dt:
@@ -62,6 +69,7 @@ def task_brief(t: Task) -> dict:
         "os_platform": t.os_platform,
         "repro_level": t.repro_level,
         "env_snapshot": t.env_snapshot,
+        "repo_id": qa_bridge.repo_id_of(t.env_snapshot),
         "prompt_preview": (t.user_prompt or "")[:220],
         "prompt_chars": len(t.user_prompt or ""),
         "session_id": t.session_id,
@@ -70,6 +78,9 @@ def task_brief(t: Task) -> dict:
         "container_exists": t.container_exists,
         "image_tag": t.image_tag,
         "exit_code": t.exit_code,
+        "round_no": max(1, t.round_no or 1),
+        "rounds": t.rounds,
+        "can_continue": t.status in CONTINUABLE,
         "meta": t.meta,
         "verdict_notes": v.get("notes") or [],
         "protocol": v.get("protocol") or {},

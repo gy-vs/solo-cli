@@ -85,7 +85,8 @@ def test_verify_flags(tmp_path: Path):
     f = tmp_path / "t.jsonl"
     make_trace(f)
     idx = trace.parse_trace(f)
-    good = "我把 prompt 里的四条约束逐条对了产物，第 2 步跑 npm test 时有 1 个用例失败，模型在第 4 步改了 src/merge.ts 之后没有再跑测试就结束了。"
+    good = ("src/merge.ts 的 mergeHunks 改完之后我跑 npm test，有 1 个用例失败，"
+            "模型改完就结束了，没有再跑一次测试确认。")
     review = {
         "scores": {d: 4 for d in verifier.DIMS},
         "descs": {d: good for d in verifier.DIMS},

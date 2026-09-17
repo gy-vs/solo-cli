@@ -14,6 +14,18 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc(dt: datetime | None) -> datetime | None:
+    """把从库里读出来的时间补上 UTC 时区。
+
+    列声明是 DateTime(timezone=True)，但 SQLite 不存时区，读回来一律是 naive。
+    直接拿去和 utc_now() 相减会抛 TypeError，拿去 .timestamp() 则会被按本地时区
+    解释而整体偏移。凡是参与算术的时间都要先过这里。
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -41,6 +53,8 @@ RUN_END_STATUSES = frozenset({FINISHED, FAILED, TIMEOUT, INTERRUPTED})
 ANALYZABLE = RUN_END_STATUSES | {REVIEWED, UPLOADED}
 # 允许上传的状态
 UPLOADABLE = frozenset({REVIEWED})
+# 允许续跑的状态：跑完、跑挂、超时、中断，以及已评审但想再补一轮的
+CONTINUABLE = RUN_END_STATUSES | {REVIEWED}
 
 ANALYSIS_IDLE = "IDLE"
 ANALYSIS_RUNNING = "RUNNING"
@@ -117,6 +131,13 @@ class Task(Base, JsonMixin):
     # ---- 运行 ----
     session_id: Mapped[str] = mapped_column(String(128), default="")
     turn_id: Mapped[str] = mapped_column(String(128), default="")
+    # 续跑轮次：1 是首轮。第一轮 504 或报错后，可以带着新指令再跑一轮，
+    # 每轮独立容器与轨迹目录，workspace 沿用上一轮的改动。
+    # server_default 不能省：_ensure_columns 给没有 DDL 默认值的整型列补的是 DEFAULT 0，
+    # 老库补出来的 0 轮会让轮次语义错位。
+    round_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    rounds_json: Mapped[str] = mapped_column(Text, default="[]")  # 每轮的指令与结果留痕
+    continue_prompt: Mapped[str] = mapped_column(Text, default="")  # 待执行的续跑指令
     discarded_from: Mapped[str] = mapped_column(String(16), default="")
     container_name: Mapped[str] = mapped_column(String(64), default="")
     container_exists: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -240,6 +261,14 @@ class Task(Base, JsonMixin):
     def dedup(self, v: dict) -> None:
         self.dedup_json = self._dump(v)
 
+    @property
+    def rounds(self) -> list:
+        return self._load(self.rounds_json, [])
+
+    @rounds.setter
+    def rounds(self, v: list) -> None:
+        self.rounds_json = self._dump(v)
+
 
 class RunEvent(Base, JsonMixin):
     """容器 stream-json 的逐条事件。payload 截断保存，完整轨迹以 jsonl 为准。"""
@@ -249,6 +278,8 @@ class RunEvent(Base, JsonMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     task_id: Mapped[int] = mapped_column(Integer, index=True)
     seq: Mapped[int] = mapped_column(Integer)
+    # 续跑后时间线要能分清哪条属于哪轮；同上，老库补列要靠 server_default 落到 1
+    round_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     kind: Mapped[str] = mapped_column(String(32))          # system / assistant / user / result / stderr / lifecycle
     summary: Mapped[str] = mapped_column(Text, default="")  # 供时间线直接展示的一行摘要

@@ -1,9 +1,9 @@
-"""五维描述的两类交付事故：写出本机路径、写出我自己的核验环境。
+"""五维描述的几类交付事故：写出本机路径、写出我自己的核验环境、用步数指位置、拿总评当开场。
 
-描述会原样交付给评审方，所以路径在落库前就要洗掉，环境自述要在核验里拦成红项。
+描述会原样交付给评审方，所以路径和步数在落库前就洗掉，环境自述和总评开场在核验里拦成红项。
 """
 
-from app.services.analyzer import _normalize, _strip_paths
+from app.services.analyzer import _normalize, _strip_paths, _strip_steps
 from app.services.verifier import check_text_style
 
 REAL_DESC = (
@@ -53,8 +53,8 @@ def test_normalize_strips_paths_everywhere():
 
 def test_container_workspace_is_relative_not_leak():
     """容器里的 /workspace 就是仓库根，剥成相对路径；它不算本机泄漏，只提醒。"""
-    assert _strip_paths("第 9 步读了 /workspace/lib/common/x.js") == "第 9 步读了 lib/common/x.js"
-    codes = {i["code"]: i["level"] for i in check_text_style("我看第 9 步它读了 /workspace/lib/common/x.js，改动没落地，函数还是旧的。")}
+    assert _strip_paths("它读了 /workspace/lib/common/x.js") == "它读了 lib/common/x.js"
+    codes = {i["code"]: i["level"] for i in check_text_style("我看它读了 /workspace/lib/common/x.js，改动没落地，函数还是旧的。")}
     assert "abs_path" not in codes
     assert codes.get("container_path") == "warn"
 
@@ -72,7 +72,61 @@ def test_env_self_talk_is_blocked():
 
 
 def test_clean_desc_passes():
-    good = ("我把 prompt 里六条需求逐条对了产物，lib/rules_inline.mjs 里没有位置字段的赋值，"
-            "第 12 步它只用 grep 找了 getLines 就去写 README，导致 README 说的接口在代码里找不到。")
-    codes = {i["code"] for i in check_text_style(good)}
-    assert "abs_path" not in codes and "meta_talk" not in codes
+    good = ("lib/rules_inline.mjs 里没有位置字段的赋值，prompt 要的六条需求只落了四条。"
+            "它只用 grep 找了 getLines 就去写 README，README 说的 setLines 在代码里根本没有，"
+            "我按 README 的说法找不到对应函数。")
+    assert check_text_style(good) == []
+
+
+# ---- 用步数指位置 ----
+
+def test_strip_steps_keeps_sentence_readable():
+    assert _strip_steps("第 38 步新建的 lib/dump-scalar.js") == "新建的 lib/dump-scalar.js"
+    assert _strip_steps("它在第 19、20 步追到 Error: Cannot find module") == "它追到 Error: Cannot find module"
+    assert _strip_steps("它在第 48 到 51 步建 HEAD worktree") == "它建 HEAD worktree"
+    assert _strip_steps("改完在第 43、59、60、64 步分批核黄金样本") == "改完分批核黄金样本"
+    assert _strip_steps("步骤 12 里它只读了一半") == "它只读了一半"
+    # 正常的数字别被误伤
+    assert _strip_steps("npm test 的 core 用例 329 个全过，第二处的 foo 也对上了") == \
+        "npm test 的 core 用例 329 个全过，第二处的 foo 也对上了"
+
+
+def test_normalize_strips_steps_from_descriptions():
+    raw = {"delivery": {"score": 4, "description": "第 66 步 git status 只有 lib/dumper.js 改动。"}}
+    out = _normalize(raw)
+    assert out["descs"]["delivery"] == "git status 只有 lib/dumper.js 改动。"
+
+
+def test_step_ref_is_blocked():
+    codes = {i["code"]: i["level"] for i in check_text_style(
+        "lib/dumper.js 的 writeNode 改了返回值，第 38 步它才补上 chooseScalarStyle，中间的用例一直是红的。")}
+    assert codes.get("step_ref") == "block"
+
+
+# ---- 拿总评当开场 ----
+
+def test_canned_opener_is_blocked():
+    for head in ("我把需求逐条对了产物", "推进顺序我认可", "几个关键判断都做对了", "调用路径十分紧凑"):
+        items = check_text_style(f"{head}。lib/dumper.js 的 writeNode 返回了 text 和 tag，npm test 全过。")
+        hit = next((i for i in items if i["code"] == "opener_talk"), None)
+        assert hit and hit["level"] == "block", head
+
+
+def test_judgement_with_anchor_is_only_warned():
+    """带了具体文件还夹一句评价，提醒就行，不至于拦住上传。"""
+    codes = {i["code"]: i["level"] for i in check_text_style(
+        "lib/dumper.js 的 writeNode 改得还行，返回值换成了 text 和 tag。我跑 npm test 全过。")}
+    assert codes.get("opener_judgement") == "warn"
+    assert "opener_talk" not in codes
+
+
+def test_vague_opener_is_warned():
+    codes = {i["code"]: i["level"] for i in check_text_style(
+        "它先看了一圈就动手改。writeNode 现在返回 text 和 tag，我跑 npm test 全过。")}
+    assert codes.get("vague_opener") == "warn"
+
+
+def test_concrete_opener_passes():
+    ok = ("lib/dumper.js 的 writeNode 现在返回 { text, tag }，writeBlockSequence 也跟着改了。"
+          "我跑 npm test，core 的 329 个用例全过。")
+    assert check_text_style(ok) == []

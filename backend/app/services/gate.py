@@ -8,8 +8,8 @@ import re
 from dataclasses import asdict, dataclass
 
 from app import config
-from app.models import Task
-from app.services import dockerx, settings_store
+from app.models import RUNNING, Task
+from app.services import dockerx, qa_bridge, repo, settings_store
 
 _SHA_RE = re.compile(r"/commit/([0-9a-fA-F]{40})/?$")
 _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target"}
@@ -87,6 +87,18 @@ async def run_checks(task: Task) -> list[Check]:
     elif not (ws / ".git").exists():
         checks.append(Check("workspace", "block", f"{ws} 不是 git 仓库，无法校验初始快照"))
     else:
+        # 一个项目里一道题一个分支，做题前必须落在自己的分支上，否则提交会写到别人头上
+        bs = await repo.branch_state(task.task_no)
+        if bs["current"] == bs["want"]:
+            checks.append(Check("branch", "ok", f"当前在题目分支 {bs['want']}"))
+        elif bs["local"] or bs["remote"]:
+            where = "游离 HEAD" if bs["detached"] else f"分支 {bs['current']}"
+            checks.append(Check("branch", "block",
+                                f"当前是{where}，这道题的分支是 {bs['want']}", fix="switch_branch"))
+        else:
+            checks.append(Check("branch", "warn",
+                                f"仓库里没有分支 {bs['want']}，将直接用当前的 {bs['current'] or '游离 HEAD'}"))
+
         head = await dockerx.run(["git", "-C", str(ws), "rev-parse", "HEAD"], timeout=20)
         head_sha = head.out.strip().lower()
         want = snapshot_sha(task.env_snapshot)
@@ -123,7 +135,33 @@ async def run_checks(task: Task) -> list[Check]:
     else:
         checks.append(Check("traces", "ok", "轨迹目录为空"))
 
+    # 5. 一个项目同时只允许跑一道题
+    repo_id = qa_bridge.repo_id_of(task.env_snapshot)
+    running = repo_siblings_running(task.id, repo_id)
+    if running:
+        checks.append(Check(
+            "repo_busy", "block",
+            f"项目 {repo_id} 的题 {'、'.join(running)} 正在运行，一个项目同时只跑一道；"
+            f"现在领取会留在队列里，等它跑完自动启动",
+        ))
+    elif repo_id:
+        checks.append(Check("repo_busy", "ok", f"项目 {repo_id} 现在没有别的题在跑"))
+
     return checks
+
+
+def repo_siblings_running(task_id: int, repo_id: str) -> list[str]:
+    """同一个项目里正在运行的其他题号。排队中的不算，它们还没占住工作区。"""
+    if not repo_id:
+        return []
+    from app.db import session as _session  # 局部导入，避免 services 与 db 的加载顺序耦合
+
+    with _session() as db:
+        rows = db.query(Task).filter(Task.status == RUNNING).all()
+        return sorted(
+            t.task_no for t in rows
+            if t.id != task_id and qa_bridge.repo_id_of(t.env_snapshot) == repo_id
+        )
 
 
 def summarize(checks: list[Check]) -> dict:
@@ -137,22 +175,37 @@ def summarize(checks: list[Check]) -> dict:
 
 
 async def reset_to_snapshot(task: Task) -> dict:
-    """git clean -fdx && git reset --hard <sha>。破坏性操作，由界面二次确认后调用。"""
-    ws = config.TaskPaths(task.task_no).workspace
+    """工作区回到初始快照的 commit。破坏性操作，由界面二次确认后调用。
+
+    题目分支上可能已经有上一轮交付的提交，reset 会把它丢掉，所以先备份成
+    refs/solo-backup/*（不出现在分支列表里，用 git log <ref> 就能找回）。
+    """
+    no = task.task_no
+    ws = config.TaskPaths(no).workspace
     sha = snapshot_sha(task.env_snapshot)
     if not sha:
         return {"ok": False, "message": "初始环境快照缺少 40 位 SHA，无法重置"}
-    r1 = await dockerx.run(["git", "-C", str(ws), "clean", "-fdx"], timeout=120)
-    r2 = await dockerx.run(["git", "-C", str(ws), "reset", "--hard", sha], timeout=120)
+
+    backup = await repo.backup_head(no, sha)
+    # 回到题目分支上再 reset，别把工作区留在游离 HEAD
+    sw = await repo.switch_to_task_branch(no)
+    r1 = await dockerx.run(["git", "-C", str(ws), "reset", "--hard", sha], timeout=120)
+    r2 = await dockerx.run(["git", "-C", str(ws), "clean", "-fdx"], timeout=120)
     ok = r1.ok and r2.ok
-    return {"ok": ok, "message": (r2.out or r2.err or r1.err).strip()}
+    where = f"分支 {sw['branch']}" if sw.get("ok") else "当前分支"
+    msg = f"已把{where}退回到 {sha[:12]}"
+    if backup:
+        msg += f"，原来的提交备份在 {backup}"
+    if not sw.get("ok") and sw.get("message"):
+        msg += f"（{sw['message']}）"
+    return {"ok": ok, "message": (r1.err or r2.err).strip()[:300] or msg}
 
 
-def archive_traces(task_no: str) -> dict:
+def archive_traces(task_no: str, round_no: int = 1) -> dict:
     """把非空轨迹目录整体改名归档（带时间戳），腾出空目录。"""
     from datetime import datetime
 
-    tr = config.TaskPaths(task_no).traces
+    tr = config.TaskPaths(task_no, round_no).traces
     if not tr.exists() or not any(tr.iterdir()):
         return {"ok": True, "message": "轨迹目录本就为空"}
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

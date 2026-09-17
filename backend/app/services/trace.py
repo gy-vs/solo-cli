@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.models import as_utc
+
 _FILE_TOKEN = re.compile(r"(?<![\w/])((?:\.{0,2}/)?[\w.\-]+(?:/[\w.\-]+)*\.[A-Za-z0-9]{1,8})(?![\w/])")
 
 
@@ -26,7 +28,7 @@ def find_trace_file(traces_dir: Path, since: datetime | None = None) -> Path | N
         return None
     files = [p for p in traces_dir.rglob("*.jsonl") if p.is_file()]
     if since is not None:
-        floor = since.timestamp() - 60
+        floor = as_utc(since).timestamp() - 60
         files = [p for p in files if p.stat().st_mtime >= floor]
     if not files:
         return None
@@ -40,7 +42,7 @@ def count_traces(traces_dir: Path, since: datetime | None = None) -> int:
         return 0
     files = [p for p in traces_dir.rglob("*.jsonl") if p.is_file()]
     if since is not None:
-        floor = since.timestamp() - 60
+        floor = as_utc(since).timestamp() - 60
         files = [p for p in files if p.stat().st_mtime >= floor]
     return len(files)
 

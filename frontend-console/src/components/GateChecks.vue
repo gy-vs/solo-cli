@@ -14,6 +14,7 @@ const FIX_LABEL: Record<string, string> = {
   reset_snapshot: '重置到初始快照',
   archive_traces: '归档现有轨迹',
   remove_container: '删除残留容器',
+  switch_branch: '切到题目分支',
 }
 const color = (l: string) => LEVEL_HEX[l] || LEVEL_HEX.block
 
@@ -30,7 +31,8 @@ function fix(action: string) {
   if (action !== 'reset_snapshot') return run(action)
   dialog.warning({
     title: '重置到初始快照',
-    content: '将执行 git clean -fdx 与 git reset --hard，清空工作目录里所有未提交改动与被忽略的文件。此操作不可撤销。',
+    content: '在题目分支上执行 git reset --hard 与 git clean -fdx，清空工作目录里所有未提交改动与被忽略的文件。'
+      + '分支上已有的交付提交会先备份到 refs/solo-backup/*，之后能用 git log 找回。',
     positiveText: '确认重置',
     negativeText: '取消',
     onPositiveClick: () => run(action),

@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import time
 from pathlib import Path
 
@@ -24,6 +25,10 @@ from app.models import (
 from app.services import dockerx, settings_store, trace, verifier
 
 log = logging.getLogger("analyzer")
+
+# 拷分析沙箱时跳过的目录：跟评审无关，还特别容易在拷贝途中变化
+SANDBOX_SKIP = ("node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+                ".cache", "target", ".claude")
 
 RUBRIC = """
 五个维度，每个维度 1 到 5 的整数分。锚点：
@@ -47,7 +52,10 @@ RUBRIC = """
 WRITING_RULES = """
 描述写法（五个维度的 description 与 other_issues 都必须遵守）：
 1. 用第一人称「我」，像我自己看完轨迹和产物后随手记下来的口语，不要书面腔。
-2. 只写看到的现象和位置：第几步、哪个工具、哪个文件、哪条命令、什么报错、哪条需求没做。每条描述至少引用一个具体的步骤号或文件名。
+2. 只写看到的现象和位置，位置一律用文件名、函数名、方法名、命令、报错原文来指，例如
+   「lib/dumper.js 的 writeNode 改成返回 { text, tag }」「npm test 的 core 用例 329 个全过」。
+   禁止写「第 38 步」「第 19、20 步」「第 2 轮」「步骤 12」这类步数说法，一次都不要出现。
+   步号只填进 evidence 字段的 step，描述正文里不写。
 3. 禁止表情符号，禁止 markdown（不要列表符号、不要标题、不要加粗、不要反引号），禁止比喻、排比、反问、夸张。
 4. 禁止使用这些词：首先、其次、最后、综上、总的来说、总之、值得注意的是、此外、另外、不仅、而且、显然、令人、堪称、优雅、精妙、丝滑、赋能、闭环、亮点、整体而言、可以看出、由此可见、体现了、展现了、表现出色、表现良好、表现一般、基本可用、效果不错、非常、极其、十分、相当。
 5. 每条描述 2 到 6 句，80 到 300 字。分数高的维度也要写具体核对了什么，例如「我把 prompt 里的 N 条约束逐条对了产物，都能对上」，并点出对的是哪几条。
@@ -61,14 +69,19 @@ WRITING_RULES = """
    不写「产物副本」「沙箱」「我这边」「我的环境」。
    命令跑不了就直接依据代码和轨迹下结论，不要解释为什么没跑，也不要说结论不受影响。
    verification.commands 只填真正执行成功的命令，没跑就给空数组。
-10. 只要这个维度不是 5 分，描述里必须同时出现三样东西，缺一样都会被质检打回：
-   扣分点发生的具体位置（第几轮第几步、哪次工具调用、哪个文件或函数、哪条命令或哪段报错原文）；
+10. 第一句直接写具体的东西：哪个文件、哪个函数、哪条命令、什么结果。
+   不要用一句总评或表态开头，下面这些开头一律不许出现，它们一眼就是机器写的：
+   「我把需求逐条对了产物。」「我照约束清单一条条核。」「推进顺序我认可。」
+   「几个关键判断都做对了。」「调用路径十分紧凑。」「整体完成度不错。」
+   正例开头：「lib/dumper.js 的 writeNode 现在返回 { text, tag }，writeBlockSequence 和 writeFlowMapping 也跟着改了。」
+11. 只要这个维度不是 5 分，描述里必须同时出现三样东西，缺一样都会被质检打回：
+   扣分点发生的具体位置（哪个文件、哪个函数、哪条命令或哪段报错原文）；
    哪里不合适（对这个维度的负面判断，不能只写「核对通过」就收尾）；
    模型具体做了什么、造成了什么客观后果。
-   反例：「它把目录列了一遍就结束了」——没写是第几步、也没写导致什么。
-   正例：「第 7 步它用 Glob 把 src 下的文件名列了一遍就去写 README，没有打开 src/parser.py 看实现，
+   反例：「它把目录列了一遍就结束了」——没写在哪个文件上、也没写导致什么。
+   正例：「它用 Glob 把 src 下的文件名列了一遍就去写 README，没有打开 src/parser.py 看实现，
    写出来的模块说明和代码里的函数名对不上，我按 README 的说法找不到对应函数。」
-11. 满分维度也不要只写一句「没问题」，要写清核对了哪几条、在哪些步骤看到的。
+12. 满分维度也不要只写一句「没问题」，要写清核对了哪几条、在哪些文件和命令上看到的。
 """.strip()
 
 
@@ -76,12 +89,42 @@ def _agent_bin() -> str | None:
     return shutil.which("agent") or shutil.which("cursor-agent")
 
 
+def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    """连 agent 自己起的子进程一起收掉。
+
+    agent 是用 start_new_session 起的，进程组 ID 等于它的 PID。杀整组才能带走它
+    用 Bash 工具跑起来的东西，否则那些进程会挂到 init 上继续占 CPU。
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except OSError:
+        log.exception("杀进程组失败，退回只杀 agent 本身")
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 def _prepare_sandbox(paths: config.TaskPaths) -> Path:
+    """把工作区拷成分析用的沙箱。
+
+    node_modules 之类的目录既跟评审无关又特别容易踩竞态：容器可能还在写，
+    copytree 走到一半源文件就没了，整次分析会因为一个 .eslintrc 失败。直接跳过。
+    """
     paths.analysis.mkdir(parents=True, exist_ok=True)
     repo = paths.analysis_repo
     if repo.exists():
         shutil.rmtree(repo)
-    shutil.copytree(paths.workspace, repo, symlinks=True)
+    try:
+        shutil.copytree(paths.workspace, repo, symlinks=True,
+                        ignore=shutil.ignore_patterns(*SANDBOX_SKIP))
+    except shutil.Error as exc:
+        # copytree 把逐个文件的失败收集起来最后一起抛。大目录已经跳过了，剩下的多是
+        # 拷贝途中源文件消失，缺几个无关文件不该让整次分析失败。
+        bad = exc.args[0] if exc.args else []
+        log.warning("拷分析沙箱有 %d 个文件没拷过来，继续分析；例如 %s", len(bad), str(bad[:2])[:300])
     return repo
 
 
@@ -102,14 +145,15 @@ PROMPT>>>
    优先靠读代码核验需求是否真的实现。装依赖、跑测试、跑构建这些能跑就跑，跑不起来就完全依据代码与轨迹判断，
    不要把「我这边跑不起来」写进任何描述字段。引用文件一律用相对这个目录的路径。
 2. 轨迹步骤索引（JSON）：{trace_index_path}
-   steps[] 里每一步有 step 序号、kind（tool 或 text）、tool 名、summary（命令/文件/说明）、files、result（工具返回摘要）、is_error。写证据时引用这里的 step 序号。
+   steps[] 里每一步有 step 序号、kind（tool 或 text）、tool 名、summary（命令/文件/说明）、files、result（工具返回摘要）、is_error。
+   step 序号只填进 evidence 字段，描述正文里不要提步数。
 3. 原始轨迹 jsonl（需要看细节时再读，可能很大）：{trace_file or '（无）'}
 
 【工作步骤】
 1. 先读 prompt，把需求拆成可核验的功能点与约束清单。
 2. 读轨迹步骤索引，理解模型做了什么、顺序如何、哪里出错、哪里重复。
 3. 在当前目录逐条核验功能点与约束：读代码，能跑就跑测试或构建，记录真正跑成功的命令与结果。
-4. 按下面的评分锚点打分，按写法要求写描述，每条描述都要引用具体步骤号或文件名。
+4. 按下面的评分锚点打分，按写法要求写描述，每条描述都要点到具体的文件名或函数名。
 
 【评分锚点】
 {RUBRIC}
@@ -190,9 +234,29 @@ def _strip_paths(text: str, repo: Path | str = "") -> str:
     return _ABS_PATH.sub(squash, text)
 
 
+# 「第 38 步」「第 19、20 步」「第 48 到 51 步」「步骤 12」。位置该用文件名和函数名来指，
+# 步号只属于 evidence 字段；连着的「在」「于」一起吃掉，否则会剩下「它在追到报错」这种断句。
+_STEP_REF = re.compile(
+    r"[在于]?\s*第\s*\d+\s*(?:[、,，和及]\s*\d+\s*|(?:到|至|-|~)\s*\d+\s*)*[步轮]\s*(?:里|中|上|时|的时候)?"
+    r"|[在于]?\s*步骤\s*\d+(?:\s*[、,，和及到至-]\s*\d+)*\s*(?:里|中|上|时|的时候)?"
+)
+_SPACE_BEFORE_PUNCT = re.compile(r"\s+([，。、；：）])")
+
+
+def _strip_steps(text: str) -> str:
+    """去掉描述里的步数说法。模型偶尔还是会写，留着读起来就是机器在报行号。"""
+    if not text:
+        return text
+    out = _STEP_REF.sub("", text)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = _SPACE_BEFORE_PUNCT.sub(r"\1", out)
+    out = re.sub(r"([，。、；])\s*\1+", r"\1", out)
+    return out.strip(" ，、")
+
+
 def _normalize(obj: dict, repo: Path | str = "") -> dict:
     out: dict = {"scores": {}, "descs": {}, "evidence": {}, "other_issues": "", "coverage": [], "verification": {}}
-    clean = lambda s: _strip_paths(str(s or "").strip(), repo)  # noqa: E731
+    clean = lambda s: _strip_steps(_strip_paths(str(s or "").strip(), repo))  # noqa: E731
     for dim in verifier.DIMS:
         d = obj.get(dim) or {}
         score = d.get("score")
@@ -299,14 +363,17 @@ async def analyze_task(task_id: int) -> dict:
                        f"最终回复只包含一个 JSON 对象。")
         cmd = [agent, "-p", "--force", "--trust", "--model", model, "--output-format", "json",
                "--workspace", str(repo), instruction]
+        # 自己一个进程组：agent 带 --force --trust，会拿 Bash 工具跑基准测试之类的东西。
+        # 真实事故：它写的 benchmark 死循环，占满一核跑了十几分钟，agent 干等它结束；
+        # 只 kill agent 的话那个子进程会挂到 init 上继续烧 CPU，所以超时要杀整组。
         proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=str(repo), env=env,
+            *cmd, cwd=str(repo), env=env, start_new_session=True,
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_group(proc)
             raise RuntimeError(f"Cursor 分析超过 {timeout_s // 60} 分钟未完成")
         stdout = out.decode("utf-8", "replace")
         stderr = err.decode("utf-8", "replace")

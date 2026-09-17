@@ -1910,8 +1910,12 @@ def test_archive_traces_renames_nonempty_dir(tmp_path, monkeypatch):
     (tr / "s.jsonl").write_text("{}", encoding="utf-8")
     r = watchdog.archive_traces("07", "B")
     assert r["ok"] is True
-    assert not any(tr.iterdir()) if tr.exists() else True
-    assert list(tr.parent.glob("B.archived-*"))
+    # 原目录要留一个空的给下一次跑用，旧轨迹改名挪到旁边
+    assert tr.exists()
+    assert list(tr.iterdir()) == []
+    archived = list(tr.parent.glob("B.archived-*"))
+    assert len(archived) == 1
+    assert (archived[0] / "s.jsonl").exists()
 
 
 def test_archive_traces_on_empty_dir_is_noop(tmp_path, monkeypatch):
