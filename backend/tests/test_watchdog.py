@@ -552,6 +552,99 @@ def test_scan_leaves_runs_that_still_have_a_coroutine_watching(task_with_runs, m
         assert db.get(m.TaskRun, ids["A"]).status == m.RUN_RUNNING
 
 
+# ---------------- 暂停异常处理 ----------------
+
+def _pause_watchdog(monkeypatch, on: bool = True) -> None:
+    monkeypatch.setattr(wd.settings_store, "get_bool",
+                        lambda k, d=False: on if k == "watchdog.paused" else d)
+
+
+def test_paused_watchdog_neither_reruns_nor_discards(task_with_runs, monkeypatch):
+    """模型停机时开的开关：跑挂的题停在原地，一个动作都不做。
+
+    重跑的动作是把这一侧连 .git 一起删掉重建。停机期间每一侧都会跑挂，照常重跑就是
+    把一整批题清空，再跑满次数整题废弃 —— 而它们缺的只是一次能连上模型的重跑。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=3)   # 次数已经到顶，不暂停的话这一轮就该废弃整题
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    _pause_watchdog(monkeypatch)
+
+    async def boom(*a, **kw):
+        raise AssertionError("异常处理已暂停，不该动手")
+
+    monkeypatch.setattr(wd, "requeue_run", boom)
+    monkeypatch.setattr(wd, "give_up", boom)
+
+    stats = asyncio.run(wd._scan_abnormal())
+    assert stats == {"requeued": 0, "discarded": 0, "held": 1}
+    with session() as db:
+        task = db.get(m.Task, task_id)
+        assert task.status != m.DISCARDED
+        run = db.get(m.TaskRun, ids["A"])
+        # 状态、次数、产出记录一律不动，环境也就没人碰
+        assert run.status == m.RUN_FAILED
+        assert run.attempt == 3
+        assert run.abnormal["held"] is True
+        assert run.abnormal["reason"]
+
+
+def test_paused_watchdog_still_records_why(task_with_runs, monkeypatch):
+    """记一笔是为了让人看见停机期间到底哪几侧跑挂了，开关一关就照常重跑。"""
+    from app.db import session
+
+    _task_id, ids = task_with_runs
+    _broken_run(ids, attempt=1)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    _pause_watchdog(monkeypatch)
+    asyncio.run(wd._scan_abnormal())
+
+    with session() as db:
+        held = dict(db.get(m.TaskRun, ids["A"]).abnormal)
+    assert held["held"] is True
+    assert held["attempt"] == 1, "挂起不算一次重跑"
+
+    # 同一个原因不反复改写：巡检每五分钟一轮，改一次就推一条事件出去
+    asyncio.run(wd._scan_abnormal())
+    with session() as db:
+        assert dict(db.get(m.TaskRun, ids["A"]).abnormal)["at"] == held["at"]
+
+
+def test_unpausing_picks_the_held_side_back_up(task_with_runs, stub_side_effects, monkeypatch):
+    """开关一关，挂起的那一侧照常走完全回退重跑，挂起的记录被这一跑的记录顶掉。"""
+    from app.db import session
+
+    _task_id, ids = task_with_runs
+    _broken_run(ids, attempt=1)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    _pause_watchdog(monkeypatch)
+    asyncio.run(wd._scan_abnormal())
+
+    _pause_watchdog(monkeypatch, on=False)
+    stats = asyncio.run(wd._scan_abnormal())
+    assert stats["requeued"] == 1
+    assert stats["held"] == 0
+    with session() as db:
+        run = db.get(m.TaskRun, ids["A"])
+        assert run.status == m.RUN_QUEUED
+        assert run.attempt == 2
+        assert "held" not in run.abnormal
+    assert stub_side_effects["wiped"] == ["A"]
+
+
+def test_manual_rerun_works_while_paused(task_with_runs, stub_side_effects, monkeypatch):
+    """暂停只挡自动动作。人明确点的重跑照做，不然停机期间什么都动不了。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _pause_watchdog(monkeypatch)
+    assert asyncio.run(wd.manual_rerun(task_id, sides=("A",)))["ok"] is True
+    with session() as db:
+        assert db.get(m.TaskRun, ids["A"]).status == m.RUN_QUEUED
+
+
 def test_scan_ignores_tasks_already_out_of_the_pipeline(task_with_runs, monkeypatch):
     """已经上传或废弃的题不再每轮扫一遍，它们的 run 怎么样都不必再管。"""
     from app.db import session

@@ -72,10 +72,21 @@ def wake() -> None:
     _wake.set()
 
 
+def paused() -> bool:
+    """异常处理是不是被人按停了。
+
+    停的只是「动手」这一段：判定照做、异常照记，但不重跑也不废弃。模型或网关停机时
+    非开不可 —— 那种时候每一侧都会跑挂，而重跑的动作是把工作区连 `.git` 一起删掉重建，
+    停机半小时就能把一整批题清空并跑满次数废弃掉，而它们本来只差一次重跑。
+    """
+    return settings_store.get_bool("watchdog.paused", False)
+
+
 def status() -> dict:
     """巡检自己的近况，供界面确认它确实在按周期跑。"""
     return {
         "interval_seconds": max(30, settings_store.get_int("watchdog.interval_seconds", INTERVAL_DEFAULT)),
+        "paused": paused(),
         "max_retries": settings_store.get_int("watchdog.max_retries", MAX_RETRIES_DEFAULT),
         "max_timeouts": settings_store.get_int("watchdog.max_timeouts", MAX_TIMEOUTS_DEFAULT),
         "alive": alive(),
@@ -655,6 +666,25 @@ async def _recount_output(run_id: int) -> bool:
     return True
 
 
+def _hold_abnormal(run_id: int, reason: str, recorded: dict) -> bool:
+    """暂停期间只记一笔异常，不动手。返回是否记了新的一笔。
+
+    记而不动是为了留下停机期间到底哪几侧跑挂了：暂停一解除，这些侧会照常被重跑，
+    界面上也能提前看见等着处理的是哪些。attempt 不加，这一笔不算一次重跑。
+    """
+    if recorded.get("held") and recorded.get("reason") == reason:
+        return False
+    with session() as db:
+        run = db.get(TaskRun, run_id)
+        if run is None:
+            return False
+        run.abnormal = {**recorded, "reason": reason, "at": utc_now().isoformat(),
+                        "attempt": run.attempt, "held": True}
+        task_id = run.task_id
+    bus.publish("tasks", {"type": "task", "id": task_id})
+    return True
+
+
 def _clear_abnormal(run_id: int) -> None:
     """抹掉这一侧已经不成立的异常记录，并看看题能不能放回流程。"""
     with session() as db:
@@ -696,7 +726,8 @@ async def _scan_abnormal() -> dict:
     # 于是整轮巡检当场中断——异常不处理、配对不推进，而日志里只有一条看不懂的磁盘报错。
     max_retries = settings_store.get_int("watchdog.max_retries", MAX_RETRIES_DEFAULT)
     max_timeouts = settings_store.get_int("watchdog.max_timeouts", MAX_TIMEOUTS_DEFAULT)
-    stats = {"requeued": 0, "discarded": 0}
+    held_only = paused()
+    stats = {"requeued": 0, "discarded": 0, "held": 0}
     with session() as db:
         # 只看还在流程里的题。已经分析完、交上去或废弃的题，它们的 run 每轮都判一遍
         # 也只会得出「没异常」，白扫几百行。
@@ -733,6 +764,14 @@ async def _scan_abnormal() -> dict:
                 _clear_abnormal(run_id)
             continue
         if recorded.get("gave_up"):
+            continue
+        if held_only:
+            # 模型或网关停机时开的那个开关。判定照做、异常照记，但一步都不动手：
+            # 重跑会把这一侧连 .git 一起删掉重建，停机期间每一侧都会跑挂，真让它跑起来
+            # 就是把一整批题清空、再跑满次数废弃掉，而它们缺的只是一次能连上模型的重跑。
+            if _hold_abnormal(run_id, reason, recorded):
+                log.warning("run %s 异常（%s），异常处理已暂停，只记一笔不动手", run_id, reason)
+            stats["held"] += 1
             continue
         if reason.startswith(ZERO_CHANGE_REASON) and await _recount_output(run_id):
             # 收尾那一刻读到的零改动未必作数，详见 runner.workspace_output
@@ -836,9 +875,9 @@ async def _loop() -> None:
             _last_tick_at, _last_error, _last_stats = utc_now(), "", stats
             # 每轮都留一行。巡检绝大多数时候什么都不做，一声不吭的话，「它到底还在不在
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
-            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 推进 %s · 耗时 %.1fs",
-                     stats["adopted"], stats["requeued"], stats["discarded"], stats["advanced"],
-                     (utc_now() - began).total_seconds())
+            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 推进 %s · 耗时 %.1fs",
+                     stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
+                     stats["advanced"], (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001

@@ -79,6 +79,8 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
         <div class="flex items-center gap-2">
           <div class="h2">环境</div>
           <span v-if="s?.scheduler.paused" class="pill h-5 text-[12px] text-warn border-warn/50 ml-auto">出队已暂停</span>
+          <span v-if="s?.watchdog.paused" class="pill h-5 text-[12px] text-warn border-warn/50"
+            :class="s?.scheduler.paused ? '' : 'ml-auto'">异常处理已暂停</span>
         </div>
         <div class="inner px-3 py-2 space-y-1.5">
           <div class="flex items-center gap-2 text-xs">
@@ -86,7 +88,8 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
             <span class="text-fg1">调度与看护</span>
             <span class="ml-auto mono text-[12px] text-fg2">
               <template v-if="s?.watchdog.alive && s?.scheduler.alive">
-                每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 跑满 {{ s?.watchdog.max_retries ?? '-' }} 次即废弃
+                <span v-if="s?.watchdog.paused" class="text-warn">每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 不自动重跑与废弃</span>
+                <template v-else>每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 跑满 {{ s?.watchdog.max_retries ?? '-' }} 次即废弃</template>
               </template>
               <span v-else class="text-err">后台循环已停止，队列不再前进</span>
             </span>

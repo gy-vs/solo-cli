@@ -22,10 +22,12 @@ const byTaskNo = computed(() => {
   for (const t of liveTasks.value) m[t.task_no] = t
   return m
 })
-/** 被看护重跑过、或已经放弃的侧 */
+/** 被看护重跑过、已经放弃、或判了异常但被挂着没动的侧 */
 const retried = computed(() => liveTasks.value
   .flatMap((t) => t.runs.map((r) => ({ t, r })))
-  .filter((x) => x.r.attempt > 1 || x.r.timeouts > 0 || x.r.abnormal?.gave_up))
+  .filter((x) => x.r.attempt > 1 || x.r.timeouts > 0 || x.r.abnormal?.gave_up || x.r.abnormal?.held))
+/** 异常处理暂停期间攒下的侧：等开关一关就会被重跑 */
+const held = computed(() => retried.value.filter((x) => x.r.abnormal?.held))
 const parallel = ref(0)
 
 /** 循环停了要第一时间喊出来：队列停摆时界面看上去和「正好没题」一模一样 */
@@ -80,6 +82,13 @@ async function togglePause(v: boolean) {
     await refreshStatus()
   } catch (e: any) { msg.error(e.message) }
 }
+async function toggleWatchdog(v: boolean) {
+  try {
+    const r = await api.watchdogPause(v)
+    msg.info(r.message)
+    await refreshStatus()
+  } catch (e: any) { msg.error(e.message) }
+}
 async function setParallel(v: number | null) {
   if (!v) return
   try {
@@ -110,6 +119,19 @@ async function setParallel(v: number | null) {
           <span class="text-fg1">暂停出队</span>
           <NSwitch size="small" :value="!!sch?.paused" @update:value="togglePause" />
         </div>
+        <div class="inner px-3 h-9 flex items-center gap-2 text-xs" :class="wd?.paused ? 'border-warn/50' : ''">
+          <span class="text-fg1" title="模型或网关停机时打开：跑挂的只记一笔，不重跑也不废弃">暂停异常处理</span>
+          <NSwitch size="small" :value="!!wd?.paused" @update:value="toggleWatchdog" />
+        </div>
+      </div>
+    </div>
+
+    <div v-if="wd?.paused" class="card p-4 border-warn/50">
+      <div class="text-warn text-xs font-semibold">异常处理已暂停，跑挂的题停在原地</div>
+      <div class="text-[12px] text-fg1 mt-1">
+        判定照做，但不自动重跑、也不因次数用尽自动废弃，工作区与轨迹原样留着。
+        模型或网关停机期间就该这样：重跑会把那一侧连 .git 一起删掉重建。
+        {{ held.length ? `目前挂着 ${held.length} 侧，关掉开关后会照常重跑` : '目前还没有挂起的侧' }}
       </div>
     </div>
 
@@ -200,7 +222,10 @@ async function setParallel(v: number | null) {
     <div class="card">
       <div class="px-4 pt-4 pb-2 flex items-center gap-3">
         <div class="h2">看护记录</div><span class="text-xs text-fg2">{{ retried.length }}</span>
-        <span class="text-[12px] text-fg2 ml-2">
+        <span v-if="wd?.paused" class="text-[12px] text-warn ml-2">
+          异常处理已暂停：下面这些只是记了一笔，没有重跑也没有废弃
+        </span>
+        <span v-else class="text-[12px] text-fg2 ml-2">
           网关重试用尽、容器消失、超时、没产出就结束，都会自动重跑；跑满 {{ wd?.max_retries ?? '-' }} 次或超时
           {{ wd?.max_timeouts ?? '-' }} 次就整题废弃，可在题库里恢复
         </span>
@@ -212,7 +237,8 @@ async function setParallel(v: number | null) {
         <span class="mono text-xs text-fg0">#{{ x.t.task_no }}</span>
         <span class="mono text-[12px] font-semibold" :style="{ color: SIDE_HEX[x.r.side] }">{{ x.r.side }} 侧</span>
         <span class="mono text-[12px]" :class="x.r.abnormal?.gave_up ? 'text-err' : 'text-warn'">
-          第 {{ x.r.attempt }} / {{ wd?.max_retries ?? '-' }} 次<span v-if="x.r.timeouts"> · 超时 {{ x.r.timeouts }}</span>
+          <template v-if="x.r.abnormal?.held">挂起 · 未重跑</template>
+          <template v-else>第 {{ x.r.attempt }} / {{ wd?.max_retries ?? '-' }} 次<span v-if="x.r.timeouts"> · 超时 {{ x.r.timeouts }}</span></template>
         </span>
         <div class="min-w-0 text-[12px] truncate" :class="x.r.abnormal?.gave_up ? 'text-err' : 'text-fg1'"
           :title="x.r.abnormal?.reason">

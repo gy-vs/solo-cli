@@ -106,6 +106,15 @@ async def queue_pause(paused: bool = Query(default=True)) -> dict:
             "message": "已暂停出队，运行中的不受影响" if paused else "已恢复出队"}
 
 
+@router.post("/watchdog/pause")
+async def watchdog_pause(paused: bool = Query(default=True)) -> dict:
+    settings_store.set_one("watchdog.paused", "1" if paused else "0")
+    bus.publish("tasks", {"type": "watchdog"})
+    return {"ok": True, "paused": paused,
+            "message": ("已暂停自动重跑与自动废弃，题目保持当前状态"
+                        if paused else "已恢复自动重跑")}
+
+
 @router.post("/queue/parallel")
 async def queue_parallel(value: int = Query(...)) -> dict:
     value = max(1, min(12, value))

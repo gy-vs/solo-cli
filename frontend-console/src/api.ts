@@ -63,7 +63,8 @@ export interface TaskRunBrief {
   /** 网关 5xx / 429。按平台规则不作为 GSB 判断依据，只触发重跑 */
   gateway_errors: string[]
   notes: string[]
-  abnormal: { reason?: string; at?: string; attempt?: number; gave_up?: boolean }
+  /** held 是「判了异常但异常处理被暂停」，只记一笔，没有重跑也没有废弃 */
+  abnormal: { reason?: string; at?: string; attempt?: number; gave_up?: boolean; held?: boolean }
   error: string
   started_at: string | null
   finished_at: string | null
@@ -233,8 +234,10 @@ export interface SystemStatus {
   }
   watchdog: {
     interval_seconds: number; max_retries: number; max_timeouts: number
+    /** 开着就是只记异常不动手：不自动重跑、不自动废弃。模型停机时用 */
+    paused: boolean
     alive: boolean; last_tick_at: string | null; last_error: string
-    last_stats: { adopted?: number; requeued?: number; discarded?: number; advanced?: number }
+    last_stats: { adopted?: number; requeued?: number; discarded?: number; held?: number; advanced?: number }
   }
   dedup: { ok: boolean; message: string; image: string }
   design: { running: number[] }
@@ -348,6 +351,7 @@ export const api = {
   queueMove: (id: number, direction: 'top' | 'up' | 'down' | 'bottom') =>
     post<{ ok: boolean; priority: number }>(`/api/tasks/${id}/queue/move`, { direction }),
   queuePause: (paused: boolean) => post<{ ok: boolean; paused: boolean; message: string }>(`/api/tasks/queue/pause?paused=${paused}`),
+  watchdogPause: (paused: boolean) => post<{ ok: boolean; paused: boolean; message: string }>(`/api/tasks/watchdog/pause?paused=${paused}`),
   queueParallel: (value: number) => post<{ ok: boolean; max_parallel: number; message: string }>(`/api/tasks/queue/parallel?value=${value}`),
 
   // ---- 题目设计 ----
