@@ -122,6 +122,10 @@ def test_run_side_refuses_a_workspace_that_is_not_the_start_point(task_with_runs
         spawned.append(a)
         raise AssertionError("起点不对还是把容器起起来了")
 
+    async def present(image):
+        return True
+
+    monkeypatch.setattr(runner.dockerx, "image_present", present)
     monkeypatch.setattr(runner.gsb_repo, "verify_head", verify)
     monkeypatch.setattr(runner.settings_store, "get", lambda k: "img")
     monkeypatch.setattr(runner.settings_store, "get_int", lambda k, d=0: d)
@@ -141,6 +145,49 @@ def test_run_side_refuses_a_workspace_that_is_not_the_start_point(task_with_runs
         assert db.get(m.TaskRun, ids["B"]).status == m.RUN_PENDING
     # 交给巡检去判异常，它走的完全重建正好能把工作区修回来
     assert woke == [True]
+
+
+def test_run_side_holds_the_queue_when_the_image_is_missing(task_with_runs, monkeypatch):
+    """镜像不在本机就不出闸，也不算这一侧跑坏了。
+
+    拉不到镜像的 docker run 三秒就退，判成 FAILED 交给巡检的话，一侧的三次重跑预算
+    十几秒烧光，紧接着整道题按「达到上限」自动废弃 —— 一次镜像丢失能在几分钟里把整个
+    队列废掉。所以退回排队保住 attempt，并停下出队等人补镜像。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    spawned = []
+
+    async def absent(image):
+        return False
+
+    async def verify(task_no, side, snapshot):
+        raise AssertionError("镜像都不在，不必再去校验起点")
+
+    async def spawn(*a, **k):
+        spawned.append(a)
+        raise AssertionError("镜像不在还是把容器起起来了")
+
+    wrote: list[tuple[str, str]] = []
+    monkeypatch.setattr(runner.dockerx, "image_present", absent)
+    monkeypatch.setattr(runner.gsb_repo, "verify_head", verify)
+    monkeypatch.setattr(runner.settings_store, "get", lambda k: "img")
+    monkeypatch.setattr(runner.settings_store, "get_int", lambda k, d=0: d)
+    monkeypatch.setattr(runner.settings_store, "set_one",
+                        lambda k, v: wrote.append((k, v)))
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", spawn)
+
+    asyncio.run(runner.run_side(ids["A"]))
+
+    assert spawned == []
+    assert wrote == [("scheduler.paused", "1")]
+    with session() as db:
+        run = db.get(m.TaskRun, ids["A"])
+        assert run.status in m.RUN_WAITING
+        assert run.attempt == 1          # 重跑预算一次都没消耗
+        assert "img" in run.error
+        assert run.container_exists is False
 
 
 # ---------------- 收尾落库 ----------------

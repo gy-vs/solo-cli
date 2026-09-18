@@ -20,8 +20,8 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import (
-    RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_RUNNING, RUN_TIMEOUT,
-    RunEvent, Task, TaskRun, as_utc, utc_now,
+    RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_PENDING, RUN_QUEUED,
+    RUN_RUNNING, RUN_TIMEOUT, RunEvent, Task, TaskRun, as_utc, utc_now,
 )
 from app.services import dockerx, gsb_repo, settings_store, trace, watchdog
 
@@ -291,6 +291,27 @@ async def _refuse_to_start(run_id: int, task_id: int, side: str, why: str) -> No
     watchdog.wake()
 
 
+async def _hold_for_missing_image(run_id: int, task_id: int, side: str, image: str) -> None:
+    """本机没有这个镜像，这一侧退回队列，并把出队停下来。
+
+    缺镜像是 docker run 必然失败的前置条件，不是「这一次跑坏了」。判成 FAILED 交给
+    watchdog 的代价很重：docker 拉不到镜像三秒就退，一侧的三次重跑预算十几秒烧光，
+    紧接着整道题按「达到上限」自动废弃 —— 一次镜像丢失能在几分钟里把整个队列废掉。
+    所以保住 attempt 退回 QUEUED，并暂停出队等人补镜像，而不是让队列空转着把题判死。
+    """
+    why = f"本机不存在镜像 {image}，已退回队列并暂停出队，请先 docker pull 或在设置页更换"
+    log.error("run %s 不出闸：%s", run_id, why)
+    with session() as db:
+        run = db.get(TaskRun, run_id)
+        # 排队的两种状态要还回原来那个：队列页按它区分「第一次跑」和「被退回来重跑」
+        back = RUN_QUEUED if run and run.attempt > 1 else RUN_PENDING
+    _set_run(run_id, status=back, container_exists=False, error=why[:2000])
+    settings_store.set_one("scheduler.paused", "1")
+    _record_event(task_id, side, 1, "lifecycle", why,
+                  {"type": "lifecycle", "side": side, "held": True, "image": image})
+    _publish_task(task_id)
+
+
 async def run_side(run_id: int) -> None:
     with session() as db:
         run = db.get(TaskRun, run_id)
@@ -306,6 +327,12 @@ async def run_side(run_id: int) -> None:
     image = settings_store.get("cc.image")
     api_key = settings_store.get("cc.api_key")
     timeout_s = max(60, settings_store.get_int("run.timeout_minutes", 120) * 60)
+
+    # 门禁在领取时确认过镜像在本机，但那是排队之前的事，期间镜像可能被 prune 掉；
+    # 而这个 tag 不一定推到过远端，docker run 的隐式拉取补不回来。
+    if not await dockerx.image_present(image):
+        await _hold_for_missing_image(run_id, task_id, side, image)
+        return
 
     # 出闸前再确认一次起点。门禁在领取时查过，但领取到出闸之间隔着排队的那段时间，
     # 期间目录可能被人动过、被上一次没做完的重建留在半路，clone 也可能是被强制启动

@@ -11,7 +11,7 @@
 |---|---|
 | 五维打分与描述 | 调用 **Cursor CLI（`agent`）+ Opus 5** 做项目实现分析并按需求文档五维评分表打分与描述；描述第一人称、口语化、去 AI 化、禁表情与修辞；结果须与轨迹文件相互印证 |
 | `prompt.md` 形态 | 多题汇总文件，以 `题号：` 分段 |
-| 镜像 | `adminfather/benzhi-claude-code:20260915-mount`：在 `20260909-isolated-git` 之上仅去掉「`/workspace` 必须为空」检查，允许映射非空的初始快照仓库；其余隔离参数不变。本机已构建并实测；多架构推送待 `docker login` 后用发布脚本完成 |
+| 镜像 | `adminfather/benzhi-claude-code:20260915-mount`：在 `20260909-isolated-git` 之上仅去掉「`/workspace` 必须为空」检查，允许映射非空的初始快照仓库；其余隔离参数不变。构建方式见 `cc-image/Dockerfile`（基础镜像按 digest 固定）；多架构推送待 `docker login` 后用发布脚本完成，在那之前这个 tag 只存在于本机，被 prune 掉就得重建 |
 | 容器销毁 | 人工点「完成」后销毁 |
 | 轮次 | 每题只跑一轮 |
 
