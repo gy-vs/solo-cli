@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, shallowRef, watch } from 'vue'
 import type { RunEvent } from '../api'
 import { fmtTime, HEX } from '../status'
 
 const props = defineProps<{ events: RunEvent[]; follow?: boolean; highlightStep?: number | null }>()
-const open = ref<Set<number>>(new Set())
+const open = shallowRef<Set<number>>(new Set())
 const box = ref<HTMLElement | null>(null)
 const filter = ref<'all' | 'tools' | 'text' | 'errors'>('all')
 
@@ -18,14 +18,35 @@ function color(e: RunEvent) {
   return KIND_COLOR[e.kind] || HEX.fg1
 }
 function isToolUse(e: RunEvent) { return e.kind === 'assistant' && e.payload?.message?.content?.some?.((b: any) => b.type === 'tool_use') }
-function isError(e: RunEvent) { return color(e) === HEX.err || color(e) === HEX.warn }
 
-const shown = computed(() => props.events.filter((e) => {
-  if (filter.value === 'tools') return isToolUse(e) || e.kind === 'user'
-  if (filter.value === 'text') return e.kind === 'assistant' && !isToolUse(e)
-  if (filter.value === 'errors') return isError(e)
-  return true
-}))
+/** 每条事件的分类只判一次。
+ *
+ * 上色、筛选、计数问的都是同一件事，而答案要往 payload 里翻好几层。事件流最多留八百条，
+ * 不缓存的话每来一条新事件，这八百条就要被翻上好几遍 —— 模型手快的时候页面直接没法滚。
+ * 挂在事件对象上（WeakMap），事件被挤出列表后自动跟着回收。
+ */
+type Mark = { color: string; tool: boolean; err: boolean }
+const marks = new WeakMap<RunEvent, Mark>()
+function mark(e: RunEvent): Mark {
+  let m = marks.get(e)
+  if (!m) {
+    const c = color(e)
+    m = { color: c, tool: !!isToolUse(e), err: c === HEX.err || c === HEX.warn }
+    marks.set(e, m)
+  }
+  return m
+}
+
+const shown = computed(() => {
+  const f = filter.value
+  if (f === 'all') return props.events
+  return props.events.filter((e) => {
+    const m = mark(e)
+    if (f === 'tools') return m.tool || e.kind === 'user'
+    if (f === 'text') return e.kind === 'assistant' && !m.tool
+    return m.err
+  })
+})
 
 function toggle(seq: number) {
   const s = new Set(open.value)
@@ -55,11 +76,16 @@ watch(() => props.events.length, async () => {
   if (box.value) box.value.scrollTop = box.value.scrollHeight
 })
 
-const counts = computed(() => ({
-  all: props.events.length,
-  tools: props.events.filter((e) => isToolUse(e)).length,
-  errors: props.events.filter(isError).length,
-}))
+const counts = computed(() => {
+  let tools = 0
+  let errors = 0
+  for (const e of props.events) {
+    const m = mark(e)
+    if (m.tool) tools++
+    if (m.err) errors++
+  }
+  return { all: props.events.length, tools, errors }
+})
 </script>
 
 <template>
@@ -75,13 +101,14 @@ const counts = computed(() => ({
     </div>
     <div ref="box" class="flex-1 min-h-0 overflow-auto pr-1">
       <div v-if="!events.length" class="empty">暂无事件</div>
-      <div v-for="e in shown" :key="e.seq" class="relative pl-6 pb-3 animate-slidein">
+      <!-- 一行的样子只跟它自己和展开与否有关，所以新事件进来时其余的行整块跳过重排 -->
+      <div v-for="e in shown" :key="e.seq" v-memo="[open.has(e.seq)]" class="relative pl-6 pb-3 animate-slidein">
         <div class="absolute left-[7px] top-2 bottom-0 w-px bg-line" />
-        <span class="absolute left-1 top-1.5 dot" :style="{ background: color(e) }" />
+        <span class="absolute left-1 top-1.5 dot" :style="{ background: mark(e).color }" />
         <div class="inner px-3 py-2 cursor-pointer hover:bg-bg3/80 transition-colors" @click="toggle(e.seq)">
           <div class="flex items-center gap-2 text-[12px] mono text-fg2">
             <span>{{ String(e.seq).padStart(3, '0') }}</span>
-            <span :style="{ color: color(e) }">{{ e.kind }}</span>
+            <span :style="{ color: mark(e).color }">{{ e.kind }}</span>
             <span class="ml-auto">{{ fmtTime(e.ts) }}</span>
           </div>
           <div class="text-fg0 text-xs mt-0.5 break-words" :class="open.has(e.seq) ? '' : 'line-clamp-2'">{{ e.summary }}</div>

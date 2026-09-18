@@ -7,6 +7,7 @@ import asyncio
 
 import pytest
 
+from app import config
 from app import models as m
 from app.services import gate
 from app.services.gsb_repo import BranchProbe
@@ -18,6 +19,12 @@ def test_normalize_choice_ignores_whitespace():
     assert gate.normalize_choice("Bug修复", gate.QUESTION_TYPES) == "Bug修复"
     assert gate.normalize_choice("随便写的", gate.QUESTION_TYPES) == ""
     assert gate.normalize_choice("", gate.QUESTION_TYPES) == ""
+
+
+def test_normalize_choice_ignores_case():
+    """出题速查表写的是「Feature 迭代」，平台选项是「feature迭代」，差在书写不在语义。"""
+    assert gate.normalize_choice("Feature 迭代", gate.QUESTION_TYPES) == "feature迭代"
+    assert gate.normalize_choice("bug 修复", gate.QUESTION_TYPES) == "Bug修复"
 
 
 def test_difficulty_options_are_exactly_two():
@@ -73,7 +80,7 @@ def stub(monkeypatch, tmp_path):
     monkeypatch.setattr(gate.config, "CODER_ROOT_MOUNT", tmp_path)
     for side in ("A", "B"):
         (tmp_path / "workspace" / "07" / side / ".git").mkdir(parents=True)
-        (tmp_path / "出题" / "轨迹" / "07" / side).mkdir(parents=True)
+        (tmp_path / config.TRACES_DIR / "07" / side).mkdir(parents=True)
     return tmp_path
 
 
@@ -128,7 +135,7 @@ def test_both_sides_are_checked_independently(stub, monkeypatch):
 
 
 def test_nonempty_trace_dir_is_blocked(stub):
-    (stub / "出题" / "轨迹" / "07" / "B" / "stale.jsonl").write_text("{}", encoding="utf-8")
+    (stub / config.TRACES_DIR / "07" / "B" / "stale.jsonl").write_text("{}", encoding="utf-8")
     levels = _levels(asyncio.run(gate.run_checks(_task())))
     assert levels["traces_A"] == "ok"
     assert levels["traces_B"] == "block"
@@ -152,6 +159,47 @@ def test_missing_workspace_is_blocked_with_fix_action(stub):
     b = next(c for c in checks if c.name == "workspace_B")
     assert b.level == "block"
     assert b.fix == "clone_sides"
+
+
+# ---------------- 哪些 block 是强制启动也绕不过去的 ----------------
+
+def test_spec_blocks_can_still_be_forced(stub):
+    """难度、任务类型这类是交不上去，人明知故犯地先跑着还有意义。"""
+    report = gate.summarize(asyncio.run(gate.run_checks(_task(difficulty="中等"))))
+    assert report["passed"] is False
+    assert report["hard_blocked"] == []
+
+
+def test_missing_clone_is_a_hard_block(stub):
+    """挂一个空目录进容器，模型会在里面自己 git init 从头造一个仓库接着做题，
+    跑完带着完整轨迹和一份像模像样的产物，肉眼很难看出这跑的根本不是这道题。"""
+    import shutil
+
+    shutil.rmtree(stub / "workspace" / "07" / "B")
+    report = gate.summarize(asyncio.run(gate.run_checks(_task())))
+    assert report["hard_blocked"] == ["workspace_B"]
+
+
+def test_wrong_head_is_a_hard_block(stub, monkeypatch):
+    async def verify(task_no, side, snapshot):
+        ok = side == "A"
+        return {"ok": ok, "head": "b" * 40, "dirty": 0,
+                "message": f"{side} 侧 HEAD bbbb 不是初始快照 aaaa"}
+
+    monkeypatch.setattr(gate.gsb_repo, "verify_head", verify)
+    report = gate.summarize(asyncio.run(gate.run_checks(_task())))
+    assert report["hard_blocked"] == ["workspace_B"]
+    assert "不是初始快照" in report["hard_messages"][0]
+
+
+def test_busy_container_and_stale_traces_are_hard_blocks(stub, monkeypatch):
+    async def state(name):
+        return "exited" if name.endswith("-A") else ""
+
+    monkeypatch.setattr(gate.dockerx, "container_state", state)
+    (stub / config.TRACES_DIR / "07" / "B" / "stale.jsonl").write_text("{}", encoding="utf-8")
+    report = gate.summarize(asyncio.run(gate.run_checks(_task())))
+    assert set(report["hard_blocked"]) == {"container_A", "traces_B"}
 
 
 def test_leak_scan_runs_per_side(stub, monkeypatch):

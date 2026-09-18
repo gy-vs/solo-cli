@@ -28,7 +28,27 @@ def test_analysis_dir_is_shared_but_repo_is_not():
 def test_host_paths_use_host_root():
     a = config.TaskPaths("07", "A")
     assert a.workspace_host == f"{config.CODER_ROOT_HOST}/workspace/07/A"
-    assert a.traces_host == f"{config.CODER_ROOT_HOST}/出题/轨迹/07/A"
+    assert a.traces_host == f"{config.CODER_ROOT_HOST}/{config.TRACES_DIR}/07/A"
+
+
+def test_export_host_points_at_the_same_dir_as_export():
+    """质检把导出目录挂进 solo-qa 的容器，两条路径指的必须是同一个目录。
+
+    错开的话不会报错，只会挂上一个空目录，症状是「轨迹文件找不到」，
+    而文件明明就在那儿 —— 这种错法很难从现象倒推回来。
+    """
+    a = config.TaskPaths("07", "A")
+    assert a.export_host.endswith("/exports/07/A")
+    assert a.export.as_posix().endswith("/exports/07/A")
+    assert a.export_host.startswith(config.DATA_DIR_HOST)
+
+
+def test_dir_names_carry_no_authoring_hint():
+    """录屏交付会拍到工作区目录树，目录名不能暗示题目是设计出来的。"""
+    names = (config.WORKSPACE_DIR, config.TRACES_DIR, config.ANALYSIS_DIR,
+             config.PROMPTS_ARCHIVE_DIR, config.PROMPT_FILE)
+    for bad in ("出题", "轨迹", "分析", "题库", "prompt", "需求"):
+        assert not any(bad in n for n in names), f"{bad} 出现在路径常量里"
 
 
 def test_side_is_validated():

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import json
+import logging
+from contextlib import suppress
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func, select
 
@@ -24,6 +28,7 @@ from app.services import (
     scheduler, settings_store, trace, watchdog,
 )
 
+log = logging.getLogger("tasks")
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 
@@ -103,11 +108,10 @@ async def queue_pause(paused: bool = Query(default=True)) -> dict:
 
 @router.post("/queue/parallel")
 async def queue_parallel(value: int = Query(...)) -> dict:
-    value = max(2, min(12, value))
+    value = max(1, min(12, value))
     settings_store.set_one("scheduler.max_parallel", str(value))
     bus.publish("tasks", {"type": "scheduler"})
-    return {"ok": True, "max_parallel": value,
-            "message": f"同时最多 {value} 个容器，也就是 {value // 2} 道题"}
+    return {"ok": True, "max_parallel": value, "message": f"同时最多 {value} 个容器"}
 
 
 @router.post("/batch/upload")
@@ -121,10 +125,17 @@ async def batch_upload(body: IdList) -> dict:
 
 @router.post("/batch/claim")
 async def batch_claim(body: IdList) -> dict:
+    """界面上的「全部领取并启动」。
+
+    走 _claim 而不是调上面那个路由函数：路由的 force 形参默认值是 `Query(default=False)`，
+    那是个 FieldInfo 对象，只有经过 HTTP 请求才会被 FastAPI 解析成布尔值。在 Python 里
+    直接调用它，force 拿到的就是这个对象本身，而它是真值——于是批量领取会一路强制到底，
+    clone 没成、门禁全红的题照样进队列。
+    """
     results = []
     for tid in body.ids:
         try:
-            results.append({"id": tid, **(await claim(tid))})
+            results.append({"id": tid, **(await _claim(tid, force=False))})
         except HTTPException as exc:
             results.append({"id": tid, "queued": False, "error": exc.detail})
     return {"results": results}
@@ -148,6 +159,11 @@ async def gate_check(task_id: int) -> dict:
 @router.post("/{task_id}/claim")
 async def claim(task_id: int, force: bool = Query(default=False)) -> dict:
     """领取：校验分支、clone 两侧、跑门禁，通过就建两个 run 进队列。"""
+    return await _claim(task_id, force)
+
+
+async def _claim(task_id: int, force: bool) -> dict:
+    """领取的实际动作。进程内的调用方一律走这里，见 batch_claim 的说明。"""
     with session() as db:
         t = _get(db, task_id)
         if t.status not in (AVAILABLE, CLAIMED):
@@ -167,6 +183,12 @@ async def claim(task_id: int, force: bool = Query(default=False)) -> dict:
         return {"queued": False, "prepare": prep, "gate": None}
 
     report = gate.summarize(await gate.run_checks(snapshot))
+    # 强制启动只放行口径类的问题。容器起不来、或者这一侧的起点不对（没 clone 成、
+    # HEAD 对不上），跑出来的东西根本不成立：docker 会拿一个空目录当工作区挂进去，
+    # 模型在里面自己 git init 造一个仓库，跑完还长得像一次正常的运行。
+    if force and report["hard_blocked"]:
+        raise HTTPException(409, "这些是强制启动也绕不过的硬前提，先修好再领取："
+                                 + "；".join(report["hard_messages"][:4]))
     queued = report["passed"] or force
     if queued:
         with session() as db:
@@ -198,31 +220,16 @@ async def release(task_id: int) -> dict:
 
 
 @router.post("/{task_id}/discard")
-async def discard(task_id: int) -> dict:
-    """标记废弃：列表默认不再显示；残留容器一并销毁，轨迹与产物保留在磁盘上。"""
-    with session() as db:
-        t = _get(db, task_id)
-        if t.status == RUNNING:
-            raise HTTPException(409, "运行中不能废弃，请先停止容器")
-        if t.status == QUEUED:
-            raise HTTPException(409, "排队中不能废弃，请先放回题库")
-        if t.status == DISCARDED:
-            return {"ok": True, "message": "该题已是废弃状态"}
-        task_no = t.task_no
-        had_container = any(r.container_exists for r in _runs(db, task_id))
-    removed = False
-    if had_container:
-        removed = (await dockerx.remove_task_containers(task_no)).ok
-    with session() as db:
-        t = _get(db, task_id)
-        t.discarded_from = t.status
-        t.status = DISCARDED
-        t.discarded_at = utc_now()
-        for r in _runs(db, task_id):
-            r.container_exists = False
-    bus.publish("tasks", {"type": "task", "id": task_id})
-    return {"ok": True, "container_removed": removed,
-            "message": "已废弃" + ("，容器已销毁" if removed else "")}
+async def discard(task_id: int, reason: str = Query(default="人工废弃")) -> dict:
+    """标记废弃：列表默认不再显示；在跑的容器一并停掉销毁，轨迹与产物留在磁盘上。
+
+    运行中和排队中也能直接废弃。以前要求先停容器、先放回题库，是怕误操作丢掉跑了一半
+    的结果；但一道题真要放弃时，多这两步只是让它继续占着容器，而槽位是这里最紧的资源。
+    """
+    res = await watchdog.discard_task(task_id, reason)
+    if not res["ok"]:
+        raise HTTPException(404, res["message"])
+    return res
 
 
 @router.post("/{task_id}/restore")
@@ -299,6 +306,227 @@ async def rerun(task_id: int, body: RerunRequest) -> dict:
     if not res["ok"]:
         raise HTTPException(400, res["message"])
     return res
+
+
+# ---------------- 容器实时 ----------------
+
+def _run_side_map(db, task_id: int) -> dict[str, TaskRun]:  # noqa: ANN001
+    return {r.side: r for r in _runs(db, task_id)}
+
+
+def _container_name(task: Task, side: str, run: TaskRun | None) -> str:
+    """这一侧的容器名。run 上有就用它，没有就按命名规则算，好让还没建 run 的题也能查。"""
+    return (run.container_name if run and run.container_name
+            else config.TaskPaths(task.task_no, side).container_name)
+
+
+@router.get("/{task_id}/containers")
+async def task_containers(task_id: int) -> dict:
+    """两侧容器此刻的真实样子：状态、退出码、资源占用、容器里的进程、最后一次出声的时刻。
+
+    详情页上「两侧运行」里的那些数字是收尾时记下来的账，跑着的时候那份账还不存在，
+    所以只能现问 docker。其中 silent_seconds（离最后一行日志过了多久）是最要紧的一个：
+    事件采集一断，界面上就再没有别的东西能区分「模型还在干活」和「容器早就卡住了」。
+    """
+    with session() as db:
+        t = _get(db, task_id)
+        by_side = _run_side_map(db, task_id)
+        wanted = [(s, _container_name(t, s, by_side.get(s)),
+                   by_side[s].status if s in by_side else "")
+                  for s in config.SIDES]
+
+    snaps = await asyncio.gather(*(dockerx.container_snapshot(name) for _, name, _ in wanted))
+    live = [name for (_, name, _), snap in zip(wanted, snaps) if snap.get("running")]
+    # 日志尾行对已经退出的容器也要取：那一行的时刻就是它最后一次出声，
+    # 跟退出时间一比就知道是干完活退的，还是半路没了声音。
+    have = [name for (_, name, _), snap in zip(wanted, snaps) if snap.get("exists")]
+    stats, tops = {}, {}
+    if live:
+        # stats 一次问两个（--no-stream 要采样，一个一个来要等两倍时间）
+        stats = await dockerx.container_stats(live)
+        tops = dict(zip(live, await asyncio.gather(*(dockerx.container_top(n) for n in live))))
+    tails = dict(zip(have, await asyncio.gather(*(dockerx.last_log_line(n) for n in have))))
+
+    # docker 用零值时间表示「还没发生」，直接给前端会算出一个两千年的时长
+    def _time(v: str) -> str | None:
+        return v if v and not v.startswith("0001-01-01") else None
+
+    now = utc_now()
+    items = []
+    for (side, name, run_status), snap in zip(wanted, snaps):
+        procs = tops.get(name) or []
+        last_raw = tails.get(name) or ""
+        last_ts, last_text = runner.split_log_ts(last_raw) if last_raw else (None, "")
+        items.append({
+            "side": side, "name": name, "run_status": run_status,
+            "exists": bool(snap.get("exists")), "status": snap.get("status", ""),
+            "running": bool(snap.get("running")), "exit_code": snap.get("exit_code"),
+            "started_at": _time(snap.get("started_at") or ""),
+            "finished_at": _time(snap.get("finished_at") or ""),
+            "oom_killed": bool(snap.get("oom_killed")), "error": snap.get("error", ""),
+            "image": snap.get("image", ""),
+            **(stats.get(name) or {"cpu": "", "mem": "", "mem_perc": ""}),
+            "processes": procs,
+            # 容器里那个 claude 进程还在，就说明模型仍在工作，哪怕事件流已经不动了
+            "claude_alive": any("claude" in (p.get("cmd") or "") for p in procs),
+            "last_log_at": last_ts.isoformat() if last_ts else None,
+            "silent_seconds": round((now - last_ts).total_seconds()) if last_ts else None,
+            "last_log": last_text[:400],
+        })
+    return {"items": items, "at": now.isoformat()}
+
+
+# 日志流的心跳间隔。容器可能几分钟不出声，中间什么都不发的话，
+# 代理和浏览器都会把这条连接当成断了。
+LOG_PING_SECONDS = 15
+
+
+@router.get("/{task_id}/container/logs")
+async def container_logs(task_id: int, side: str = Query(...),
+                         tail: int = Query(default=200, ge=1, le=2000)) -> StreamingResponse:
+    """把容器的原始 stdout 实时推给界面上的终端。
+
+    走的是 `docker logs -f`，跟事件流不是一回事：事件流是解析、过滤、落库之后的结果，
+    噪声事件（每个 token 一条的 thinking）被丢掉了，采集断了就什么也没有；
+    这里给的是容器此刻真正在往外写的每一行，用来确认「它到底还在不在动」。
+    """
+    want = _side(side)
+    with session() as db:
+        t = _get(db, task_id)
+        name = _container_name(t, want, _run_side_map(db, task_id).get(want))
+
+    snap = await dockerx.container_snapshot(name)
+    if not snap.get("exists"):
+        raise HTTPException(404, f"容器 {name} 不在了（已销毁或还没启动），没有日志可看")
+
+    async def gen():
+        # 有界队列顺带做背压：容器刷得比浏览器收得快时，读日志那侧自己会等
+        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+
+        async def pump() -> None:
+            try:
+                async for line in dockerx.stream_container_logs(name, tail=tail):
+                    await q.put({"type": "line", "text": line})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await q.put({"type": "error", "message": f"读容器日志失败：{exc}"})
+            await q.put({"type": "eof", "message": "日志流结束（容器已退出或被销毁）"})
+
+        pumping = asyncio.create_task(pump())
+        yield sse_format({"type": "hello", "container": name, "state": snap.get("status", ""),
+                          "running": bool(snap.get("running")), "tail": tail})
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=LOG_PING_SECONDS)
+                except asyncio.TimeoutError:
+                    yield sse_format({"type": "ping"})
+                    continue
+                yield sse_format(item)
+                if item["type"] == "eof":
+                    break
+        finally:
+            pumping.cancel()
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.websocket("/{task_id}/container/exec")
+async def container_exec(ws: WebSocket, task_id: int, side: str = Query(default="A"),
+                         rows: int = Query(default=dockerx.PTY_ROWS, ge=4, le=400),
+                         cols: int = Query(default=dockerx.PTY_COLS, ge=20, le=600)) -> None:
+    """页面上那个终端的另一端：容器里一个真正的 shell。
+
+    跟隔壁 /container/logs 分工清楚：那边是 `docker logs -f` 的只读回放，只能看着
+    stream-json 往下滚；这里是 `docker exec -it` 接在伪终端上的双向通道，能敲命令、
+    有颜色和光标，vim、top、git log 这类认终端的程序都照常用。要确认模型此刻把工作区
+    改成了什么样，只有进去用 git status 亲眼看一遍才算数。
+
+    容器名一律由 task_id + side 推算，不接受调用方传。这个接口能在容器里执行任意命令，
+    容器名一旦可以由参数指定，等于把宿主机上所有容器都对外开放了。
+    """
+    await ws.accept()
+
+    async def bye(message: str) -> None:
+        # 先握手再报错，不在握手阶段拒：WebSocket 握手失败浏览器只给一个
+        # 「连接失败」，页面上就无从分辨是容器没了、题没跑，还是后端挂了
+        with suppress(Exception):
+            await ws.send_json({"type": "exit", "message": message})
+            await ws.close()
+
+    want = (side or "").upper()
+    if want not in config.SIDES:
+        await bye("side 必须是 A 或 B")
+        return
+    with session() as db:
+        t = db.get(Task, task_id)
+        if t is None:
+            await bye("任务不存在")
+            return
+        name = _container_name(t, want, _run_side_map(db, task_id).get(want))
+
+    snap = await dockerx.container_snapshot(name)
+    if not snap.get("exists"):
+        await bye(f"容器 {name} 不在了（还没启动，或两侧跑完推完产物后已自动销毁），开不了终端")
+        return
+    if not snap.get("running"):
+        await bye(f"容器 {name} 已经退出（{snap.get('status') or '状态未知'}）。"
+                  f"停掉的容器进不去，它留下的东西请在工作区目录里翻")
+        return
+
+    try:
+        term = await dockerx.pty_shell(
+            name, rows=rows, cols=cols, workdir=config.CONTAINER_WORKSPACE,
+            env={"TERM": "xterm-256color", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        await bye(f"开终端失败：{exc}")
+        return
+
+    await ws.send_json({"type": "hello", "container": name, "side": want,
+                        "cwd": config.CONTAINER_WORKSPACE})
+    # 按块读会把一个多字节字符切成两半，攒着等下一块再拼。少了这一步，容器里的中文
+    # 输出会每隔一段冒出一个替换字符，而且恰好在刷屏最快的时候最密。
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    async def to_browser() -> None:
+        while (chunk := await term.read()) is not None:
+            text = decoder.decode(chunk)
+            if text:
+                await ws.send_json({"type": "stdout", "data": text})
+
+    async def to_container() -> None:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            kind = msg.get("type")
+            if kind == "stdin":
+                await term.write(str(msg.get("data") or "").encode("utf-8"))
+            elif kind == "resize":
+                term.resize(int(msg.get("rows") or rows), int(msg.get("cols") or cols))
+
+    pumps = [asyncio.create_task(to_browser()), asyncio.create_task(to_container())]
+    try:
+        # 谁先结束都收摊：浏览器关页面（到不了 to_container 的下一轮）、
+        # 容器里 exit（to_browser 读到 None）、容器被销毁，三种情况都走这里
+        done, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+        for p in done:
+            # 取一次异常，别让它变成没人认领的 Task 警告；浏览器断连本身不是错
+            exc = p.exception()
+            if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                log.info("容器终端 %s 结束：%r", name, exc)
+    finally:
+        await term.close()
+        with suppress(Exception):
+            await ws.send_json({"type": "exit", "message": f"终端已退出（容器 {name} 仍在运行）"})
+            await ws.close()
 
 
 # ---------------- 事件流 ----------------

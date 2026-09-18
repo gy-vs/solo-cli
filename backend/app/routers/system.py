@@ -13,7 +13,7 @@ from app import config
 from app.db import session
 from app.events import bus, sse_format
 from app.models import ALL_STATUSES, RUN_RUNNING, Task, TaskRun
-from app.services import designer, dockerx, gsb_analyzer, gsb_uploader, qa_bridge, settings_store, watchdog
+from app.services import designer, dockerx, gsb_uploader, llm, qa_bridge, settings_store, watchdog
 from app.services.scheduler import scheduler
 
 router = APIRouter(prefix="/api", tags=["system"])
@@ -56,12 +56,7 @@ async def system_status() -> dict:
         "docker": {"ok": docker_ok, "message": docker_msg},
         "image": {"name": image, "present": image_ok},
         "scheduler": scheduler.snapshot(),
-        "watchdog": {
-            "interval_seconds": settings_store.get_int("watchdog.interval_seconds",
-                                                       watchdog.INTERVAL_DEFAULT),
-            "max_retries": settings_store.get_int("watchdog.max_retries",
-                                                  watchdog.MAX_RETRIES_DEFAULT),
-        },
+        "watchdog": watchdog.status(),
         "dedup": {"ok": dedup_ok, "message": dedup_why or "已启用",
                   "image": settings_store.get("qc.image")},
         "design": {"running": sorted(designer.running)},
@@ -87,7 +82,7 @@ async def probe(target: str) -> dict:
     if target == "gateway":
         return await gsb_uploader.probe_gateway()
     if target == "cursor":
-        return await gsb_analyzer.probe_ping()
+        return await llm.probe_ping()
     if target in ("dedup", "qc"):
         return await qa_bridge.probe()
     if target == "docker":
@@ -102,10 +97,16 @@ async def probe(target: str) -> dict:
 
 
 @router.get("/events")
-async def global_events() -> StreamingResponse:
+async def global_events(runs: bool = True) -> StreamingResponse:
+    """整个界面的公共流：状态变化，外加各题运行事件的摘要。
+
+    两路合在一条连接上，是为了让浏览器那六个并发连接够用 —— 详见 events.py 里的说明。
+    """
+    topics = ("tasks", "runs") if runs else ("tasks",)
+
     async def gen():
         yield sse_format({"type": "hello"})
-        async for item in bus.subscribe("tasks"):
+        async for item in bus.subscribe(*topics):
             yield sse_format(item)
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

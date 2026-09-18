@@ -65,6 +65,16 @@ def test_parse_multi():
     assert "session_id" not in t1.fields and "turn_id" not in t1.fields
 
 
+def test_parse_body_marker_tolerates_extra_wording():
+    """skill 会在标记行后面加补充说明，写死全等的话正文会整段丢掉。"""
+    text = SAMPLE.replace("以下为发送给模型的 prompt 正文，整段复制。",
+                          "以下为发送给模型的 prompt 正文，A 侧与 B 侧发送同一份，整段复制。")
+    tasks = prompt_bank.parse_text(text)
+    assert [t.task_no for t in tasks] == ["01", "02"]
+    assert tasks[0].user_prompt.startswith("我要做一个三方合并的内核库。")
+    assert tasks[1].user_prompt == "修一下这个 bug。"
+
+
 def test_import_picks_up_repo_url(tmp_db, tmp_path, monkeypatch):
     """双跑要按分支 clone 两份，仓库地址必须在导入时就拿到。"""
     from app.db import session

@@ -7,6 +7,27 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 
+# 会改动本机状态的 docker 子命令。测试里的题号是固定的 07、08，而本机上很可能
+# 正好有一个同名容器在跑真活：一次 remove_task_containers 就能把它连同还没导出的
+# 轨迹一起删掉。只读的 inspect、ps 照常放行，那些是查询。
+_DESTRUCTIVE = {"rm", "stop", "kill", "run", "start", "restart"}
+
+
+@pytest.fixture(autouse=True)
+def no_container_side_effects(monkeypatch):
+    """兜住所有会动到真容器的命令，测试跑不出本机的副作用。"""
+    from app.services import dockerx
+
+    real = dockerx.run
+
+    async def guarded(args, **kw):
+        if list(args[:1]) == ["docker"] and len(args) > 1 and args[1] in _DESTRUCTIVE:
+            return dockerx.CmdResult(0, "", "")
+        return await real(args, **kw)
+
+    monkeypatch.setattr(dockerx, "run", guarded)
+
+
 @pytest.fixture()
 def tmp_db(tmp_path, monkeypatch):
     """把 db 模块的 engine 换成临时库。
@@ -31,10 +52,12 @@ def tmp_db(tmp_path, monkeypatch):
 def task_with_runs(tmp_db):
     """一道题加它的 A、B 两个 run，返回 (task_id, {side: run_id})。"""
     from app.db import session
-    from app.models import Task, TaskRun
+    from app.models import QUEUED, Task, TaskRun
 
     with session() as db:
-        t = Task(task_no="07", prompt_hash="h", user_prompt="做点事",
+        # 有 run 的题一定已经领取过了。留默认的 AVAILABLE 会让巡检扫不到它 ——
+        # 那一步只看还在流程里的题，见 models.WATCHED。
+        t = Task(task_no="07", prompt_hash="h", user_prompt="做点事", status=QUEUED,
                  repo_url="https://github.com/acme/widget",
                  env_snapshot="https://github.com/acme/widget/commit/" + "c" * 40)
         db.add(t)

@@ -1,6 +1,6 @@
 """查重桥接：只跑 solo-qa 的查重规则 A 与规则 C。
 
-这个文件不在 solo-cli 的进程里运行，而是挂进 `solo-qa-backend` 镜像执行
+这个文件不在 solo-cli 的进程里运行，而是挂进 solo-qa 的后端镜像执行
 （那套依赖 pin 了 sqlalchemy/pydantic 的具体版本，跟 solo-cli 的直接混装会冲突）。
 因此只用标准库 + solo-qa 自己的包，不要 import solo-cli 的任何模块。
 

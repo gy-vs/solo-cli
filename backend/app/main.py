@@ -46,11 +46,12 @@ async def lifespan(_: FastAPI):
     log.info("Console : http://localhost:%s", config.HOST_PORT)
     log.info("API     : http://localhost:%s/api/health", config.HOST_PORT)
     log.info("Coder   : %s (mount %s)", config.CODER_ROOT_HOST, config.CODER_ROOT_MOUNT)
-    log.info("巡检    : 每 %s 秒一轮，异常最多自动重跑 %s 次",
+    log.info("巡检    : 每 %s 秒一轮，一侧最多跑 %s 次 / 超时 %s 次，用尽自动废弃整题",
              settings_store.get_int("watchdog.interval_seconds", watchdog.INTERVAL_DEFAULT),
-             settings_store.get_int("watchdog.max_retries", watchdog.MAX_RETRIES_DEFAULT))
-    log.info("并发    : 最多 %s 个容器（%s 道题同时跑）",
-             scheduler.max_parallel, scheduler.max_parallel // 2)
+             settings_store.get_int("watchdog.max_retries", watchdog.MAX_RETRIES_DEFAULT),
+             settings_store.get_int("watchdog.max_timeouts", watchdog.MAX_TIMEOUTS_DEFAULT))
+    log.info("并发    : 最多 %s 个容器，按容器排队（A、B 各排各的，跑完再配对）",
+             scheduler.max_parallel)
     log.info("=" * 60)
     yield
     await scheduler.stop()

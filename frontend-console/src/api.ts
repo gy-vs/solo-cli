@@ -45,8 +45,10 @@ export interface TaskRunBrief {
   id: number
   side: Side
   status: RunStatus
-  /** 第几次跑。重跑加一，超过上限就转人工 */
+  /** 第几次跑。重跑加一，用尽后整道题自动废弃 */
   attempt: number
+  /** 其中超时了几次。上限比普通重跑低，先撞到哪个算哪个 */
+  timeouts: number
   container_name: string
   container_exists: boolean
   image_tag: string
@@ -155,8 +157,16 @@ export interface TaskDetail extends TaskBrief {
   runs: TaskRunDetail[]
 }
 
-export interface GateCheck { name: string; level: 'ok' | 'warn' | 'block'; message: string; fix: string }
-export interface GateReport { passed: boolean; blocked: number; warnings: number; checks: GateCheck[] }
+export interface GateCheck { name: string; level: 'ok' | 'warn' | 'block'; message: string; fix: string; hard: boolean }
+/** hard_blocked 里的项强制启动也绕不过去，得先修好 */
+export interface GateReport {
+  passed: boolean
+  blocked: number
+  hard_blocked: string[]
+  hard_messages: string[]
+  warnings: number
+  checks: GateCheck[]
+}
 
 /** 领题时先 clone 两侧，分支不合规就不往下走 */
 export interface PrepareResult {
@@ -196,12 +206,36 @@ export interface SettingItem {
   default: string; configured: boolean; value: string
 }
 
+/** 排队中的一个容器。队列的单位是容器不是题，A 与 B 各排各的 */
+export interface QueueItem {
+  run_id: number; task_id: number; task_no: string; side: Side
+  attempt: number
+  /** 被看护退回来重跑的，跟第一次排队的区分开 */
+  requeued: boolean
+}
+
+export interface RunningItem {
+  run_id: number; task_no: string; side: Side; attempt: number; minutes: number
+}
+
 export interface SystemStatus {
   docker: { ok: boolean; message: string }
   image: { name: string; present: boolean }
-  /** 额度单位是容器：一道题占两个 */
-  scheduler: { running: number; max_parallel: number; running_ids: number[]; queued: number; paused: boolean }
-  watchdog: { interval_seconds: number; max_retries: number }
+  /** 额度与排队的单位都是容器：一个空槽放一个容器 */
+  scheduler: {
+    running: number; max_parallel: number; free: number; running_ids: number[]
+    running_runs: RunningItem[]
+    /** 在等的容器数；queued_tasks 才是题数 */
+    queued: number; queued_tasks: number; queue: QueueItem[]
+    paused: boolean
+    /** 调度循环的近况。alive 为假说明它停了，界面要喊出来 */
+    alive: boolean; last_tick_at: string | null; last_error: string
+  }
+  watchdog: {
+    interval_seconds: number; max_retries: number; max_timeouts: number
+    alive: boolean; last_tick_at: string | null; last_error: string
+    last_stats: { adopted?: number; requeued?: number; discarded?: number; advanced?: number }
+  }
   dedup: { ok: boolean; message: string; image: string }
   design: { running: number[] }
   counts: Record<Status, number>
@@ -213,6 +247,32 @@ export interface SystemStatus {
 }
 
 export interface RunEvent { seq: number; side?: Side; kind: string; summary: string; ts: string | null; payload: any }
+
+/** 一侧容器此刻的样子。全部现问 docker，跟收尾时记下的那份账无关 */
+export interface ContainerLive {
+  side: Side
+  name: string
+  run_status: RunStatus | ''
+  exists: boolean
+  status: string
+  running: boolean
+  exit_code: number | null
+  started_at: string | null
+  finished_at: string | null
+  oom_killed: boolean
+  error: string
+  image: string
+  cpu: string
+  mem: string
+  mem_perc: string
+  processes: { pid: string; time: string; cmd: string }[]
+  /** 容器里那个 claude 进程还在不在。事件流不动时，只有它能说明模型是否还在干活 */
+  claude_alive: boolean
+  last_log_at: string | null
+  /** 离最后一行日志过了多久。判「还在动」还是「卡住了」就看这个数 */
+  silent_seconds: number | null
+  last_log: string
+}
 
 // ---------- 接口 ----------
 export const api = {
@@ -255,6 +315,12 @@ export const api = {
     get<{ items: RunEvent[]; total: number; truncated: boolean }>(`/api/tasks/${id}/events/list${side ? '?side=' + side : ''}`),
   traceIndex: (id: number, side: Side) => get<any>(`/api/tasks/${id}/trace-index?side=${side}`),
   traceUrl: (id: number, side: Side) => `/api/tasks/${id}/trace?side=${side}`,
+
+  // ---- 容器实时 ----
+  containers: (id: number) => get<{ items: ContainerLive[]; at: string }>(`/api/tasks/${id}/containers`),
+  /** 容器原始 stdout 的实时流，给终端面板用（EventSource 直连） */
+  containerLogUrl: (id: number, side: Side, tail = 300) =>
+    `/api/tasks/${id}/container/logs?side=${side}&tail=${tail}`,
 
   // ---- GSB 分析与结论 ----
   analyze: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/analyze`),

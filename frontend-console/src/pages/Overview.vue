@@ -42,7 +42,7 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
         <div class="text-fg1 text-xs mt-0.5">设计题目 → 题库 → A/B 双容器同时跑 → 自动提交产物 → 自动对比出 GSB → 补录屏链接 → 上传</div>
       </div>
       <div class="ml-auto flex gap-2">
-        <NButton size="small" secondary :loading="importing" @click="doImport">重新扫描 prompt.md</NButton>
+        <NButton size="small" secondary :loading="importing" @click="doImport">重新扫描题面</NButton>
         <NButton size="small" secondary @click="router.push('/design')">设计题目</NButton>
         <NButton size="small" type="primary" @click="router.push('/bank')">去题库领题</NButton>
       </div>
@@ -51,10 +51,10 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
     <div class="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-6 gap-4">
       <Metric label="待领取" :value="counts?.AVAILABLE ?? '—'" />
       <Metric label="容器占用" :value="`${s?.scheduler.running ?? 0}/${s?.scheduler.max_parallel ?? '-'}`" :tone="HEX.run"
-        :sub="`${s?.running_sides ?? 0} 侧在跑`" />
+        :sub="`${s?.scheduler.queued ?? 0} 个容器在排队`" />
       <Metric label="等我录屏" :value="waitingScreencast.length" :tone="HEX.ok" sub="结论已出，只差链接" />
       <Metric label="今日上传" :value="s?.totals.uploaded ?? '—'" :tone="HEX.info" :sub="s?.totals.date" />
-      <Metric label="需人工" :value="counts?.NEEDS_ATTENTION ?? 0" :tone="HEX.err" sub="重跑用尽或推产物失败" />
+      <Metric label="需人工" :value="counts?.NEEDS_ATTENTION ?? 0" :tone="HEX.err" sub="推产物或质检没过" />
       <Metric label="已完成" :value="counts?.DONE ?? '—'" :tone="HEX.fg2"
         :sub="counts?.DISCARDED ? `另有 ${counts.DISCARDED} 题已废弃` : ''" />
     </div>
@@ -82,10 +82,13 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
         </div>
         <div class="inner px-3 py-2 space-y-1.5">
           <div class="flex items-center gap-2 text-xs">
-            <span class="dot bg-ok" />
-            <span class="text-fg1">看护</span>
+            <span class="dot" :class="s?.watchdog.alive && s?.scheduler.alive ? 'bg-ok' : 'bg-err'" />
+            <span class="text-fg1">调度与看护</span>
             <span class="ml-auto mono text-[12px] text-fg2">
-              每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 最多重跑 {{ s?.watchdog.max_retries ?? '-' }} 次
+              <template v-if="s?.watchdog.alive && s?.scheduler.alive">
+                每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 跑满 {{ s?.watchdog.max_retries ?? '-' }} 次即废弃
+              </template>
+              <span v-else class="text-err">后台循环已停止，队列不再前进</span>
             </span>
           </div>
           <div class="flex items-center gap-2 text-xs">
@@ -97,7 +100,7 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
         <div class="space-y-2 text-xs">
           <div class="flex items-center gap-2"><span class="dot" :class="s?.docker.ok ? 'bg-ok' : 'bg-err'" /><span class="text-fg1">Docker</span><span class="ml-auto mono text-fg0">{{ s?.docker.message || '—' }}</span></div>
           <div class="flex items-center gap-2"><span class="dot" :class="s?.image.present ? 'bg-ok' : 'bg-err'" /><span class="text-fg1">镜像</span><span class="ml-auto mono text-fg0 truncate max-w-[220px]" :title="s?.image.name">{{ s?.image.name?.split('/').pop() || '—' }}</span></div>
-          <div class="flex items-center gap-2"><span class="dot" :class="s?.paths.prompt_exists ? 'bg-ok' : 'bg-err'" /><span class="text-fg1">prompt.md</span><span class="ml-auto mono text-fg0 truncate max-w-[220px]" :title="s?.paths.prompt_file">{{ s?.paths.coder_root_host || '—' }}</span></div>
+          <div class="flex items-center gap-2"><span class="dot" :class="s?.paths.prompt_exists ? 'bg-ok' : 'bg-err'" /><span class="text-fg1">当前题面</span><span class="ml-auto mono text-fg0 truncate max-w-[220px]" :title="s?.paths.prompt_file">{{ s?.paths.coder_root_host || '—' }}</span></div>
           <div class="flex items-center gap-2"><span class="dot" :class="s?.configured['cc.api_key'] ? 'bg-ok' : 'bg-err'" /><span class="text-fg1">网关 Key</span><span class="ml-auto mono text-fg2">{{ s?.configured['cc.api_key'] ? '已配置' : '未配置' }}</span></div>
           <div class="flex items-center gap-2"><span class="dot" :class="s?.configured['gsb.session_cookie'] && s?.configured['gsb.csrf_token'] ? 'bg-ok' : 'bg-err'" /><span class="text-fg1">GSB 平台身份</span><span class="ml-auto mono text-fg2">{{ s?.configured['gsb.session_cookie'] ? '已配置' : '未配置' }}</span></div>
           <div class="flex items-center gap-2"><span class="dot" :class="s?.configured['gh.token'] ? 'bg-ok' : 'bg-warn'" /><span class="text-fg1">GitHub Token</span><span class="ml-auto mono text-fg2">{{ s?.configured['gh.token'] ? '已配置' : '未配置' }}</span></div>

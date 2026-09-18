@@ -46,13 +46,18 @@ SPECS: tuple[Spec, ...] = (
     Spec("cursor.api_key", "Cursor API Key", "Cursor CLI 分析", secret=True, help="cursor.com/dashboard/api 创建的 User API Key"),
     Spec("cursor.model", "分析模型", "Cursor CLI 分析", default="claude-opus-5-thinking-high", kind="select"),
     Spec("cursor.timeout_minutes", "分析超时（分钟）", "Cursor CLI 分析", default="40", kind="number"),
-    Spec("scheduler.max_parallel", "最大并发容器数", "调度", default="4", kind="number",
-         help="一道题占两个（A 与 B 成对启动），所以这里填偶数比较合适"),
+    Spec("scheduler.max_parallel", "最大并发容器数", "调度", default="8", kind="number",
+         help="上限由网关 Key 的并发决定：Key 允许 8 路并发就填 8。排队和额度的单位都是"
+              "容器，一个空槽放一个容器，A 与 B 各排各的队，两侧跑完再配对分析；"
+              "填奇数也不浪费槽位"),
     Spec("scheduler.paused", "暂停出队", "调度", default="0", kind="bool",
          help="暂停后队列不再启动新容器，已在跑的不受影响"),
     Spec("run.timeout_minutes", "单题运行超时（分钟）", "调度", default="120", kind="number"),
     Spec("gate.blacklist", "泄漏扫描黑名单（逗号分隔 glob）", "调度",
-         default="CLAUDE.md,AGENTS.md,.claude,.cursor,.cursorrules,*.mdc,prompt*.md,题*,需求文档,*.jsonl"),
+         default="CLAUDE.md,AGENTS.md,.claude,.cursor,.cursorrules,*.mdc,"
+                 "drafts,sessions,reports,staging,current.md,index.md,brief.md,"
+                 "prompt*.md,题*,需求文档,出题,轨迹,*.jsonl",
+         help="工作副本里出现这些就是出题资料漏进了映射目录。旧命名一并留着兜底"),
     Spec("auto.destroy_on_finish", "结束后自动销毁容器", "自动流水线", default="1", kind="bool",
          help="轨迹导出成功后才销毁；导出失败会保留容器等待人工处理"),
     Spec("auto.analyze", "两边跑完后自动 GSB 分析", "自动流水线", default="1", kind="bool"),
@@ -61,12 +66,17 @@ SPECS: tuple[Spec, ...] = (
     Spec("watchdog.interval_seconds", "守护扫描间隔（秒）", "守护", default="300", kind="number",
          help="扫异常重跑与配对触发分析；run 一结束会立刻唤醒一次，这个间隔只是兜底"),
     Spec("watchdog.max_retries", "自动重跑次数上限", "守护", default="3", kind="number",
-         help="指重跑次数，一个 run 最多跑 4 次；用尽后停下等人工"),
+         help="一侧最多跑几次，用尽后整道题自动废弃（可在废弃列表里恢复）。这和 CC 自己的"
+              "十次网关重试是两回事：那十次在容器内部发生，重试期间不介入，"
+              "只有重试用尽仍没跑成才算一次容器级重跑"),
+    Spec("watchdog.max_timeouts", "超时次数上限", "守护", default="2", kind="number",
+         help="超时单独计数，先撞到哪个上限就按哪个废弃。一次超时要烧掉一整个运行超时的"
+              "机器时间，所以容忍次数比普通重跑更低"),
     # qc.* 三项保留：solo-qa 质检已废弃，但出题查重还要靠它们把 solo-qa 源码挂进桥接容器
     Spec("qc.project_host", "solo-qa 项目路径（宿主机）", "题目查重", default="/Users/gaoyong/solo-qa-0908",
          help="挂进质检容器的源码与 .env 所在目录"),
-    Spec("qc.image", "质检镜像", "题目查重", default="solo-qa-backend:latest",
-         help="复用 solo-qa 自己的后端镜像，避免依赖版本冲突"),
+    Spec("qc.image", "质检镜像", "题目查重", default="solo2-backend:latest",
+         help="复用 solo-qa 自己的后端镜像（它的 compose 里就叫这个名），避免依赖版本冲突"),
     Spec("qc.timeout_minutes", "质检超时（分钟）", "题目查重", default="15", kind="number"),
     Spec("design.count", "默认设计题数", "题目设计", default="5", kind="number"),
     Spec("design.model", "设计模型", "题目设计", default="claude-opus-5-thinking-high", kind="select"),
@@ -75,6 +85,20 @@ SPECS: tuple[Spec, ...] = (
          help="命中规则 A 或 C 的题直接废弃，通过的留在题库队列"),
     Spec("gh.token", "GitHub Token", "题目设计", secret=True,
          help="出题要建仓库和推快照。本机执行 gh auth token 取值，需要 repo 权限"),
+    Spec("pool.enabled", "启用跨设备查重池", "跨设备查重池", default="0", kind="bool",
+         help="多台设备各自本地出题时，靠一个共享池互相查重。关掉则只查 solo-qa 的历史库，"
+              "另一台设备新出的题在本机不可见"),
+    Spec("pool.repo", "查重池仓库", "跨设备查重池",
+         help="GitHub 私有仓库，填 owner/repo 或完整 https 地址。仓库不存在会自动创建为 private。"
+              "池里存题面全文，必须是私有仓库"),
+    Spec("pool.device", "本机标识", "跨设备查重池", default="",
+         help="区分题目出自哪台设备，例如 mac-studio / mac-air。必填且两台设备不能重名："
+              "后端跑在容器里，不填会取到每次重建都变的容器 ID，同一道题会被反复当成新题入池"),
+    Spec("pool.similarity", "字面查重阈值", "跨设备查重池", default="0.45", kind="number",
+         help="题面归一化后的相似度上限，超过即判重。实测同一道题换措辞在 0.5 上下，"
+              "同基底的不同功能点在 0.3 上下，0.45 落在两者之间。往低调更容易误杀真题，"
+              "但被拒的候选只是没落地、日志里写明了相似度和撞的是哪道题；往高调会漏掉"
+              "同义改写的重复题，代价是两个容器白跑两小时"),
 )
 SPEC_BY_KEY = {s.key: s for s in SPECS}
 

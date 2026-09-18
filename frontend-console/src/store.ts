@@ -15,12 +15,35 @@ export async function refreshStatus() {
   try { store.status = await api.status() } catch { /* 顶栏会显示断连 */ }
 }
 
+/** 上一轮每道题的原样内容，用来认出「这题其实没变」 */
+const sigs = new Map<number, string>()
+
+/** 没变的题继续用原来那个对象。
+ *
+ * 整个数组换新的话，每道题都是一个新对象，卡片和列表行即使内容一字未改也要全部重画一遍。
+ * 而这个刷新是 SSE 一有动静就触发的，跑着的时候相当密集 —— 题一多，光是这一下就够卡。
+ * 保住没变那些的引用，Vue 才能整块跳过它们。
+ */
+function mergeTasks(items: TaskBrief[]) {
+  const prev = new Map(store.tasks.map((t) => [t.id, t]))
+  const next = items.map((n) => {
+    const sig = JSON.stringify(n)
+    const kept = sigs.get(n.id) === sig ? prev.get(n.id) : undefined
+    sigs.set(n.id, sig)
+    return kept || n
+  })
+  for (const id of sigs.keys()) if (!prev.has(id) && !items.some((n) => n.id === id)) sigs.delete(id)
+  // 一道都没变（顺序也一样）就连数组都不换，这一轮刷新对界面来说等于没发生
+  if (next.length === store.tasks.length && next.every((t, i) => t === store.tasks[i])) return
+  store.tasks = next
+}
+
 export async function refreshTasks() {
   store.loadingTasks = true
   try {
     // 一次取全（含已废弃），各页面按需过滤，避免切 tab 再发请求
     const r = await api.tasks({ include_discarded: true })
-    store.tasks = r.items
+    mergeTasks(r.items)
     store.lastRefresh = Date.now()
   } finally {
     store.loadingTasks = false
@@ -48,5 +71,24 @@ export function scheduleRefresh() {
   }, 250)
 }
 
+/** 界面上所有「已经跑了多久」共用的这一秒。
+ *
+ * 它每跳一下，凡是显示时长的列表行、卡片都要跟着重画一遍，所以标签页在后台时就停下来 ——
+ * 那时画给谁看都没有，白占着主线程，回到前台第一件事是把时间对上。
+ */
 export const nowMs = ref(Date.now())
-setInterval(() => { nowMs.value = Date.now() }, 1000)
+let clock: number | null = null
+
+function startClock() {
+  if (clock === null) clock = window.setInterval(() => { nowMs.value = Date.now() }, 1000)
+}
+function stopClock() {
+  if (clock !== null) { clearInterval(clock); clock = null }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    nowMs.value = Date.now()
+    startClock()
+  } else stopClock()
+})
+startClock()

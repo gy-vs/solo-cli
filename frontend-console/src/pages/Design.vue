@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /** 题目设计：输入数量 → Cursor CLI 跑 solo-prompt → 产出自动导入 → 规则 A+C 查重。 */
 import { NButton, NInput, NInputNumber, NTag, useMessage } from 'naive-ui'
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, type DesignCheck, type DesignRun } from '../api'
 import { DESIGN_LABEL, fmtDuration, fmtTime } from '../status'
@@ -16,11 +16,22 @@ const ready = ref(false)
 const runs = ref<DesignRun[]>([])
 const starting = ref(false)
 const openLog = ref<number | null>(null)
+const logBox = ref<HTMLElement | null>(null)
 let timer = 0
+
+/** agent 的进度是往后追加的，一行就够说明它正在哪一步 */
+const lastLine = (r: DesignRun) => (r.log_tail || '').trimEnd().split('\n').pop() || ''
+
+async function toggleLog(id: number) {
+  openLog.value = openLog.value === id ? null : id
+  await nextTick()
+  if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight
+}
 
 const CHECK_LABEL: Record<string, string> = {
   cursor_cli: 'Cursor CLI', cursor_key: 'Cursor API Key', skill: 'solo-prompt SOP',
   gh: 'GitHub CLI', gh_token: 'GitHub Token', requirements: '需求文档', dedup: '查重通道',
+  pool: '跨设备查重池',
 }
 /** 缺了就跑不起来的项；gh 类只影响建仓库那一步，先放行 */
 const BLOCKING = ['cursor_cli', 'cursor_key', 'skill', 'requirements']
@@ -37,7 +48,7 @@ async function load() {
   } catch (e: any) { msg.error(e.message) }
 }
 async function start() {
-  if (!confirm(`设计 ${count.value} 道题？出题会在工作区建仓库、写 出题/prompts，过程要跑一段时间。`)) return
+  if (!confirm(`设计 ${count.value} 道题？出题会在工作区建仓库、写 drafts/，过程要跑一段时间。`)) return
   starting.value = true
   try {
     await api.designStart(count.value, note.value)
@@ -119,7 +130,7 @@ onUnmounted(() => clearInterval(timer))
               <template v-if="r.stats?.discarded"> · <span class="text-err">查重废弃 {{ r.stats.discarded }}</span></template>
             </div>
             <div class="text-[12px] truncate" :class="r.error ? 'text-err' : 'text-fg2'">
-              {{ r.error || r.stats?.dedup_error || r.note || r.model }}
+              {{ r.error || r.stats?.dedup_error || (r.status === 'RUNNING' && lastLine(r)) || r.note || r.model }}
             </div>
           </div>
           <div class="mono text-[12px] text-fg2 nums">
@@ -129,7 +140,7 @@ onUnmounted(() => clearInterval(timer))
           <div class="flex items-center gap-1">
             <NButton v-if="['QUEUED', 'RUNNING', 'DEDUP'].includes(r.status)" size="tiny" quaternary @click="cancel(r)">取消</NButton>
             <NButton v-if="r.stats?.dedup_error && r.task_ids?.length" size="tiny" quaternary @click="redoDedup(r)">重跑查重</NButton>
-            <NButton size="tiny" quaternary @click="openLog = openLog === r.id ? null : r.id">
+            <NButton size="tiny" quaternary @click="toggleLog(r.id)">
               {{ openLog === r.id ? '收起' : '日志' }}
             </NButton>
           </div>
@@ -140,7 +151,8 @@ onUnmounted(() => clearInterval(timer))
             @click="router.push(`/bank?q=${no}`)">#{{ no }}</span>
         </div>
         <div v-if="openLog === r.id" class="px-4 pb-4">
-          <pre class="inner p-3 text-[12px] text-fg1 leading-5 max-h-[320px] overflow-auto whitespace-pre-wrap">{{ r.log_tail || '（还没有输出）' }}</pre>
+          <pre ref="logBox"
+            class="inner p-3 text-[12px] text-fg1 leading-5 max-h-[320px] overflow-auto whitespace-pre-wrap">{{ r.log_tail || '（还没有输出）' }}</pre>
         </div>
       </div>
     </div>

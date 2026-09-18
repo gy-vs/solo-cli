@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /** 运行中的题卡片。A、B 双列并排，两侧各自的实时事件分开走。 */
 import { NButton } from 'naive-ui'
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, SIDES, type RunEvent, type Side, type TaskBrief, type TaskRunBrief } from '../api'
+import { api, SIDES, type Side, type TaskBrief, type TaskRunBrief } from '../api'
+import { useRunFeed } from '../sse'
 import { fmtDuration, HEX, RUN_COLOR, RUN_LABEL, SIDE_HEX, STATUS_COLOR, STATUS_LABEL } from '../status'
 import { nowMs } from '../store'
 import StatusPill from './StatusPill.vue'
@@ -21,28 +22,16 @@ const bySide = computed(() => {
 })
 const liveSide = (s: Side) => bySide.value[s]?.status === 'RUNNING'
 
-// 一条流拿两侧事件，按 side 各留最近 3 条工具调用
-const recent = ref<Record<Side, RunEvent[]>>({ A: [], B: [] })
-let es: EventSource | null = null
-function connect() {
-  es?.close()
-  recent.value = { A: [], B: [] }
-  if (!live.value) return
-  es = new EventSource(`/api/tasks/${props.task.id}/events`)
-  es.onmessage = (e) => {
-    try {
-      const d = JSON.parse(e.data)
-      if (d.type !== 'event') return
-      if (!['assistant', 'user', 'system', 'stderr'].includes(d.kind)) return
-      const s: Side = d.side === 'B' ? 'B' : 'A'
-      const arr = [...recent.value[s], d]
-      if (arr.length > 3) arr.shift()
-      recent.value = { ...recent.value, [s]: arr }
-    } catch { /* ignore */ }
-  }
-}
-watch(live, connect, { immediate: true })
-onBeforeUnmount(() => es?.close())
+/** 只有真在跑的卡片跟着秒钟走。
+ *
+ * 排队中的题时长是「—」，跑完的题时长是个定数，可它们的模板一读这个每秒跳的值，Vue 就得
+ * 每秒把这张卡重画一遍。列表上二十几张卡是常态，全都这么跳，页面就一直在忙。
+ */
+const clock = computed(() => (live.value ? nowMs.value : Date.now()))
+
+/** 两侧各留最近 3 条动静。走公共流，卡片自己不占连接 —— 列表上同时跑五题也还是一条 */
+const { recent, clear } = useRunFeed(() => props.task.id, () => !!live.value)
+watch(live, clear)
 
 const turns = (r?: TaskRunBrief) => r?.protocol?.num_turns ?? r?.artifact?.tool_calls ?? '—'
 const tokens = (r?: TaskRunBrief) => {
@@ -84,7 +73,7 @@ async function stop(side?: Side) {
               :loading="stopping === s" @click="stop(s)">停</NButton>
           </div>
           <div class="grid grid-cols-3 gap-1 mono text-[11px] nums">
-            <div><div class="label">耗时</div><div class="text-fg0">{{ fmtDuration(bySide[s]?.started_at, bySide[s]?.finished_at, nowMs) }}</div></div>
+            <div><div class="label">耗时</div><div class="text-fg0">{{ fmtDuration(bySide[s]?.started_at, bySide[s]?.finished_at, clock) }}</div></div>
             <div><div class="label">轮次</div><div class="text-fg0">{{ turns(bySide[s]) }}</div></div>
             <div><div class="label">tokens</div><div class="text-fg0">{{ tokens(bySide[s]) }}</div></div>
           </div>

@@ -10,7 +10,10 @@
 
 services:
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        GH_DOWNLOAD_BASE: ${GH_DOWNLOAD_BASE:-https://github.com}
     container_name: solo-cli-backend
     environment:
       - DATA_DIR=/data

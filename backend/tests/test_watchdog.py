@@ -30,11 +30,27 @@ def test_clean_finished_run_is_not_abnormal():
     assert wd.abnormal_reason(_run()) == ""
 
 
-def test_gateway_error_is_abnormal():
-    r = _run(verdict={"process": {"gateway_errors": ["504"]},
+def test_gateway_error_alone_is_not_abnormal():
+    """CC 自带十次重试，中途报过 504 但最终跑完的，不该重跑。
+
+    以前只要 stderr 里出现过状态码就把整侧推倒重来，等于把一次已经成功的运行作废，
+    白烧一个多小时，还让本来能配对的两侧再次错开。
+    """
+    r = _run(verdict={"process": {"gateway_errors": ["504"],
+                                  "retries": {"attempt": 3, "max_retries": 10}},
                       "protocol": {"subtype": "success"},
                       "artifact": {"trace_found": True, "changed_files": 3}})
-    assert "504" in wd.abnormal_reason(r)
+    assert wd.abnormal_reason(r) == ""
+
+
+def test_failed_run_reports_exhausted_gateway_retries():
+    """重试用尽仍没跑成才介入，原因里要说清重试到了第几次。"""
+    r = _run(status=m.RUN_FAILED,
+             verdict={"process": {"gateway_errors": ["504"],
+                                  "retries": {"attempt": 10, "max_retries": 10}},
+                      "protocol": {}, "artifact": {}})
+    reason = wd.abnormal_reason(r)
+    assert "504" in reason and "10/10" in reason
 
 
 def test_nonzero_exit_code_is_abnormal():
@@ -83,13 +99,23 @@ def test_zero_change_count_but_diff_present_is_ok():
 
 
 def test_running_with_dead_container_is_abnormal():
-    r = _run(status=m.RUN_RUNNING, verdict={})
+    r = _run(status=m.RUN_RUNNING, verdict={}, started_at=m.utc_now())
     assert "已经不在了" in wd.abnormal_reason(r, container_alive=False)
 
 
 def test_running_with_live_container_is_fine():
-    r = _run(status=m.RUN_RUNNING, verdict={})
+    r = _run(status=m.RUN_RUNNING, verdict={}, started_at=m.utc_now())
     assert wd.abnormal_reason(r, container_alive=True) == ""
+
+
+def test_just_dispatched_run_is_not_judged_by_a_missing_container():
+    """出闸到容器拉起来之间有一段窗口，那会儿容器本来就不存在。
+
+    调度先占住 RUNNING 状态，runner 校验完起跑点才真正 docker run，started_at 是在
+    那之后才写的。不认这个窗口的话，每一次出闸都会被当场判成「容器没了」清掉重跑。
+    """
+    r = _run(status=m.RUN_RUNNING, verdict={}, started_at=None)
+    assert wd.abnormal_reason(r, container_alive=False) == ""
 
 
 def test_pending_run_is_not_abnormal():
@@ -109,14 +135,14 @@ def test_can_retry_respects_limit():
 
 def test_archive_traces_renames_nonempty_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(wd.config, "CODER_ROOT_MOUNT", tmp_path)
-    tr = tmp_path / "出题" / "轨迹" / "07" / "A"
+    tr = tmp_path / wd.config.TRACES_DIR / "07" / "A"
     tr.mkdir(parents=True)
     (tr / "a.jsonl").write_text("{}", encoding="utf-8")
 
     assert wd.archive_traces("07", "A")["ok"] is True
     # 原目录整体改名走了，下次跑之前 runner 会重新建一个空的
     assert not tr.exists()
-    archived = list((tmp_path / "出题" / "轨迹" / "07").glob("A.archived-*"))
+    archived = list((tmp_path / wd.config.TRACES_DIR / "07").glob("A.archived-*"))
     assert len(archived) == 1
     # 归档是改名不是删除：上一次的轨迹是判「为什么异常」的唯一材料
     assert (archived[0] / "a.jsonl").exists()
@@ -124,7 +150,7 @@ def test_archive_traces_renames_nonempty_dir(monkeypatch, tmp_path):
 
 def test_archive_traces_noop_when_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(wd.config, "CODER_ROOT_MOUNT", tmp_path)
-    (tmp_path / "出题" / "轨迹" / "07" / "A").mkdir(parents=True)
+    (tmp_path / wd.config.TRACES_DIR / "07" / "A").mkdir(parents=True)
     assert wd.archive_traces("07", "A")["ok"] is True
 
 
@@ -132,7 +158,7 @@ def test_archive_traces_noop_when_empty(monkeypatch, tmp_path):
 
 @pytest.fixture()
 def stub_side_effects(monkeypatch, tmp_path):
-    calls = {"removed": [], "reset": []}
+    calls = {"removed": [], "reset": [], "wiped": []}
 
     async def remove(name):
         calls["removed"].append(name)
@@ -140,12 +166,36 @@ def stub_side_effects(monkeypatch, tmp_path):
 
     async def reset(task_no, side, snapshot):
         calls["reset"].append(side)
-        return {"ok": True, "message": f"{side} 已退回"}
+        return {"ok": True, "mode": "reset", "message": f"{side} 已退回"}
+
+    async def rebuild(task_no, repo_url, side, snapshot):
+        calls["wiped"].append(side)
+        return {"ok": True, "archived": "", "message": f"{side} 已从主干重建"}
 
     monkeypatch.setattr(wd.dockerx, "remove_container", remove)
     monkeypatch.setattr(wd.gsb_repo, "reset_side", reset)
+    monkeypatch.setattr(wd.gsb_repo, "rebuild_side", rebuild)
     monkeypatch.setattr(wd.config, "CODER_ROOT_MOUNT", tmp_path)
+    monkeypatch.setattr(wd.config, "EXPORT_DIR", tmp_path / "exports")
     return calls
+
+
+def _lay_out_last_run(task_no: str = "07") -> dict:
+    """铺一份上一跑留下的东西：两侧的导出轨迹与索引，加题级的分析中间产物。"""
+    made = {}
+    for side in ("A", "B"):
+        paths = wd.config.TaskPaths(task_no, side)
+        paths.export.mkdir(parents=True, exist_ok=True)
+        jsonl = paths.export / f"{side.lower()}-old.jsonl"
+        jsonl.write_text("{}", encoding="utf-8")
+        paths.analysis.mkdir(parents=True, exist_ok=True)
+        paths.trace_index.write_text('{"steps": []}', encoding="utf-8")
+        made[side] = (jsonl, paths.trace_index)
+    analysis = wd.config.TaskPaths(task_no).analysis
+    (analysis / "gsb_prompt.md").write_text("上一跑的 prompt", encoding="utf-8")
+    (analysis / "gsb_raw.txt").write_text("上一跑的原始输出", encoding="utf-8")
+    made["dir"] = analysis
+    return made
 
 
 def test_requeue_clears_previous_result_and_events(task_with_runs, stub_side_effects):
@@ -182,21 +232,101 @@ def test_requeue_clears_previous_result_and_events(task_with_runs, stub_side_eff
         assert db.query(m.RunEvent).filter(m.RunEvent.side == "B").count() == 1
 
 
-def test_requeue_removes_container_then_resets(task_with_runs, stub_side_effects):
+def test_requeue_clears_exported_trace_and_index(task_with_runs, stub_side_effects):
+    """导出的 jsonl 和轨迹索引都是下游直接读的，留着会让质检和分析用上一跑的过程。"""
+    _, ids = task_with_runs
+    made = _lay_out_last_run()
+
+    assert asyncio.run(wd.requeue_run(ids["A"], reason="超时"))["ok"] is True
+
+    jsonl_a, index_a = made["A"]
+    assert not jsonl_a.exists()
+    assert not index_a.exists()
+    # 另一侧没重跑，它的材料一个都不能动
+    jsonl_b, index_b = made["B"]
+    assert jsonl_b.exists() and index_b.exists()
+
+
+def test_requeue_clears_analysis_conclusion(task_with_runs, stub_side_effects):
+    """结论是两侧比出来的，一侧重跑它就作废了；不清的话上传交出去的是上一跑的结论。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    made = _lay_out_last_run()
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.analysis_status = m.ANALYSIS_DONE
+        t.analysis = {"model": "x", "raw": {"verdict": "A"}}
+        t.gsb = {"verdict": "A", "reason": "上一跑的理由"}
+        t.verify = {"overall": "pass"}
+        t.gsb_qc = {"ok": True, "passed": True}
+
+    asyncio.run(wd.requeue_run(ids["B"], reason="人工重跑"))
+
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        assert t.analysis_status == m.ANALYSIS_IDLE
+        assert t.analysis == {} and t.gsb == {} and t.verify == {} and t.gsb_qc == {}
+    assert not (made["dir"] / "gsb_prompt.md").exists()
+    assert not (made["dir"] / "gsb_raw.txt").exists()
+
+
+def test_requeue_drops_only_the_rerun_sides_screencast(task_with_runs, stub_side_effects):
+    """录的是那一侧的产物，重跑之后得重录；另一侧的录屏还作数。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        db.get(m.Task, task_id).screencast = {"A": "https://v/a.mp4", "B": "https://v/b.mp4"}
+
+    asyncio.run(wd.requeue_run(ids["A"], reason="超时"))
+
+    with session() as db:
+        assert db.get(m.Task, task_id).screencast == {"B": "https://v/b.mp4"}
+
+
+def test_requeue_lets_the_pair_be_analyzed_again(task_with_runs, stub_side_effects):
+    """配对扫描只挑 analysis_status 为 IDLE 的题。不复位，两侧重跑完也等不来分析。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        db.get(m.Task, task_id).analysis_status = m.ANALYSIS_DONE
+
+    asyncio.run(wd.requeue_run(ids["A"], reason="超时"))
+    with session() as db:
+        for run_id in ids.values():
+            run = db.get(m.TaskRun, run_id)
+            run.status = m.RUN_FINISHED
+            run.verdict = _run().verdict
+
+    assert wd._pairs_ready() == [task_id]
+
+
+def test_requeue_removes_container_then_rebuilds(task_with_runs, stub_side_effects):
+    """默认走完全重建：销毁容器，再把这一侧从主干在初始快照上重新开一份。"""
     task_id, ids = task_with_runs
     asyncio.run(wd.requeue_run(ids["B"], reason="超时"))
     assert stub_side_effects["removed"] == ["solo-cc-07-B"]
+    assert stub_side_effects["wiped"] == ["B"]
+    assert stub_side_effects["reset"] == []
+
+
+def test_requeue_can_fall_back_to_plain_reset(task_with_runs, stub_side_effects):
+    _, ids = task_with_runs
+    asyncio.run(wd.requeue_run(ids["B"], reason="超时", full=False))
     assert stub_side_effects["reset"] == ["B"]
+    assert stub_side_effects["wiped"] == []
 
 
-def test_requeue_stops_if_reset_fails(task_with_runs, stub_side_effects, monkeypatch):
-    """reset 失败还往下走，会拿上一次的改动当起点，产物快照的父提交就对不上了。"""
+def test_requeue_stops_if_rollback_fails(task_with_runs, stub_side_effects, monkeypatch):
+    """回退失败还往下走，会拿上一次的改动当起点，产物快照的父提交就对不上了。"""
     from app.db import session
 
-    async def bad_reset(task_no, side, snapshot):
+    async def bad_rebuild(task_no, repo_url, side, snapshot):
         return {"ok": False, "message": "本地有冲突"}
 
-    monkeypatch.setattr(wd.gsb_repo, "reset_side", bad_reset)
+    monkeypatch.setattr(wd.gsb_repo, "rebuild_side", bad_rebuild)
     task_id, ids = task_with_runs
     r = asyncio.run(wd.requeue_run(ids["A"], reason="超时"))
     assert r["ok"] is False
@@ -230,16 +360,213 @@ def test_manual_rerun_one_side_only(task_with_runs, stub_side_effects):
         assert db.get(m.TaskRun, ids["A"]).status == m.RUN_PENDING
 
 
-def test_give_up_flags_task_for_human(task_with_runs):
+def test_give_up_discards_the_whole_task(task_with_runs, stub_side_effects):
+    """一侧修不好，整道题就废弃：另一侧再跑也交不出去，不能让它继续占容器。"""
     from app.db import session
 
     task_id, ids = task_with_runs
     asyncio.run(wd.give_up(ids["A"], "网关 504 连着三次"))
     with session() as db:
         task = db.get(m.Task, task_id)
-        assert task.status == m.NEEDS_ATTENTION
+        assert task.status == m.DISCARDED
+        assert task.discarded_from == m.QUEUED      # 恢复时按它回退
         assert "504" in task.auto_error
         assert db.get(m.TaskRun, ids["A"]).abnormal["gave_up"] is True
+
+
+def test_discard_stops_the_other_side_still_running(task_with_runs, stub_side_effects,
+                                                    monkeypatch):
+    """废弃时另一侧可能还在跑，容器要停掉，槽位立刻还给队列。"""
+    from app.db import session
+    from app.services import runner
+
+    task_id, ids = task_with_runs
+    stopped = []
+    with session() as db:
+        db.get(m.TaskRun, ids["B"]).status = m.RUN_RUNNING
+
+    async def stop_run(rid):
+        stopped.append(rid)
+        return {"ok": True, "message": ""}
+
+    monkeypatch.setattr(runner, "stop_run", stop_run)
+    asyncio.run(wd.discard_task(task_id, "超时两次"))
+
+    assert stopped == [ids["B"]]
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.DISCARDED
+        assert db.get(m.TaskRun, ids["B"]).status == m.RUN_INTERRUPTED
+
+
+# ---------------- 重跑预算 ----------------
+
+def test_retry_budget_allows_reruns_until_the_limit():
+    assert wd.discard_reason(_run(attempt=1), 3, 2) == ""
+    assert wd.discard_reason(_run(attempt=2), 3, 2) == ""
+    assert "上限 3" in wd.discard_reason(_run(attempt=3), 3, 2)
+
+
+def test_timeouts_have_their_own_lower_limit():
+    """超时一次就烧掉一整个运行超时，容忍次数比普通重跑低。"""
+    assert wd.discard_reason(_run(attempt=1, timeouts=1), 3, 2) == ""
+    assert "超时 2 次" in wd.discard_reason(_run(attempt=1, timeouts=2), 3, 2)
+
+
+def test_requeue_counts_the_timeout_before_clearing_it(task_with_runs, stub_side_effects):
+    """超时得在重跑前记一笔，不然状态一清这笔账就没了，上限永远撞不到。"""
+    from app.db import session
+
+    _task_id, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).status = m.RUN_TIMEOUT
+
+    asyncio.run(wd.requeue_run(ids["A"], reason="超时"))
+    with session() as db:
+        run = db.get(m.TaskRun, ids["A"])
+        assert run.timeouts == 1
+        assert run.attempt == 2
+        assert run.status == m.RUN_QUEUED
+
+
+def test_manual_rerun_clears_the_timeout_tally(task_with_runs, stub_side_effects):
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).timeouts = 2
+
+    asyncio.run(wd.manual_rerun(task_id, sides=("A",)))
+    with session() as db:
+        assert db.get(m.TaskRun, ids["A"]).timeouts == 0
+
+
+def _broken_run(ids, side="A", **fields):
+    """把一侧摆成「跑挂了」的样子。"""
+    from app.db import session
+
+    with session() as db:
+        r = db.get(m.TaskRun, ids[side])
+        r.status = m.RUN_FAILED
+        r.verdict = {"process": {"exit_code": 1}, "protocol": {}, "artifact": {}}
+        for k, v in fields.items():
+            setattr(r, k, v)
+
+
+def test_scan_discards_the_task_once_reruns_run_out(task_with_runs, stub_side_effects,
+                                                    monkeypatch):
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=3)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    monkeypatch.setattr(wd.settings_store, "get_int",
+                        lambda k, d=0: {"watchdog.max_retries": 3, "watchdog.max_timeouts": 2}.get(k, d))
+
+    asyncio.run(wd._scan_abnormal())
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.DISCARDED
+
+
+def test_scan_discards_the_task_after_two_timeouts(task_with_runs, stub_side_effects,
+                                                   monkeypatch):
+    """次数还有富余，但超时已经两次 —— 先撞到哪个上限就按哪个废弃。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=1, timeouts=2)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    monkeypatch.setattr(wd.settings_store, "get_int",
+                        lambda k, d=0: {"watchdog.max_retries": 3, "watchdog.max_timeouts": 2}.get(k, d))
+
+    asyncio.run(wd._scan_abnormal())
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.DISCARDED
+        assert "超时 2 次" in db.get(m.Task, task_id).auto_error
+
+
+def test_failed_rerun_prep_waits_for_the_next_round(task_with_runs, monkeypatch):
+    """重跑没准备成是环境的事，不占重跑次数，题也不该当场废弃。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=1)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+
+    async def failing(run_id, *, reason, reset_attempt=False):
+        return {"ok": False, "message": "GitHub 连不上"}
+
+    monkeypatch.setattr(wd, "requeue_run", failing)
+    asyncio.run(wd._scan_abnormal())
+
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.QUEUED
+        assert db.get(m.TaskRun, ids["A"]).abnormal["prep_failures"] == 1
+
+
+def test_rerun_prep_failing_over_and_over_does_discard(task_with_runs, monkeypatch):
+    """但环境一直坏着也不能每五分钟空转一次，攒够次数照样废弃。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=1)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+
+    async def failing(run_id, *, reason, reset_attempt=False):
+        return {"ok": False, "message": "GitHub 连不上"}
+
+    monkeypatch.setattr(wd, "requeue_run", failing)
+    for _ in range(3):
+        asyncio.run(wd._scan_abnormal())
+
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.DISCARDED
+
+
+def test_scan_leaves_runs_that_still_have_a_coroutine_watching(task_with_runs, monkeypatch):
+    """有协程守着的 run 不判异常，哪怕这一刻容器已经不在 running 了。
+
+    守着的协程正等容器结束，容器一退它就收尾 —— 这里看到的「容器没了」多半就是那
+    半秒钟的窗口。抢在它前面判，会把一次刚跑完、甚至跑满两小时的运行清掉重跑。
+    """
+    from app.db import session
+    from app.services.scheduler import scheduler
+
+    _task_id, ids = task_with_runs
+    with session() as db:
+        r = db.get(m.TaskRun, ids["A"])
+        r.status = m.RUN_RUNNING
+        r.started_at = m.utc_now()
+
+    async def boom(*a, **kw):
+        raise AssertionError("有协程守着，不该来碰它")
+
+    monkeypatch.setattr(wd, "requeue_run", boom)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    monkeypatch.setitem(scheduler.running, ids["A"], object())
+    try:
+        asyncio.run(wd._scan_abnormal())
+    finally:
+        scheduler.running.pop(ids["A"], None)
+
+    with session() as db:
+        assert db.get(m.TaskRun, ids["A"]).status == m.RUN_RUNNING
+
+
+def test_scan_ignores_tasks_already_out_of_the_pipeline(task_with_runs, monkeypatch):
+    """已经上传或废弃的题不再每轮扫一遍，它们的 run 怎么样都不必再管。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=1)
+    with session() as db:
+        db.get(m.Task, task_id).status = m.UPLOADED
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+
+    async def boom(*a, **kw):
+        raise AssertionError("不该来碰这道题")
+
+    monkeypatch.setattr(wd, "requeue_run", boom)
+    asyncio.run(wd._scan_abnormal())
 
 
 # ---------------- 配对推进 ----------------
@@ -271,6 +598,130 @@ def test_pairs_ready_needs_both_sides_finished(task_with_runs):
     assert wd._pairs_ready() == [task_id]
 
 
+# ---------------- 收养孤儿 ----------------
+
+@pytest.fixture()
+def stub_container(monkeypatch):
+    """让 watchdog 看到一个指定状态的容器，并记录有没有去收尾。"""
+    seen = {"finalized": []}
+    state = {"value": "exited", "code": 0}
+
+    async def container_state(name):
+        return state["value"]
+
+    async def container_exit_code(name):
+        return state["code"]
+
+    async def finalize(run_id, **kw):
+        seen["finalized"].append((run_id, kw))
+
+    monkeypatch.setattr(wd.dockerx, "container_state", container_state)
+    monkeypatch.setattr(wd.dockerx, "container_exit_code", container_exit_code)
+    from app.services import runner
+
+    monkeypatch.setattr(runner, "finalize", finalize)
+    return seen, state
+
+
+def test_orphan_run_with_exited_container_is_finalized(task_with_runs, stub_container):
+    """容器跑完退出了、协程却没了的 run，要补记账而不是判异常。
+
+    这一侧退出码是 0、轨迹也落盘了，是一次跑完的运行，只是没人记账。按「容器不见了」
+    判异常会把它整个清掉重跑，一个多小时的结果就白跑了。
+    """
+    from app.db import session
+
+    seen, _ = stub_container
+    _, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).status = m.RUN_RUNNING
+    asyncio.run(wd._scan_orphans())
+    assert [r for r, _ in seen["finalized"]] == [ids["A"]]
+    assert seen["finalized"][0][1]["exit_code"] == 0
+    assert seen["finalized"][0][1]["container_gone"] is False
+
+
+def test_orphan_scan_leaves_live_containers_alone(task_with_runs, stub_container):
+    from app.db import session
+
+    seen, state = stub_container
+    state["value"] = "running"
+    _, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).status = m.RUN_RUNNING
+    asyncio.run(wd._scan_orphans())
+    assert seen["finalized"] == []
+
+
+def test_orphan_scan_reports_a_vanished_container_as_such(task_with_runs, stub_container):
+    """容器连记录都没了，如实报「容器没了」，不要替人认下「我按的停止」。
+
+    认成人工停止的话，abnormal_reason 会直接放行（人工停止不自动重跑），
+    而这一侧又不是 FINISHED，配对扫描也不管 —— 题目就此永久卡死。
+    """
+    from app.db import session
+
+    seen, state = stub_container
+    state["value"] = ""
+    _, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).status = m.RUN_RUNNING
+    asyncio.run(wd._scan_orphans())
+    assert seen["finalized"][0][1]["container_gone"] is True
+    assert "manual_stop" not in seen["finalized"][0][1]
+
+
+def test_orphan_scan_skips_runs_the_scheduler_still_watches(task_with_runs, stub_container,
+                                                            monkeypatch):
+    """还有协程守着的不插手，否则会和 runner 抢着收尾，记两遍账。"""
+    from app.db import session
+    from app.services.scheduler import scheduler
+
+    seen, _ = stub_container
+    _, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).status = m.RUN_RUNNING
+    monkeypatch.setitem(scheduler.running, ids["A"], object())
+    asyncio.run(wd._scan_orphans())
+    assert seen["finalized"] == []
+
+
+def test_scan_abnormal_never_opens_a_nested_session(task_with_runs, monkeypatch):
+    """巡检里不许在已开的会话中再开一条连接。
+
+    settings_store 每次取值都会自己开会话。以前 can_retry 就是在 with session() 里被
+    调用的，于是每轮巡检都要在已有事务中新建连接，而库文件在 Docker Desktop 的
+    bind mount 上，第二条连接跑 PRAGMA journal_mode=WAL 会抛 disk I/O error。
+    结果是定时任务每 5 分钟静静地挂一次：异常不处理、配对不推进，线上整整一小时
+    没有推进任何一道题，日志里只有一条看不懂的磁盘报错。
+    """
+    from contextlib import contextmanager
+
+    from app import db as db_mod
+    from app.services import settings_store
+
+    real = db_mod.session
+    depth = {"now": 0, "max": 0}
+
+    @contextmanager
+    def counting_session():
+        depth["now"] += 1
+        depth["max"] = max(depth["max"], depth["now"])
+        try:
+            with real() as s:
+                yield s
+        finally:
+            depth["now"] -= 1
+
+    monkeypatch.setattr(wd, "session", counting_session)
+    monkeypatch.setattr(settings_store, "session", counting_session)
+
+    _, ids = task_with_runs
+    _finish_both(ids)
+    asyncio.run(wd._scan_abnormal())
+    assert depth["max"] == 1, f"巡检里出现了嵌套会话，最深 {depth['max']} 层"
+
+
 def test_pairs_ready_skips_abnormal_side(task_with_runs):
     from app.db import session
 
@@ -278,7 +729,7 @@ def test_pairs_ready_skips_abnormal_side(task_with_runs):
     _finish_both(ids)
     with session() as db:
         run = db.get(m.TaskRun, ids["B"])
-        run.verdict = {"process": {"gateway_errors": ["504"]},
+        run.verdict = {"process": {"exit_code": 1},
                        "protocol": {"subtype": "success"},
                        "artifact": {"trace_found": True, "changed_files": 1}}
     assert wd._pairs_ready() == []
@@ -335,6 +786,59 @@ def test_push_artifacts_skips_sides_already_pushed(task_with_runs, monkeypatch):
     assert seen == ["B"]
 
 
+def test_push_artifacts_clears_stale_failure_note(task_with_runs, monkeypatch):
+    """上一轮失败留下的那句话，推成功之后要擦掉。
+
+    不擦的话产物早就推上去了、分析也跑完了，界面上还挂着「push 失败，检查 Token
+    写权限」，人只会跑去翻权限设置，而实际上什么都不用做。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    with session() as db:
+        db.get(m.Task, task_id).auto_error = "B 侧推送失败：原因不明，检查网络与 Token 的 repo 写权限"
+
+    async def push(task_no, repo_url, side, snapshot, *, message):
+        return {"ok": True, "sha": side.lower() * 40, "url": "u"}
+
+    monkeypatch.setattr(wd.gsb_repo, "commit_and_push", push)
+    assert asyncio.run(wd.push_artifacts(task_id))["ok"] is True
+    with session() as db:
+        assert db.get(m.Task, task_id).auto_error == ""
+
+
+def test_advance_pair_rejects_reentry_while_running(task_with_runs, monkeypatch):
+    """巡检和界面上那个「提交产物并分析」撞在一起时，后来的那个要被挡回去。
+
+    不挡的话两边各推一遍产物：推同一个分支的两条 push 里落后的那条被远端拒掉，
+    接着它把「push 失败」写进 auto_error，盖掉另一条已经成功的事实。
+    """
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    calls = []
+    second = {}
+
+    async def push(tid):
+        # 第一次推送还没回来时插一次调用，模拟人正好在这几秒里点了按钮
+        calls.append(tid)
+        second.update(await wd.advance_pair(tid))
+        return {"ok": False, "message": "先不往下走"}
+
+    async def remove(name):
+        return True
+
+    monkeypatch.setattr(wd, "push_artifacts", push)
+    monkeypatch.setattr(wd.dockerx, "remove_container", remove)
+    asyncio.run(wd.advance_pair(task_id))
+
+    assert calls == [task_id]        # 推送只跑了一遍，没有第二次推同一个分支
+    assert second["ok"] is False
+    assert "正在推进" in second["message"]
+    # 挡回去之后标记要清掉，否则这道题以后再也推不动
+    assert task_id not in wd._advancing
+
+
 def test_push_failure_does_not_count_as_retry(task_with_runs, monkeypatch):
     """推送失败是我这边的事，不是模型的事，不能吃掉重跑次数。"""
     from app.db import session
@@ -380,3 +884,357 @@ def test_advance_pair_keeps_container_when_trace_missing(task_with_runs, monkeyp
     monkeypatch.setattr(wd.gsb_repo, "commit_and_push", push)
     asyncio.run(wd.advance_pair(task_id))
     assert removed == ["solo-cc-07-B"]
+
+
+# ---------------- 质检结论折成给人看的一句话 ----------------
+
+def test_qc_note_is_empty_when_passed():
+    """通过时要把上一轮的报错清掉，不能留着旧结论误导人。"""
+    assert wd._qc_note({"ok": True, "passed": True, "summary": "全部通过"}) == ""
+
+
+def test_qc_note_separates_platform_failure_from_rejection():
+    """质检压根没跑成，和这道题被打回，是两件事。"""
+    note = wd._qc_note({"ok": False, "error": "查重池连不上"})
+    assert "质检未完成" in note and "查重池连不上" in note
+
+
+def test_incomplete_conclusion_tells_people_to_rerun_not_to_fix():
+    """INCOMPLETE 是平台侧没跑完，让人去改理由就是白费工。"""
+    note = wd._qc_note({
+        "ok": True, "passed": False, "incomplete": True,
+        "conclusion": "INCOMPLETE", "summary": "分支与起跑点未能核验",
+    })
+    assert "重跑" in note
+    assert "打回" not in note and "废弃" not in note
+
+
+def test_qc_note_carries_the_rule_that_was_hit():
+    note = wd._qc_note({
+        "ok": True, "passed": False, "conclusion": "REJECT",
+        "hit_rule": "T4", "hit_rule_label": "轨迹规则 T4 · 上传了多份轨迹文件",
+        "summary": "A 侧传了 2 个文件",
+    })
+    assert "打回" in note and "T4" in note and "A 侧传了 2 个文件" in note
+
+
+def test_discard_and_reject_are_worded_differently():
+    """废弃是这条数据作废，打回是改完再交，两者的下一步动作不同。"""
+    common = {"ok": True, "passed": False, "summary": "题面与已有数据重复"}
+    discard = wd._qc_note({**common, "conclusion": "DISCARD"})
+    reject = wd._qc_note({**common, "conclusion": "REJECT"})
+    assert "废弃" in discard
+    assert "打回" in reject
+
+
+# ---------------- 容器没了 ≠ 人按了停止 ----------------
+
+def test_vanished_container_with_trace_counts_as_finished():
+    """advance_pair 推进成功后会主动销毁容器，容器没了不代表这次跑坏了。"""
+    from app.services import runner
+
+    status, adopted = runner.decide_status(
+        timed_out=False, manual_stop=False, result_event={},
+        exit_code=None, has_trace=True, container_gone=True)
+    assert status == m.RUN_FINISHED
+    assert adopted is True
+
+
+def test_vanished_container_without_trace_is_still_interrupted():
+    """没轨迹就没有跑过的证据，这种才是真的断了。"""
+    from app.services import runner
+
+    status, _ = runner.decide_status(
+        timed_out=False, manual_stop=False, result_event={},
+        exit_code=None, has_trace=False, container_gone=True)
+    assert status == m.RUN_INTERRUPTED
+
+
+def test_explicit_stop_still_wins_over_trace():
+    """人按的停止是事实不是推断，有轨迹也照样算中断。"""
+    from app.services import runner
+
+    status, _ = runner.decide_status(
+        timed_out=False, manual_stop=True, result_event={},
+        exit_code=None, has_trace=True, container_gone=True)
+    assert status == m.RUN_INTERRUPTED
+
+
+def test_vanished_container_does_not_get_the_manual_stop_pass():
+    """这是那次死锁的回归测试。
+
+    容器没了被记成 manual_stop 时，abnormal_reason 会直接放行（人工停止不自动重跑），
+    而这一侧又不是 FINISHED，配对扫描同样不管它 —— 两边都不接手，题目永久卡死。
+    """
+    run = m.TaskRun(side="A", status=m.RUN_INTERRUPTED, attempt=1,
+                    container_name="solo-cc-07-A")
+    run.verdict = {"process": {"manual_stop": False, "exit_code": None}}
+    assert wd.abnormal_reason(run) != ""
+
+
+# ---------------- 「零改动」下手前要复核 ----------------
+
+def _exited(*_a, **_kw):
+    async def go(*a, **k):
+        return "exited"
+    return go
+
+
+def _zero_change_run(ids, side="A"):
+    from app.db import session
+
+    with session() as db:
+        r = db.get(m.TaskRun, ids[side])
+        r.status = m.RUN_FINISHED
+        r.git_diff_stat = ""
+        r.verdict = {"process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+                     "artifact": {"trace_found": True, "changed_files": 0}}
+
+
+def test_zero_change_is_rechecked_before_a_rerun(task_with_runs, monkeypatch):
+    """收尾读到的零改动可能是假的，清掉重跑之前要实测一次。
+
+    两种假法：产物已 commit（工作区自然干净），或容器刚退、文件还没同步过来。
+    不复核就会把一次做满了活的运行整个清掉重跑。
+    """
+    from app.db import session
+
+    _, ids = task_with_runs
+    _zero_change_run(ids)
+    requeued = []
+
+    async def measure(ws, base_sha="", *, settle=False):
+        return 7, "src/a.ts | 3 +-"
+
+    async def requeue(run_id, *, reason, reset_attempt=False):
+        requeued.append(run_id)
+        return {"ok": True, "message": ""}
+
+    from app.services import runner
+    monkeypatch.setattr(runner, "workspace_output", measure)
+    monkeypatch.setattr(wd, "requeue_run", requeue)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+
+    asyncio.run(wd._scan_abnormal())
+
+    assert requeued == []
+    with session() as db:
+        run = db.get(m.TaskRun, ids["A"])
+        assert run.verdict["artifact"]["changed_files"] == 7
+        assert run.git_diff_stat == "src/a.ts | 3 +-"
+
+
+def test_really_empty_run_still_gets_requeued(task_with_runs, monkeypatch):
+    """复核确认真的什么都没有，该重跑还是要重跑。"""
+    _, ids = task_with_runs
+    _zero_change_run(ids)
+    requeued = []
+
+    async def measure(ws, base_sha="", *, settle=False):
+        return 0, ""
+
+    async def requeue(run_id, *, reason, reset_attempt=False):
+        requeued.append(run_id)
+        return {"ok": True, "message": ""}
+
+    from app.services import runner
+    monkeypatch.setattr(runner, "workspace_output", measure)
+    monkeypatch.setattr(wd, "requeue_run", requeue)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+
+    asyncio.run(wd._scan_abnormal())
+    assert requeued == [ids["A"]]
+
+
+def test_revoked_misjudgement_puts_the_task_back_in_the_flow(task_with_runs, monkeypatch):
+    """异常是我们自己判错的，撤销之后要把题从「需人工」放回去。
+
+    配对扫描够不着 NEEDS_ATTENTION 的题。撤销了判定却不开门，这道题就谁也不碰了：
+    异常已经不成立，配对又轮不到它，看上去就是看护彻底失灵。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _zero_change_run(ids)
+    with session() as db:
+        db.get(m.TaskRun, ids["B"]).status = m.RUN_FINISHED
+        db.get(m.TaskRun, ids["B"]).verdict = {
+            "process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+            "artifact": {"trace_found": True, "changed_files": 4}}
+        db.get(m.TaskRun, ids["B"]).git_diff_stat = "src/b.ts | 1 +"
+        db.get(m.Task, task_id).status = m.NEEDS_ATTENTION
+        db.get(m.Task, task_id).auto_error = "工作目录零改动，疑似戛然而止"
+
+    async def measure(ws, base_sha="", *, settle=False):
+        return 6, "src/a.ts | 3 +-"
+
+    from app.services import runner
+    monkeypatch.setattr(runner, "workspace_output", measure)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+
+    asyncio.run(wd._scan_abnormal())
+
+    with session() as db:
+        task = db.get(m.Task, task_id)
+        assert task.status == m.RUN_DONE
+        assert task.auto_error == ""
+
+
+def test_other_reasons_for_attention_are_left_to_people(task_with_runs, monkeypatch):
+    """另一侧还有真异常时不能放回去，那不是误判。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _zero_change_run(ids)
+    with session() as db:
+        db.get(m.TaskRun, ids["B"]).status = m.RUN_FAILED
+        db.get(m.TaskRun, ids["B"]).verdict = {"process": {"exit_code": 1}}
+        db.get(m.Task, task_id).status = m.NEEDS_ATTENTION
+
+    async def measure(ws, base_sha="", *, settle=False):
+        return 6, "src/a.ts | 3 +-"
+
+    from app.services import runner
+    monkeypatch.setattr(runner, "workspace_output", measure)
+    monkeypatch.setattr(wd, "requeue_run", _noop_requeue())
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+
+    asyncio.run(wd._scan_abnormal())
+
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.NEEDS_ATTENTION
+
+
+def _noop_requeue():
+    async def go(run_id, *, reason, reset_attempt=False):
+        return {"ok": True, "message": ""}
+    return go
+
+
+def test_stale_abnormal_record_is_cleared_once_it_no_longer_holds(task_with_runs, monkeypatch):
+    """异常不成立了就要把记录抹掉，否则题永远出不了「需人工」。
+
+    这一侧的 changed_files 已经被复核补正，abnormal_reason 早就返回空了，
+    但 run 上还挂着上一轮那条过期的异常。不清掉的话，扫描每轮都直接跳过它，
+    而配对扫描又不看「需人工」的题 —— 两头都够不着，这道题就死在那儿了。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        for side in ("A", "B"):
+            r = db.get(m.TaskRun, ids[side])
+            r.status = m.RUN_FINISHED
+            r.git_diff_stat = "src/x.ts | 2 +-"
+            r.verdict = {"process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+                         "artifact": {"trace_found": True, "changed_files": 5}}
+        db.get(m.TaskRun, ids["A"]).abnormal = {"reason": "工作目录零改动，疑似戛然而止",
+                                                "attempt": 1}
+        db.get(m.Task, task_id).status = m.NEEDS_ATTENTION
+        db.get(m.Task, task_id).auto_error = "A 侧重跑 1 次仍异常"
+
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    asyncio.run(wd._scan_abnormal())
+
+    with session() as db:
+        assert db.get(m.TaskRun, ids["A"]).abnormal == {}
+        task = db.get(m.Task, task_id)
+        assert task.status == m.RUN_DONE
+        assert task.auto_error == ""
+
+
+def test_a_new_key_puts_failed_analyses_back_in_the_flow(task_with_runs):
+    """换 Key 是「凭据修好了」的动作，挂在凭据上的分析该自己接着跑。
+
+    不这么做，人换完 Key 还得回头挨个点一遍重新分析 —— 而这正是这条流水线想省掉的事。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        for side in ("A", "B"):
+            r = db.get(m.TaskRun, ids[side])
+            r.status = m.RUN_FINISHED
+            r.git_diff_stat = "src/x.ts | 2 +-"
+            r.verdict = {"process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+                         "artifact": {"trace_found": True, "changed_files": 5}}
+        t = db.get(m.Task, task_id)
+        t.status, t.analysis_status = m.NEEDS_ATTENTION, m.ANALYSIS_FAILED
+        t.auto_error = "GSB 分析失败：Cursor API Key 无效或已撤销"
+
+    assert wd.retry_failed_analyses() == ["07"]
+
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        assert t.status == m.RUN_DONE
+        assert t.analysis_status == m.ANALYSIS_IDLE
+        assert t.auto_error == ""
+
+
+def test_a_new_key_does_not_revive_a_half_finished_task(task_with_runs):
+    """一侧还没跑完的题不能因为换了 Key 就被拖进分析。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).status = m.RUN_FINISHED
+        db.get(m.TaskRun, ids["B"]).status = m.RUN_FAILED
+        db.get(m.Task, task_id).analysis_status = m.ANALYSIS_FAILED
+        db.get(m.Task, task_id).status = m.NEEDS_ATTENTION
+
+    assert wd.retry_failed_analyses() == []
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.NEEDS_ATTENTION
+
+
+def test_a_broken_side_never_gets_its_work_pushed(task_with_runs, monkeypatch):
+    """跑挂的那一侧不能提交产物，界面上那个直连的按钮也不行。
+
+    推上去的是一份没跑完的东西，拿它做对比就是拿半截结果当结论；远端一旦有了这个提交，
+    重跑时还得先把分支退回去。这一侧该走的是重建重跑。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["A"]).status = m.RUN_FINISHED
+        db.get(m.TaskRun, ids["A"]).verdict = {
+            "process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+            "artifact": {"trace_found": True, "changed_files": 3}}
+        db.get(m.TaskRun, ids["A"]).git_diff_stat = "src/a.ts | 3 +-"
+        db.get(m.TaskRun, ids["B"]).status = m.RUN_INTERRUPTED
+
+    pushed = []
+    monkeypatch.setattr(wd, "push_artifacts", lambda tid: pushed.append(tid))
+
+    r = asyncio.run(wd.advance_pair(task_id))
+
+    assert r["ok"] is False
+    assert "B 侧" in r["message"]
+    assert pushed == []
+
+
+def test_a_side_flagged_abnormal_is_blocked_too(task_with_runs, monkeypatch):
+    """状态是 FINISHED 但被判过异常的，同样不能推。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        for side in ("A", "B"):
+            r = db.get(m.TaskRun, ids[side])
+            r.status = m.RUN_FINISHED
+            r.git_diff_stat = "src/x.ts | 1 +"
+            r.verdict = {"process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+                         "artifact": {"trace_found": True, "changed_files": 2}}
+        # 轨迹都没落盘，abnormal_reason 会认出来
+        db.get(m.TaskRun, ids["A"]).verdict = {
+            "process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+            "artifact": {"trace_found": False, "changed_files": 2}}
+
+    pushed = []
+    monkeypatch.setattr(wd, "push_artifacts", lambda tid: pushed.append(tid))
+
+    r = asyncio.run(wd.advance_pair(task_id))
+    assert r["ok"] is False
+    assert "A 侧" in r["message"]
+    assert pushed == []

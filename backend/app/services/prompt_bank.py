@@ -12,7 +12,7 @@
     SessionID：待回填，取轨迹 jsonl 文件名的 UUID
     TurnID/PromptID：待回填，取本轮 user 消息的 promptId
     <空行>
-    以下为发送给模型的 prompt 正文，整段复制。
+    以下为发送给模型的 prompt 正文…（这行按前缀认，尾巴上的补充说明会变）
     <空行>
     <正文…直到下一个「题号：」或文件末尾>
 
@@ -35,7 +35,10 @@ from app.db import session
 from app.models import AVAILABLE, ORIGIN_BANK, Task
 from app.services import gsb_repo
 
-BODY_MARKER = "以下为发送给模型的 prompt 正文，整段复制。"
+# 正文起始标记，按前缀认。这句后面 skill 会跟补充说明（「A 侧与 B 侧发送同一份」
+# 一类），它自己提取正文时也只匹配前缀；这里要是写全等，模板一改措辞就整题解析不出
+# 正文，题面明明生成了却一道都进不了题库。
+BODY_MARKER = "以下为发送给模型的 prompt 正文"
 _TASK_LINE = re.compile(r"^题号[：:]\s*(\S+)\s*$")
 _KV_LINE = re.compile(r"^([^：:]{1,40})[：:]\s*(.*)$")
 
@@ -84,7 +87,7 @@ def parse_block(lines: list[str], start: int, end: int) -> ParsedTask:
     body_at = None
     for i in range(start + 1, end):
         text = lines[i].rstrip("\n")
-        if text.strip() == BODY_MARKER:
+        if text.strip().startswith(BODY_MARKER):
             body_at = i
             break
         kv = _KV_LINE.match(text)
@@ -115,13 +118,19 @@ def parse_file(path: Path | None = None) -> list[ParsedTask]:
 
 
 def archive_files() -> list[Path]:
-    """出题/prompts/ 下的单题归档。/solo-prompt 批量出题时每题一个文件。"""
+    """归档目录下的单题题面。/solo-prompt 批量出题时每题一个文件，文件名即题号。
+
+    只认纯数字文件名。归档目录里还躺着 current.md、index.md 一类非题面文件，
+    用 *.md 一把抓会把索引和需求文档也当题目解析。
+    """
     d = config.CODER_ROOT_MOUNT / config.PROMPTS_ARCHIVE_DIR
-    return sorted(d.glob("*.md")) if d.exists() else []
+    if not d.exists():
+        return []
+    return sorted(p for p in d.glob("*.md") if p.stem.isdigit())
 
 
 def parse_sources(extra: list[Path] | None = None) -> list[ParsedTask]:
-    """根目录 prompt.md + 归档目录。同题以先出现的为准（根目录优先）。"""
+    """当前题面 + 归档目录。同题以先出现的为准（当前题面优先）。"""
     seen: set[tuple[str, str]] = set()
     out: list[ParsedTask] = []
     for path in [config.prompt_file(), *(extra if extra is not None else archive_files())]:
@@ -155,6 +164,8 @@ def import_tasks(*, sources: list[Path] | None = None, origin: str = ORIGIN_BANK
             t.meta = p.meta
             for fk, fv in p.fields.items():
                 setattr(t, fk, fv)
+            # 快照链接后面同样跟着括号说明，而这个值要拿去比对 HEAD、还会原样提交
+            t.env_snapshot = gsb_repo.first_url(t.env_snapshot)
             # 双跑要按分支 clone 两份，仓库地址必须在导入时就拿到，
             # 不然领题时得回头再解析一遍题块
             t.repo_url = gsb_repo.parse_repo_url(p.meta)

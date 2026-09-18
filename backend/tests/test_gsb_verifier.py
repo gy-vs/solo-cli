@@ -61,9 +61,80 @@ def test_reason_must_mention_both_sides():
     assert "reason_both_sides" in _names(gv.verify(_data(reason=only_a)))
 
 
-@pytest.mark.parametrize("bad", ["首先", "综上", "表现出色", "非常"])
-def test_banned_words_are_blocked(bad):
-    assert "reason_banned_words" in _names(gv.verify(_data(reason=GOOD_REASON + bad)))
+# ---------------- AI 痕迹 ----------------
+# 判的是「只有程序才数得出来的量」，不是书面语。solo-qa 的 AI 化评分里，
+# 步号、工具调用次数、增删行数这些权重最高；而正式、术语密集、长句、长篇幅
+# 都被它的评分提示词明确排除在扣分之外。
+
+@pytest.mark.parametrize("bad, rule", [
+    ("它在第 12 步改的", "reason_step_ref"),
+    ("B 侧步骤 7 才发现", "reason_step_ref"),
+    ("A 侧走了 113 次工具调用", "reason_tool_count"),
+    ("交互轮次 47 才收敛", "reason_tool_count"),
+    ("问题在 lib/dumper.js:120-136", "reason_file_line"),
+    ("A 侧新增 1895 行", "reason_diff_stat"),
+    ("B 侧耗时 46 分钟", "reason_duration"),
+])
+def test_machine_metrics_are_blocked(bad, rule):
+    assert rule in _names(gv.verify(_data(reason=GOOD_REASON + bad)))
+
+
+@pytest.mark.parametrize("ok", [
+    "我看重的是 writeFlowMapping 有没有把标签透传下去",
+    "两侧的实现思路存在本质差异，A 侧采用了访问者模式重构序列化链路，"
+    "在架构层面更契合既有抽象，可维护性显著优于 B 侧的局部补丁式修改",
+    "首先要看需求点有没有落实，其次才是实现是否优雅",
+])
+def test_formal_writing_is_not_an_ai_trace(ok):
+    """书面语、术语、长句、单个过渡词都不该拦。
+
+    以前这里禁「首先/其次/综上/非常」，既拦不住真正会被判回的东西，
+    又把正常的书面表达判成违规，人在界面上改到第五遍也过不了。
+    """
+    assert _names(gv.verify(_data(reason=GOOD_REASON + ok))) == set()
+
+
+def test_two_delivery_cliches_are_blocked():
+    """单个过渡词放过，凑够两个才是拿套话当骨架。"""
+    assert _names(gv.verify(_data(reason=GOOD_REASON + "综上所述"))) == set()
+    r = gv.verify(_data(reason=GOOD_REASON + "综上所述，值得注意的是两边都改了"))
+    assert "reason_cliche" in _names(r)
+
+
+def test_dense_numbers_are_blocked():
+    dense = "A 侧改了 3 个点 12 处 7 个文件 9 个用例 5 次 2 轮 8 项 4 条 6 类 1 处。"
+    assert "reason_number_density" in _names(gv.verify(_data(reason=dense * 2)))
+
+
+def test_symbol_dump_is_blocked():
+    dump = "A 侧动了 parseSelector、parseValue、parseAtrule、parseBlock、parseRaw、parseUrl。"
+    assert "reason_symbol_dump" in _names(gv.verify(_data(reason=GOOD_REASON + dump)))
+
+
+def test_terminal_output_dump_is_blocked():
+    r = gv.verify(_data(reason=GOOD_REASON + "跑出来是 43 过 1 败"))
+    assert "reason_terminal_dump" in _names(r)
+
+
+def test_section_labels_are_blocked():
+    r = gv.verify(_data(reason="【产物】" + GOOD_REASON))
+    assert "reason_section_label" in _names(r)
+
+
+def test_ai_self_reference_is_blocked():
+    r = gv.verify(_data(reason=GOOD_REASON + "作为大语言模型我倾向 A"))
+    assert "reason_self_reference" in _names(r)
+
+
+def test_chat_scaffolding_is_blocked():
+    r = gv.verify(_data(reason=GOOD_REASON + "希望对你有帮助"))
+    assert "reason_chat_scaffold" in _names(r)
+
+
+def test_hollow_reason_is_blocked():
+    """通篇「各有优劣」「差不多」，删掉套话就没剩下什么。"""
+    hollow = "两边各有优劣，难分高下，表现都还行，看不出差别，整体不错，基本可用，问题不大。"
+    assert "reason_hollow" in _names(gv.verify(_data(verdict="Same", reason=hollow * 3)))
 
 
 @pytest.mark.parametrize("bad", ["## 结论\n", "- 一条\n", "**加粗**", "`代码`"])

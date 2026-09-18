@@ -12,7 +12,7 @@ from app.db import session
 from app.events import bus, sse_format
 from app.models import DesignRun, Task
 from app.schemas import DesignStart, IdList, design_run, task_brief
-from app.services import designer, settings_store
+from app.services import designer, pool, settings_store
 
 router = APIRouter(prefix="/api/design", tags=["design"])
 
@@ -27,7 +27,10 @@ async def preflight() -> dict:
 
 @router.post("/start")
 async def start(body: DesignStart) -> dict:
-    blocking = [c for c in designer.preflight() if not c["ok"] and c["name"] in ("cursor_cli", "cursor_key", "skill", "requirements")]
+    # 少了这几样出题必然失败：模型调不通、建不了仓库、或者读不到本期口径。
+    # 查重不在列，它失败只是把题留着等人工判，不影响出题本身。
+    blocking = [c for c in designer.preflight()
+                if not c["ok"] and c["name"] in ("cursor_cli", "cursor_key", "gh", "gh_token", "requirements")]
     if blocking:
         raise HTTPException(409, "缺少必要条件：" + "；".join(f"{c['name']} {c['message']}" for c in blocking))
     res = designer.start(body.count, body.note)
@@ -62,6 +65,34 @@ async def dedup(body: IdList) -> dict:
     if err:
         raise HTTPException(502, err)
     return {"ok": True, "passed": passed, "discarded": discarded}
+
+
+# ---------------- 跨设备查重池 ----------------
+
+@router.get("/pool")
+async def pool_status() -> dict:
+    return pool.snapshot()
+
+
+@router.post("/pool/sync")
+async def pool_sync() -> dict:
+    """拉一次远端池，并把题库索引按池重建。出题时会自动做，这里是手动触发。"""
+    res = await pool.sync()
+    if not res["ok"]:
+        raise HTTPException(409, res["message"])
+    return {**res, "index": pool.write_index(), "pool": pool.snapshot()}
+
+
+@router.post("/pool/bootstrap")
+async def pool_bootstrap() -> dict:
+    """把本机已有的题一次性推进池。第一次启用池时用。
+
+    幂等：已经在池里的题会被跳过，重复点不会写重复行。
+    """
+    res = await pool.bootstrap()
+    if not res["ok"]:
+        raise HTTPException(409, res["message"])
+    return {**res, "pool": pool.snapshot()}
 
 
 @router.get("/{run_id}")

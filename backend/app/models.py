@@ -53,6 +53,13 @@ ALL_STATUSES = (
 # 允许上传的状态
 UPLOADABLE = frozenset({ANALYZED})
 
+# 还可以往外发容器的题。RUNNING 必须在内：槽位按容器算，一道题的两侧各排各的队，
+# A 先出闸把题带成 RUNNING 之后，B 仍然在队列里等自己那个槽。只认 QUEUED 的话，
+# 凡是「一侧在跑、另一侧被退回重跑」的题，那一侧就再也发不出去了。
+SCHEDULABLE = frozenset({QUEUED, RUNNING})
+# 巡检还要盯着的题。已经分析完、交上去或废弃的题不必每轮再扫一遍它们的 run。
+WATCHED = frozenset({QUEUED, RUNNING, RUN_DONE, NEEDS_ATTENTION})
+
 # ---------------- 单侧运行状态 ----------------
 # 取值字面量与题级的 QUEUED/RUNNING 同名，故常量名加 RUN_ 前缀区分；
 # 比较时务必用常量而不是字面量，否则题级和侧级会混用。
@@ -65,8 +72,10 @@ RUN_TIMEOUT = "TIMEOUT"
 RUN_INTERRUPTED = "INTERRUPTED"
 
 RUN_END_STATUSES = frozenset({RUN_FINISHED, RUN_FAILED, RUN_TIMEOUT, RUN_INTERRUPTED})
-# 只有 FINISHED 算正常结束；其余结束态由 watchdog 决定重跑还是转人工
+# 只有 FINISHED 算正常结束；其余结束态由 watchdog 决定重跑还是废弃
 RUN_OK_STATUSES = frozenset({RUN_FINISHED})
+# 在等槽位的两种状态：刚建出来的是 PENDING，被退回重跑的是 QUEUED
+RUN_WAITING = frozenset({RUN_PENDING, RUN_QUEUED})
 
 ANALYSIS_IDLE = "IDLE"
 ANALYSIS_RUNNING = "RUNNING"
@@ -83,6 +92,21 @@ DESIGN_DEDUP = "DEDUP"
 DESIGN_DONE = "DONE"
 DESIGN_FAILED = "FAILED"
 DESIGN_CANCELLED = "CANCELLED"
+
+
+def derive_task_status(runs: list["TaskRun"]) -> str | None:
+    """按两侧 run 推出题级状态。两侧都不在运行阶段时返回 None，交给巡检判断。
+
+    以前是谁动谁写：调度出闸写 RUNNING、重跑退回写 QUEUED。而「A 在跑、B 在等」
+    是双跑最常见的组合，题级取哪个值全看最后一次写的是谁 —— 写成 RUNNING，B 就再也
+    排不上队；写成 QUEUED，界面上一道正在跑的题却显示在排队。两种都错，所以题级状态
+    不再由动作方各写各的，一律从两侧 run 现在的样子推。
+    """
+    if any(r.status == RUN_RUNNING for r in runs):
+        return RUNNING
+    if any(r.status in RUN_WAITING for r in runs):
+        return QUEUED
+    return None
 
 
 class JsonMixin:
@@ -141,6 +165,12 @@ class Task(Base, JsonMixin):
     # 避免旧代码按五维结构去读它。
     gsb_json: Mapped[str] = mapped_column(Text, default="{}")
     verify_json: Mapped[str] = mapped_column(Text, default="{}")       # GSB 核验报告
+    # solo-qa 的 GSB 质检结论。本地核验（verify_json）只判确定性规则，这里存的是平台
+    # 口径的结果，含 AI 化评分与命中的规则号，两者都过才敢上传。
+    #
+    # 叫 gsb_qc_json 而不是 qc_json：后者是五维质检时代的列，已经废弃删掉了，名字重用
+    # 会让老库里残留的旧格式数据被当成新结论读出来。
+    gsb_qc_json: Mapped[str] = mapped_column(Text, default="{}")
     # 两侧录屏链接 {"A": url, "B": url}，平台上传必填，由人工录完后填入
     screencast_json: Mapped[str] = mapped_column(Text, default="{}")
     upload_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -189,6 +219,14 @@ class Task(Base, JsonMixin):
     @verify.setter
     def verify(self, v: dict) -> None:
         self.verify_json = self._dump(v)
+
+    @property
+    def gsb_qc(self) -> dict:
+        return self._load(self.gsb_qc_json, {})
+
+    @gsb_qc.setter
+    def gsb_qc(self, v: dict) -> None:
+        self.gsb_qc_json = self._dump(v)
 
     @property
     def screencast(self) -> dict:
@@ -248,10 +286,14 @@ class TaskRun(Base, JsonMixin):
     task_id: Mapped[int] = mapped_column(Integer, index=True)
     side: Mapped[str] = mapped_column(String(1), index=True)   # 取值见 config.SIDES
     status: Mapped[str] = mapped_column(String(16), default=RUN_PENDING, index=True)
-    # 第几次跑。重跑加一，达到上限后 watchdog 不再自动重跑。
+    # 第几次跑。重跑加一，达到上限后整道题废弃。
     # server_default 不能省：_ensure_columns 给没有 DDL 默认值的整型列补的是 DEFAULT 0，
     # 补出来的第 0 次会让重跑计数错位。
     attempt: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # 其中有几次是跑超时的。超时单独计数是因为它的代价跟别的异常不是一个量级：
+    # 一次超时要整整烧掉 timeout_minutes，连着两次就是四个小时的机器时间换一份没有的
+    # 结果，所以它的容忍次数比普通重跑更低，先撞到哪个上限就按哪个废弃。
+    timeouts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     container_name: Mapped[str] = mapped_column(String(64), default="")
     container_exists: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -275,6 +317,11 @@ class TaskRun(Base, JsonMixin):
 
     # watchdog 判定为异常时记原因与时间，题卡要显示
     abnormal_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 人按过停止。这件事必须落库：它以前只是 runner 里的一个内存集合，后端一重启、
+    # 或者容器换了协程接管，标记就没了，于是人按的停止在收尾时被当成异常结束，
+    # watchdog 转头把这一侧整个清掉重跑 —— 人看到的是「我明明停了它，它自己又跑起来了」，
+    # 而且刚改的配置会被那次重跑盖掉。
+    stop_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -20,17 +20,7 @@ from app.services import dockerx, settings_store
 log = logging.getLogger("qa_bridge")
 
 SCRIPT_DEDUP = "qa_dedup.py"
-SCRIPT_QC = "qa_qc.py"
-
-# solo-qa 的五维字段名 → 本项目的维度键
-DIM_MAP = {
-    "delivery": "score_delivery",
-    "instruction": "score_instruction",
-    "planning": "score_planning",
-    "reasoning": "score_reasoning",
-    "execution": "score_execution",
-}
-DESC_MAP = {k: f"desc_{k}" for k in DIM_MAP}
+SCRIPT_GSB_QC = "qa_gsb_qc.py"
 
 
 def project_host() -> str:
@@ -49,7 +39,7 @@ def available() -> tuple[bool, str]:
 
 async def _run(script: str, payload: dict, *, timeout_s: int, mounts: list[str] | None = None) -> dict:
     root = project_host()
-    image = settings_store.get("qc.image") or "solo-qa-backend:latest"
+    image = settings_store.get("qc.image") or "solo2-backend:latest"
     cmd = [
         dockerx.docker_bin(), "run", "--rm", "-i",
         # 用宿主机上的最新源码覆盖镜像里构建时的那份快照
@@ -107,72 +97,69 @@ def repo_id_of(env_snapshot: str) -> str:
 
 
 # ============================================================
-# 质检：完整链路，只取结论
+# GSB 质检：走 solo-qa 的 GSB 链路，只取结论
 # ============================================================
+# 早先这里调的是它的五维质检入口，传的是 score_delivery、desc_planning 那套字段。
+# 那套评分连同字段一起废弃了，GSB 改成两侧对比加一个理由，字段完全不同，所以这条
+# 桥接实际上早就调不通了，只是没人调用它，一直没暴露出来。
 
-def build_submission(t: Task) -> tuple[dict, list[str]]:
-    """把一条任务装成 solo-qa 的提交字段。返回 (payload, 缺失字段说明)。"""
-    review = t.review or {}
-    scores = review.get("scores") or {}
-    descs = review.get("descs") or {}
-    summary = t.trace_summary or {}
-
-    data = {
-        "question_type": t.question_type,
-        "difficulty": t.difficulty,
-        "languages": t.languages,
-        "harness": t.harness or "Claude Code",
-        # 表单版本必须和轨迹里的一致，否则质检的交叉校验直接打回；
-        # 轨迹解析拿到版本时以它为准，镜像实测值只作兜底
-        "harness_version": summary.get("harness_version") or t.harness_version,
-        "os_platform": t.os_platform,
-        "repro_level": t.repro_level,
-        "env_snapshot": t.env_snapshot,
-        "user_prompt": t.user_prompt,
-        "session_id": t.session_id,
-        "turn_id": t.turn_id,
-        "other_issues": review.get("other_issues") or "",
-    }
-    for dim, field in DIM_MAP.items():
-        data[field] = scores.get(dim)
-    for dim, field in DESC_MAP.items():
-        data[field] = (descs.get(dim) or "").strip()
-
-    missing = [k for k, v in data.items() if k != "other_issues" and (v is None or v == "")]
-    return data, missing
+# solo-qa 的 DATA_DIR，轨迹必须挂进这个目录下才会走本地解析
+QA_DATA_DIR = "/app/data"
+TRACE_SUBDIR = "solo-cli-trace"
 
 
-async def qc_task(task_id: int) -> dict:
-    """对一条任务跑质检。只读 solo-qa，不写它的库。"""
+async def gsb_qc(task_id: int, *, timeout_s: int = 0) -> dict:
+    """对一道题的 GSB 结论跑平台口径的质检。只读 solo-qa，不写它的库。
+
+    要送两侧的轨迹：它的 T3 规则要在轨迹里找有没有把 GSB 的评判标准泄漏给模型，
+    单送结论查不出这类问题。
+
+    轨迹挂进它的 `DATA_DIR` 而不是随便找个路径：它的轨迹读取会先拿相对路径在
+    DATA_DIR 下找本地文件，找到就直接解析，找不到才回源对象存储。挂在别处就等于
+    逼它走一趟本来不需要的网络。
+    """
     ok, why = available()
     if not ok:
         return {"ok": False, "error": why}
+
+    from app.services import gsb_uploader
+
     with session() as db:
         t = db.get(Task, task_id)
         if t is None:
             return {"ok": False, "error": "任务不存在"}
-        data, missing = build_submission(t)
-        task_no, trace_file = t.task_no, t.trace_file
-    if missing:
-        return {"ok": False, "error": "字段不全，先完成五维评审：" + "、".join(missing)}
-    if not trace_file or not Path(trace_file).exists():
-        return {"ok": False, "error": "没有导出的轨迹文件，无法质检"}
+        task_no = t.task_no
+    try:
+        data = await gsb_uploader.build_values_for(task_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"装配提交字段失败：{exc}"}
 
-    paths = config.TaskPaths(task_no)
-    name = Path(trace_file).name
-    size = Path(trace_file).stat().st_size
-    mounts = ["-v", f"{paths.export_host}:/trace:ro"]
-    timeout_s = max(120, settings_store.get_int("qc.timeout_minutes", 15) * 60)
+    mounts: list[str] = []
+    traces: dict[str, str] = {}
+    for side in config.SIDES:
+        paths = config.TaskPaths(task_no, side)
+        local = _exported_trace(paths.export)
+        if local is None:
+            return {"ok": False, "error": f"{side} 侧没有导出的轨迹文件，无法质检"}
+        rel = f"{TRACE_SUBDIR}-{side}"
+        mounts += ["-v", f"{paths.export_host}:{QA_DATA_DIR}/{rel}:ro"]
+        traces[side] = f"{rel}/{local.name}"
+
     payload = {
         "submission": data,
-        "trace_path": f"/trace/{name}",
-        "trace_name": name,
-        "trace_size": size,
+        "traces": traces,
         "submitter": "solo-cli",
         "task_no": task_no,
-        "round_no": 1,
+        # 录屏是人工环节，质检这一步必然还没录，见桥接脚本头部说明
+        "defer_screencast": True,
     }
-    return await _run(SCRIPT_QC, payload, timeout_s=timeout_s, mounts=mounts)
+    timeout_s = timeout_s or max(120, settings_store.get_int("qc.timeout_minutes", 15) * 60)
+    return await _run(SCRIPT_GSB_QC, payload, timeout_s=timeout_s, mounts=mounts)
+
+
+def _exported_trace(export_dir: Path) -> Path | None:
+    files = sorted(export_dir.glob("*.jsonl")) if export_dir.is_dir() else []
+    return files[-1] if files else None
 
 
 async def probe() -> dict:
@@ -185,7 +172,7 @@ async def probe() -> dict:
         # 后端在容器里，只能看挂载进来的路径，这里只检查宿主路径的拼写是否可疑
         if not p.startswith("/"):
             return {"ok": False, "message": f"路径必须是宿主机绝对路径：{p}"}
-    image = settings_store.get("qc.image") or "solo-qa-backend:latest"
+    image = settings_store.get("qc.image") or "solo2-backend:latest"
     if not await dockerx.image_present(image):
         return {"ok": False, "message": f"镜像 {image} 不存在，先在 solo-qa 项目里 docker compose build"}
     r = await dedup([{"key": "probe", "user_prompt": "连通性探测，不参与判定。", "repo_id": "", "session_id": ""}],

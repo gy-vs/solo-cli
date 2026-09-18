@@ -71,6 +71,7 @@ def run_brief(r: TaskRun) -> dict:
         "side": r.side,
         "status": r.status,
         "attempt": r.attempt,
+        "timeouts": r.timeouts,
         "container_name": r.container_name,
         "container_exists": r.container_exists,
         "image_tag": r.image_tag,

@@ -10,8 +10,10 @@ GitHub Token 只在拼命令的那一刻进内存：一次性命令（ls-remote�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -33,13 +35,28 @@ _SLUG_RE = re.compile(r"(?:github\.com[:/])([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 _SHA_RE = re.compile(r"/commit/([0-9a-fA-F]{40})/?$")
 # 题块里仓库地址的键名不统一，中英文都认
 _META_KEYS = ("仓库", "repo", "repository")
+# 「仓库：」那行地址后面常跟一句括号说明，取地址时要在括号、逗号、空白处断开
+_URL_RE = re.compile(r"https?://[^\s，,（）()]+")
+
+
+def first_url(value: str) -> str:
+    """取值里的第一个地址。
+
+    题面里地址后面跟一句括号说明是常态：「仓库：https://…（本题专属，分支只有
+    main / A / B）」「初始环境快照：https://…/commit/<sha>（A、B 两侧共用）」。整段
+    存下去的话每处都要到最后一步才炸——_SLUG_RE 与 _SHA_RE 都锚定行尾，仓库解析不出
+    org/repo（clone 失败、同项目并发规则静默失效），快照认不出 SHA（门禁直接拦），
+    而这两个值还会原样提交给平台。取不到 URL 的（比如测试里的本地裸仓库路径）按原值返回。
+    """
+    m = _URL_RE.search(value or "")
+    return m.group(0) if m else (value or "").strip()
 
 
 def parse_repo_url(meta: dict) -> str:
     for key in _META_KEYS:
         v = (meta or {}).get(key)
         if isinstance(v, str) and v.strip():
-            return v.strip()
+            return first_url(v)
     return ""
 
 
@@ -66,6 +83,37 @@ def authed_url(repo_url: str, token: str) -> str:
     if not token or not url.startswith("https://github.com/"):
         return url
     return url.replace("https://", f"https://x-access-token:{token}@", 1)
+
+
+_PUSH_FAILURES = (
+    ("timeout after", "推送超时，多半是网络不通，稍后会自动重试"),
+    ("non-fast-forward", "远端这个分支已经领先本地了，先看看是不是推过一次"),
+    ("fetch first", "远端这个分支已经领先本地了，先看看是不是推过一次"),
+    # 两次推送撞在同一个分支上时远端会锁住 ref 拒掉后来的那条。以前这类失败落到最后的
+    # 兜底文案上，报成「检查 Token 的 repo 写权限」，而权限根本没问题
+    ("cannot lock ref", "远端这个分支正被另一次推送占用，稍后重试即可"),
+    ("failed to lock", "远端这个分支正被另一次推送占用，稍后重试即可"),
+    ("protected branch", "这个分支在远端是受保护的，推不上去"),
+    ("authentication failed", "GitHub Token 认证没过，到设置页换一个"),
+    ("403", "Token 没有这个仓库的写权限"),
+    ("could not resolve host", "连不上 GitHub，检查网络"),
+    ("connection", "连接 GitHub 时断了，稍后会自动重试"),
+    ("repository not found", "仓库不存在，或者 Token 看不到它"),
+)
+
+
+def push_failure(res: dockerx.CmdResult) -> str:
+    """把 push 的失败翻成一句给人看的话。
+
+    原文一律不透传：超时分支的 err 里拼着完整命令行，而 helper 参数里就有 token。
+    但也不能像以前那样一律说成「检查 Token 的写权限」—— 网络抖一下也会走到这儿，
+    人照着这句话跑去翻权限设置，只会白费工夫。所以按已知特征分门别类地说。
+    """
+    blob = f"{res.out}\n{res.err}".lower()
+    for needle, human in _PUSH_FAILURES:
+        if needle in blob:
+            return human
+    return "原因不明，检查网络与 Token 的 repo 写权限"
 
 
 def credential_args(repo_url: str) -> list[str]:
@@ -232,6 +280,90 @@ async def reset_side(task_no: str, side: str, snapshot: str) -> dict:
     return {"ok": True, "backup": backup, "message": msg}
 
 
+def archive_workspace(task_no: str, side: str) -> str:
+    """把这一侧的工作目录整个改名存档，返回存档目录名；本来就没有就返回空串。
+
+    上一跑的产物是判「为什么异常」的唯一材料，删之前得留一份。但不能像以前那样往
+    `.git` 里打个备份 ref 就算数 —— 那份备份留在重跑后的仓库里，模型一句
+    `git log --all` 就把上一跑改过什么全看见了。改名挪走才是真的挪走。
+    """
+    ws = config.TaskPaths(task_no, side).workspace
+    if not ws.exists():
+        return ""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    target = ws.with_name(f"{ws.name}.archived-{stamp}")
+    ws.rename(target)
+    return target.name
+
+
+async def rebuild_side(task_no: str, repo_url: str, side: str, snapshot: str) -> dict:
+    """把这一侧彻底重建：本地删干净，分支从主干在初始快照上重新开一个，远端也跟着退回去。
+
+    重跑必须跟第一次跑长得一模一样，不然两次跑就不是在同一个起点上比，这道题也就废了。
+    做到这一点，退回工作区内容是不够的：
+
+    `reset --hard` 加 `clean -fdx` 退得掉文件，退不掉仓库自身。reflog、备份 ref、
+    上一跑的对象都还躺在 `.git` 里，`git log --all`、`git reflog`、`git fsck` 随便哪条
+    都能把上次改过什么翻出来，模型看见了就不是独立的一跑了。
+
+    远端同理。上一跑推上去的产物还挂在这个分支上，照着这个分支重新 clone，残留原样带回来。
+
+    所以这里不 clone 这一侧的分支，而是拉主干、在初始快照上重新开一个同名分支，再强推
+    回远端 —— 等价于把这个分支删掉、从主干重新切一份。主干里没有上一跑的任何东西，
+    clone 下来的 `.git` 自然也就没有。
+    """
+    if not snapshot:
+        return {"ok": False, "message": "初始环境快照缺少 40 位 SHA，不敢重建这一侧"}
+    ws = config.TaskPaths(task_no, side).workspace
+    archived = ""
+    if ws.exists():
+        head = ""
+        if (ws / ".git").exists():
+            head = (await _git(ws, "rev-parse", "HEAD", timeout=30)).out.strip().lower()
+        if head and head != snapshot.lower():
+            # 领先初始快照，说明这一跑提交过产物，整个目录挪走留底再重建
+            try:
+                archived = await asyncio.to_thread(archive_workspace, task_no, side)
+            except OSError as exc:
+                return {"ok": False, "message": f"{side} 侧目录存档失败：{exc}"}
+        else:
+            try:
+                await asyncio.to_thread(shutil.rmtree, ws)
+            except OSError as exc:
+                return {"ok": False, "message": f"{side} 侧目录删不掉：{exc}"}
+
+    # 不带 --branch：拉远端的默认分支。这一侧上一跑的提交只在自己那个分支上，
+    # 不碰它就一个对象都不会进到新的 .git 里
+    ws.parent.mkdir(parents=True, exist_ok=True)
+    cl = await dockerx.run(
+        ["git", *credential_args(repo_url), "clone", "--single-branch", repo_url, str(ws)],
+        timeout=600)
+    if not cl.ok:
+        return {"ok": False, "message": f"{side} 侧重新 clone 主干失败，检查仓库与 Token 权限"}
+
+    co = await _git(ws, "checkout", "-B", side, snapshot, timeout=120)
+    if not co.ok:
+        return {"ok": False,
+                "message": f"{side} 侧在初始快照 {snapshot[:12]} 上开分支失败，"
+                           f"确认这个提交在主干历史里"}
+
+    # 远端那个分支也要退回去，否则下次 clone 又把上一跑的产物带回来
+    push = await dockerx.run(
+        ["git", "-C", str(ws), *credential_args(repo_url), "push", "--force", "origin",
+         f"{snapshot}:refs/heads/{side}"], timeout=300)
+    if not push.ok:
+        return {"ok": False,
+                "message": f"{side} 侧远端分支退回初始快照失败：{push_failure(push)}"}
+
+    hv = await verify_head(task_no, side, snapshot)
+    if not hv["ok"]:
+        return {"ok": False, "message": f"{side} 侧重建后对不上初始快照：{hv['message']}"}
+    msg = f"{side} 侧已从主干重建到 {snapshot[:12]}，远端分支同步退回"
+    if archived:
+        msg += f"，上一跑存档在 {archived}"
+    return {"ok": True, "archived": archived, "message": msg}
+
+
 def commit_message(task_no: str, side: str, session_id: str) -> str:
     return (f"solo {task_no} · {side}\n\n"
             f"SessionID: {session_id or '-'}\n")
@@ -267,20 +399,43 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
 
     st = await _git(ws, "status", "--porcelain", "--untracked-files=all", timeout=60)
     changed = len([x for x in st.out.splitlines() if x.strip()])
-    if not changed:
+    # 产物可能上一轮就已经提交过了（提交成了但推送没成，或者收尾重来了一次）。这时工作区
+    # 干干净净，只看 status 会把一次做满了活的运行判成「没有产出」，把人挡在推送门外。
+    # 认定「已经提交过」要同时满足作者是我们、父提交是初始快照 —— 只看 HEAD 动没动，
+    # 模型自己随手 commit 的东西也会被当成产物提交，后面 amend 上去就把它悄悄改了，
+    # 还顺带伪装成了合规，而这种情况本来就该被规则 G3 拦下来交给人。
+    head_now = (await _git(ws, "rev-parse", "HEAD", timeout=30)).out.strip()
+    committed_already = False
+    if snapshot and head_now.lower() != snapshot.lower():
+        author = (await _git(ws, "log", "-1", "--format=%ae", timeout=30)).out.strip()
+        head_parent = (await _git(ws, "rev-parse", "HEAD^", timeout=30)).out.strip()
+        committed_already = (author == COMMIT_EMAIL
+                             and head_parent.lower() == snapshot.lower())
+    if not changed and not committed_already:
         return {"ok": False, "message": f"{side} 侧工作区没有改动，这一跑没有产出，不能当作产物提交"}
 
-    # add / commit 的参数里没有凭据，stderr 可以带给调用方帮人定位问题
-    add = await _git(ws, "add", "-A", timeout=180)
-    if not add.ok:
-        return {"ok": False, "message": f"git add 失败：{add.err.strip()[:300]}"}
-    ci = await _git(ws, "-c", f"user.name={COMMIT_USER}", "-c", f"user.email={COMMIT_EMAIL}",
-                    "commit", "-m", message, timeout=180)
-    if not ci.ok:
-        return {"ok": False, "message": f"git commit 失败：{(ci.err or ci.out).strip()[:300]}"}
+    if changed:
+        # add / commit 的参数里没有凭据，stderr 可以带给调用方帮人定位问题
+        add = await _git(ws, "add", "-A", timeout=180)
+        if not add.ok:
+            return {"ok": False, "message": f"git add 失败：{add.err.strip()[:300]}"}
+        # --amend：产物必须是初始快照之上恰好一个提交，否则平台规则 G3 会打回。已经提交过
+        # 又冒出新改动时，追加第二个提交会让父提交对不上，只能并进原来那个。
+        # --no-verify：跳过仓库自己的提交钩子。husky 这类钩子要 npx、要装依赖，这个容器里
+        # 没有也不该有；它们是给写代码的人用的，而这里只是把跑出来的产物存档。
+        extra = ["--amend", "--no-edit"] if committed_already else ["-m", message]
+        ci = await _git(ws, "-c", f"user.name={COMMIT_USER}", "-c", f"user.email={COMMIT_EMAIL}",
+                        "commit", "--no-verify", *extra, timeout=180)
+        if not ci.ok:
+            return {"ok": False, "message": f"git commit 失败：{(ci.err or ci.out).strip()[:300]}"}
 
     head = (await _git(ws, "rev-parse", "HEAD", timeout=30)).out.strip()
     parent = (await _git(ws, "rev-parse", "HEAD^", timeout=30)).out.strip()
+    # 改了几个文件按提交后的实际内容算。上面数的是未提交改动，产物分两次攒起来时
+    # （上轮提交过、这轮又并进来一些）只会数到后半截，报出来的数字比实际少。
+    names = await _git(ws, "diff", "--name-only", f"{parent}..{head}", timeout=60)
+    if names.ok:
+        changed = len([x for x in names.out.splitlines() if x.strip()]) or changed
     if parent.lower() != (snapshot or "").lower():
         return {"ok": False,
                 "message": f"{side} 侧产物的父提交是 {parent[:12]}，不是初始快照 {snapshot[:12]}；"
@@ -295,8 +450,7 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
          f"HEAD:refs/heads/{side}"], timeout=300,
     )
     if not push.ok:
-        # 超时分支的 err 里拼着完整命令行，而 helper 参数里就有 token：一律不透传
-        return {"ok": False, "message": f"{side} 侧 push 失败，检查 Token 的 repo 写权限"}
+        return {"ok": False, "message": f"{side} 侧 push 失败：{push_failure(push)}"}
 
     url = commit_url(repo_url, head)
     log.info("题 %s %s 侧产物 %s 已推到分支 %s（%d 个文件）", task_no, side, head[:12], side, changed)

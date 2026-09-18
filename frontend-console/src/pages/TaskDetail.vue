@@ -3,6 +3,8 @@ import { NButton, NTag, useDialog, useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, SIDES, type GateReport, type Gsb, type Side, type TaskDetail, type TaskRunDetail, type VerifyReport } from '../api'
+import ContainerLive from '../components/ContainerLive.vue'
+import ContainerTerminal from '../components/ContainerTerminal.vue'
 import GateChecks from '../components/GateChecks.vue'
 import GsbEditor from '../components/GsbEditor.vue'
 import ScreencastPanel from '../components/ScreencastPanel.vue'
@@ -90,6 +92,12 @@ const discarded = computed(() => task.value?.status === 'DISCARDED')
 const claimable = computed(() => task.value?.status === 'AVAILABLE' || task.value?.status === 'CLAIMED')
 const discardable = computed(() => !!task.value && !['RUNNING', 'QUEUED', 'ANALYZING', 'DISCARDED'].includes(task.value.status))
 const containersLeft = computed(() => task.value?.runs?.filter((r) => r.container_exists).length || 0)
+/** 哪几侧需要重跑：结束状态不是 FINISHED，或者看护判过异常 */
+const badSides = computed(() => SIDES.filter((s) => {
+  const r = run(s)
+  if (!r || !RUN_END.includes(r.status)) return false
+  return r.status !== 'FINISHED' || !!r.abnormal?.reason
+}))
 
 const tabs = computed<[Tab, string][]>(() => (task.value?.runs?.length
   ? [['runs', '两侧运行'], ['gsb', 'GSB 结论'], ['screencast', '录屏'], ['upload', '上传'], ['steps', '轨迹步骤'], ['prompt', '题目信息']]
@@ -103,6 +111,16 @@ const gsbDot = computed(() => {
   if (t.gsb_verdict) return 'bg-ok'
   return ''
 })
+
+/** 容器终端。事件流断掉时，只有容器自己的 stdout 还能说明它在不在动 */
+const termShow = ref(false)
+const termSide = ref<Side>('A')
+function openTerminal(s?: Side) {
+  // 不指定就先看哪一侧还在跑：要看的十有八九是它
+  const running = task.value?.runs?.find((r) => r.status === 'RUNNING')
+  termSide.value = s || (running?.side as Side) || 'A'
+  termShow.value = true
+}
 
 const gateReport = ref<GateReport | null>(null)
 const gateChecking = ref(false)
@@ -287,6 +305,8 @@ const payloadPreview = computed<[string, string][]>(() => {
         <NButton v-if="claimable" size="small" type="primary" :loading="busy === 'claim'" @click="claim">领取并启动两侧</NButton>
         <NButton v-if="claimable" size="small" secondary :loading="gateChecking" @click="runGate">门禁检查</NButton>
         <NButton v-if="discarded" size="small" type="primary" secondary :loading="busy === 'restore'" @click="restore">恢复该题</NButton>
+        <NButton v-if="task.runs.length" size="small" secondary
+          title="接上容器的 stdout，实时看这一侧的 Claude Code 在干什么" @click="openTerminal()">打开终端</NButton>
         <NButton v-if="anyRunning" size="small" type="error" secondary :loading="busy === 'stop'" @click="stop()">停止两侧</NButton>
         <NButton v-if="task.runs.length && !locked" size="small" tertiary :loading="busy === 'rerun'" @click="rerun([])">重跑两侧</NButton>
         <NButton v-if="ended && !locked && !task.gsb_verdict" size="small" type="primary" :loading="busy === 'advance'"
@@ -310,8 +330,13 @@ const payloadPreview = computed<[string, string][]>(() => {
         <span>{{ task.branch_check.message }}。仓库要恰好是 main/master 加 A、B 三个分支，A、B 从初始快照切出来。</span>
       </div>
       <div v-if="task.status === 'NEEDS_ATTENTION'" class="mt-3 inner p-3 text-xs text-err leading-5">
-        看护已经放弃自动重跑{{ task.auto_error ? `：${task.auto_error}` : '' }}。
-        环境修好后点「重跑两侧」或到两侧运行页单独重跑某一侧，重跑次数会清零。
+        <!-- 转人工的原因不止「重跑用尽」一种，推产物失败、分析失败都会到这儿，所以按 auto_error 如实说 -->
+        <div>需人工介入{{ task.auto_error ? `：${task.auto_error}` : '' }}。整侧重跑会把工作目录重置回初始快照、归档已有轨迹，重跑次数清零。</div>
+        <div v-if="!locked" class="mt-2 flex items-center gap-2">
+          <NButton v-for="s in badSides" :key="s" size="tiny" secondary type="error"
+            :loading="busy === 'rerun'" @click="rerun([s])">重跑 {{ s }} 侧</NButton>
+          <NButton size="tiny" quaternary :loading="busy === 'rerun'" @click="rerun([])">重跑两侧</NButton>
+        </div>
       </div>
       <div v-if="ended && !task.gsb_verdict && task.analysis_status !== 'RUNNING'" class="mt-3 text-xs text-fg1">
         两侧都跑完了。看护会自动提交产物并开始对比分析，也可以点「提交产物并分析」立刻走一遍。
@@ -379,6 +404,8 @@ const payloadPreview = computed<[string, string][]>(() => {
         <!-- 两侧运行 -->
         <template v-if="tab === 'runs'">
           <SideStrip :runs="task.runs" />
+          <!-- 下面那两张卡是收尾时记下来的账，跑着的时候还没有；这一张是现问 docker 的实况 -->
+          <ContainerLive :task-id="id" @terminal="openTerminal" />
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div v-for="s in SIDES" :key="s" class="card p-4 space-y-2">
               <div class="flex items-center gap-2">
@@ -386,7 +413,8 @@ const payloadPreview = computed<[string, string][]>(() => {
                   :style="{ color: SIDE_HEX[s], background: SIDE_HEX[s] + '1f' }">{{ s }}</span>
                 <span class="text-fg0 font-medium text-sm">{{ run(s) ? RUN_LABEL[run(s)!.status] : '未建' }}</span>
                 <span v-if="run(s)?.attempt && run(s)!.attempt > 1" class="pill h-5 text-[12px] text-warn border-warn/40">第 {{ run(s)!.attempt }} 次</span>
-                <NButton v-if="run(s) && !locked" size="tiny" quaternary class="ml-auto" :loading="busy === 'rerun'" @click="rerun([s])">重跑</NButton>
+                <NButton v-if="run(s)" size="tiny" quaternary class="ml-auto" @click="openTerminal(s)">终端</NButton>
+                <NButton v-if="run(s) && !locked" size="tiny" quaternary :loading="busy === 'rerun'" @click="rerun([s])">重跑</NButton>
               </div>
               <template v-if="run(s)">
                 <div class="text-xs flex justify-between"><span class="text-fg1">退出码</span><span class="mono" :class="run(s)!.exit_code === 0 ? 'text-ok' : 'text-err'">{{ run(s)!.exit_code ?? '—' }}</span></div>
@@ -567,6 +595,8 @@ const payloadPreview = computed<[string, string][]>(() => {
         </template>
       </div>
     </div>
+
+    <ContainerTerminal v-model:show="termShow" v-model:side="termSide" :task-id="id" :task-no="task.task_no" />
   </div>
   <div v-else class="page"><div class="card empty">任务不存在 <NButton size="tiny" tertiary @click="router.push('/runs')">返回</NButton></div></div>
 </template>

@@ -52,7 +52,10 @@ function fix(action: string) {
     <div v-for="c in report.checks" :key="c.name" class="inner p-3 flex items-start gap-3 animate-slidein">
       <span class="dot mt-1.5 shrink-0" :style="{ background: color(c.level) }" />
       <div class="min-w-0 flex-1">
-        <div class="mono text-[12px] text-fg2">{{ c.name }}</div>
+        <div class="mono text-[12px] text-fg2">
+          {{ c.name }}
+          <span v-if="c.hard && c.level === 'block'" class="text-err">· 必须修复</span>
+        </div>
         <div class="text-fg0 text-xs break-all">{{ c.message }}</div>
       </div>
       <NButton v-if="c.fix" size="tiny" secondary :type="c.fix === 'reset_sides' ? 'warning' : 'default'"

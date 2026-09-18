@@ -27,6 +27,14 @@ DB_PATH = DATA_DIR / "solo-cli.db"
 EXPORT_DIR = DATA_DIR / "exports"
 HOST_PORT = _env("HOST_PORT", "8788")
 
+# Cursor skills 目录（后端容器里看到的路径）。出题靠 Cursor CLI 执行 /solo-prompt，
+# 出题规则的唯一来源就是这个目录下的 solo-prompt skill，不在本项目里另存一份。
+SKILL_DIR_MOUNT = Path(_env("SKILL_DIR_MOUNT") or str(Path.home() / ".cursor" / "skills"))
+SKILL_NAME = "solo-prompt"
+# CLI 只认这四个固定位置下的 skill，给不了自定义目录参数，所以把挂载点链过去。
+# 详见 llm.ensure_skills_linked。
+SKILL_LINK = Path.home() / ".cursor" / "skills"
+
 # 环境种子：首次启动写入设置表（仅当设置为空时）
 SEED_ENV = {
     "cursor.api_key": _env("CURSOR_API_KEY"),
@@ -42,12 +50,18 @@ SEED_ENV = {
 # 桥接脚本目录：挂进 solo-qa 镜像执行查重与质检
 BRIDGE_DIR_HOST = _env("BRIDGE_DIR_HOST") or str(Path(__file__).resolve().parents[1] / "bridges")
 
-# prompt.md 与各子目录的相对位置（相对 coder_root）
-PROMPT_FILE = "prompt.md"
+# 各子目录的相对位置（相对 coder_root）。
+#
+# 目录名一律取中性英文：宿主路径虽然不会进容器（挂载只暴露 /workspace 与
+# /home/node/.claude/projects），但录屏交付时终端提示符、Finder、编辑器侧栏都会
+# 拍到工作区的目录树。出现"出题""轨迹""题库"一类字样等于自证题目是设计出来的，
+# 因此这些名字不能带任何出题语义。
+PROMPT_FILE = "drafts/current.md"
+BRIEF_FILE = "drafts/brief.md"
 WORKSPACE_DIR = "workspace"
-TRACES_DIR = "出题/轨迹"
-ANALYSIS_DIR = "出题/分析"
-PROMPTS_ARCHIVE_DIR = "出题/prompts"
+TRACES_DIR = "sessions"
+ANALYSIS_DIR = "reports"
+PROMPTS_ARCHIVE_DIR = "drafts"
 
 # 容器内固定路径（由镜像决定）
 CONTAINER_WORKSPACE = "/workspace"
@@ -110,6 +124,12 @@ class TaskPaths:
     @property
     def traces_host(self) -> str:
         return f"{CODER_ROOT_HOST}/{TRACES_DIR}/{self.task_no}/{self.side}"
+
+    @property
+    def export_host(self) -> str:
+        """导出目录的宿主路径。质检要把它挂进 solo-qa 的容器，而 docker -v 的源
+        由宿主 daemon 解析，给容器内的 /data/... 会挂到一个空目录上。"""
+        return f"{DATA_DIR_HOST}/exports/{self.task_no}/{self.side}"
 
     @property
     def container_name(self) -> str:

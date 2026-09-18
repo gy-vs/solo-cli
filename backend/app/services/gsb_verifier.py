@@ -17,21 +17,16 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import Task, TaskRun
-from app.services import dockerx, gsb_repo, settings_store, trace
-from app.services.gsb_analyzer import BANNED_WORDS, VERDICTS
+from app.services import dockerx, gsb_repo, gsb_rules, settings_store, trace
+from app.services.gsb_analyzer import VERDICTS
 
 log = logging.getLogger("gsb_verifier")
 
-MIN_REASON_CHARS = 60
-# Same 要论证两边确实等价，比直接说谁更好更费笔墨，门槛提高
-MIN_SAME_REASON_CHARS = 150
+MIN_REASON_CHARS = gsb_rules.MIN_REASON_CHARS
+MIN_SAME_REASON_CHARS = gsb_rules.MIN_SAME_REASON_CHARS
 
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
-_EMOJI = re.compile(
-    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0001F2FF\uFE0F\u2705\u274C]")
-_MD_MARK = re.compile(r"(^\s{0,3}#{1,6}\s)|(^\s{0,3}[-*+]\s)|(\*\*)|(`)", re.M)
 _ABS_PATH = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/)+")
-_STEP_REF = re.compile(r"第\s*\d+\s*[步轮]|步骤\s*\d+")
 # 理由里对文件的引用：带目录的路径，或者带常见扩展名的文件名
 _FILE_REF = re.compile(
     r"\b(?:[\w.\-]+/)+[\w.\-]+\.\w{1,6}\b"
@@ -49,6 +44,63 @@ def _chars(text: str) -> int:
 
 def _norm_prompt(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
+
+
+def _ai_trace_items(reason: str) -> list[dict]:
+    """按 solo-qa 的 GSB 口径查 AI 痕迹。
+
+    它的 AI 化判定是一次 0～10 分的模型评分，4 分就打回，而分数主要来自「只有程序
+    数得出来的量」：步号、工具调用次数、增删行数、耗时、file.js:120-136 的行号，
+    以及由这些堆出来的数字密度。这些在本地是能确定性查出来的，所以先在这里拦掉，
+    别等交上去才被判。
+
+    反过来，书面语、术语、长句、长篇幅、段落对称、通篇没有「我」都不算 AI 痕迹，
+    它的评分提示词里逐条写明不扣分，所以这里一个都不查——查了只会逼人把话改烂。
+    """
+    items: list[dict] = []
+    for name, label, pattern in gsb_rules.MACHINE_METRICS:
+        if m := pattern.search(reason):
+            items.append(_item(name, "block",
+                               f"理由里有{label}（{m.group(0).strip()[:40]}），"
+                               f"这是 AI 化评分里权重最高的一类证据，位置该用文件名和函数名来指"))
+    count, density = gsb_rules.number_density(reason)
+    if density > gsb_rules.NUMBER_PER_100_LIMIT:
+        items.append(_item("reason_number_density", "block",
+                           f"理由里有 {count} 个精确数字，每百字 {density} 个，"
+                           f"超过每百字 {gsb_rules.NUMBER_PER_100_LIMIT} 个的线"))
+    if chunk := gsb_rules.symbol_run(reason):
+        items.append(_item("reason_symbol_dump", "block",
+                           f"理由里连着罗列了一串符号名（{chunk}），这是在搬运工具输出"))
+    if m := gsb_rules.TERMINAL_DUMP.search(reason):
+        items.append(_item("reason_terminal_dump", "block",
+                           f"理由里有终端输出原文（{m.group(0).strip()[:40]}）"))
+    if m := gsb_rules.SECTION_LABEL.search(reason):
+        items.append(_item("reason_section_label", "block",
+                           f"理由里有固定分栏（{m.group(0).strip()[:20]}），平台的理由框是纯文本"))
+    if gsb_rules.MD_ANY.search(reason):
+        items.append(_item("reason_markdown", "block",
+                           "理由里有 markdown 记号（标题、列表符号、加粗或反引号），平台的理由框不渲染"))
+    if gsb_rules.EMOJI.search(reason):
+        items.append(_item("reason_emoji", "block", "理由里有表情符号"))
+    if hits := gsb_rules.cliche_hits(reason):
+        # 单独一个过渡词不算，凑够两个才是拿套话当骨架
+        if len(hits) >= gsb_rules.DELIVERY_CLICHE_MIN:
+            items.append(_item("reason_cliche", "block",
+                               f"理由里有 {len(hits)} 个交付套话（{'、'.join(hits[:5])}），"
+                               f"凑够两个就会被判成模板"))
+    if gsb_rules.ordinal_template(reason):
+        items.append(_item("reason_template", "block",
+                           "理由是「首先／其次／最后」加栏目标签的模板骨架"))
+    if hit := next((p for p in gsb_rules.SELF_REFERENCE if p in reason), ""):
+        items.append(_item("reason_self_reference", "block", f"理由里有 AI 自指（{hit}）"))
+    if hit := next((p for p in gsb_rules.CHAT_SCAFFOLD if p in reason), ""):
+        items.append(_item("reason_chat_scaffold", "block", f"理由里有对话腔（{hit}）"))
+    ratio = gsb_rules.substance_ratio(reason)
+    if ratio < gsb_rules.SUBSTANCE_RATIO:
+        items.append(_item("reason_hollow", "block",
+                           f"删掉「各有优劣」「表现良好」这类空话后只剩 {int(ratio * 100)}% 的内容，"
+                           f"不足一半，整段没有落到具体事实上"))
+    return items
 
 
 def verify(data: dict) -> dict:
@@ -70,20 +122,10 @@ def verify(data: dict) -> dict:
     if not re.search(r"\bA\b|A\s*侧", reason) or not re.search(r"\bB\b|B\s*侧", reason):
         items.append(_item("reason_both_sides", "block", "理由里没有分别写到 A 和 B 两侧"))
 
-    if hits := [w for w in BANNED_WORDS if w in reason]:
-        items.append(_item("reason_banned_words", "block",
-                           f"理由里有禁用词：{'、'.join(hits[:8])}"))
-    if _MD_MARK.search(reason):
-        items.append(_item("reason_markdown", "block",
-                           "理由里有 markdown 记号（标题、列表符号、加粗或反引号），平台的理由框不渲染"))
-    if _EMOJI.search(reason):
-        items.append(_item("reason_emoji", "block", "理由里有表情符号"))
+    items.extend(_ai_trace_items(reason))
     if m := _ABS_PATH.search(reason):
         items.append(_item("reason_abs_path", "block",
                            f"理由里有绝对路径（{m.group(0)[:40]}），会把本机目录结构一起交出去"))
-    if m := _STEP_REF.search(reason):
-        items.append(_item("reason_step_ref", "block",
-                           f"理由里有步数说法（{m.group(0)}），位置该用文件名和函数名来指"))
 
     # ---- 理由提到的文件必须真实存在（G6）----
     known = set()
@@ -155,21 +197,22 @@ def verify(data: dict) -> dict:
             "warnings": len([i for i in items if i["level"] == "warn"])}
 
 
-_SCAN_SKIP = {".git", "node_modules", ".venv", "__pycache__"}
+async def _side_files(task_no: str, side: str, index: dict) -> list[str]:
+    """这一侧可被理由引用的文件：轨迹里碰过的，加仓库里实际跟踪的。
 
-
-def _side_files(task_no: str, side: str, index: dict) -> list[str]:
-    """这一侧可被理由引用的文件：轨迹里碰过的，加产物副本里实际存在的。"""
+    以前这里扫的是分析沙箱副本，沙箱随 agent 漫游一起取消了，改问 git。git ls-files
+    只列被跟踪的文件，node_modules 这类本来就不在里面，也就不必再自己过滤一遍。
+    """
     files = set()
     for step in (index.get("steps") or []):
         for f in (step.get("files") or []):
             if isinstance(f, str) and f.strip():
                 files.add(f.strip().lstrip("./"))
-    repo = config.TaskPaths(task_no, side).analysis_repo
-    if repo.is_dir():
-        for p in repo.rglob("*"):
-            if p.is_file() and not any(part in _SCAN_SKIP for part in p.parts):
-                files.add(str(p.relative_to(repo)))
+    ws = config.TaskPaths(task_no, side).workspace
+    if (ws / ".git").exists():
+        r = await dockerx.run(["git", "-C", str(ws), "ls-files"], timeout=60)
+        if r.ok:
+            files.update(line.strip() for line in r.out.splitlines() if line.strip())
     return sorted(files)
 
 
@@ -219,7 +262,7 @@ async def collect(task_id: int) -> dict:
             "trace_count": trace.count_traces(paths.traces) if paths.traces.exists() else 0,
             "human_turns": summary.get("human_turns", index.get("human_turns")),
             "prompt": summary.get("prompt") or index.get("prompt") or "",
-            "files": _side_files(task_no, side, index),
+            "files": await _side_files(task_no, side, index),
         }
 
     image = settings_store.get("cc.image")

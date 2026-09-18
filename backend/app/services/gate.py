@@ -39,19 +39,27 @@ class Check:
     level: str          # ok / warn / block
     message: str
     fix: str = ""       # 可用的修复动作标识
+    # 硬前提：强制启动也绕不过去。分两类，跑不起来的（Docker、镜像、Key、容器名被占）
+    # 和起点不对的（没 clone、HEAD 对不上、轨迹目录非空）。它们跟难度、任务类型那种
+    # 口径问题不是一回事：口径不对是交不上去，人明知故犯地先跑着还有意义；这两类是
+    # 跑出来的东西根本不成立——容器起不来，或者模型在一个空目录里自己造一个仓库，
+    # 跑完还长得像一次正常的运行。
+    hard: bool = False
 
 
 def normalize_choice(value: str, options: tuple[str, ...]) -> str:
     """把题块里写的值对到平台选项上。
 
-    去掉全部空白再比对，匹配上返回平台侧的原值。匹配不上返回空串让门禁报出来，
-    不做模糊猜测——猜错了会以一个合法但错误的分类提交上去。
+    去掉全部空白、忽略大小写再比对，匹配上返回平台侧的原值。题块里的写法跟着
+    出题速查表走，是「Feature 迭代」「0-1 代码生成」这种带空格且首字母大写的，
+    平台选项则是「feature迭代」；差在书写而不是语义，不放宽的话整道题会卡在门禁上。
+    匹配不上返回空串让门禁报出来，不做模糊猜测——猜错了会以一个合法但错误的分类提交上去。
     """
-    want = _WS.sub("", value or "")
+    want = _WS.sub("", value or "").casefold()
     if not want:
         return ""
     for o in options:
-        if _WS.sub("", o) == want:
+        if _WS.sub("", o).casefold() == want:
             return o
     return ""
 
@@ -78,12 +86,12 @@ async def run_checks(task: Task) -> list[Check]:
     if settings_store.is_configured("cc.api_key"):
         checks.append(Check("cc.api_key", "ok", "网关 Key 已配置"))
     else:
-        checks.append(Check("cc.api_key", "block", "未配置网关 Key，请到设置页填写"))
+        checks.append(Check("cc.api_key", "block", "未配置网关 Key，请到设置页填写", hard=True))
 
     image = settings_store.get("cc.image")
     ok, msg = await dockerx.daemon_ok()
     if not ok:
-        checks.append(Check("docker", "block", f"Docker 不可用：{msg}"))
+        checks.append(Check("docker", "block", f"Docker 不可用：{msg}", hard=True))
         return checks
     checks.append(Check("docker", "ok", f"Docker {msg}"))
     if await dockerx.image_present(image):
@@ -99,7 +107,8 @@ async def run_checks(task: Task) -> list[Check]:
             checks.append(Check("image_label", "warn",
                                 "镜像缺少 org.benzhi.claude.task-mode 标签，可能不是本项目的 CC 任务镜像"))
     else:
-        checks.append(Check("image", "block", f"本机不存在镜像 {image}，请先 docker pull 或在设置页更换"))
+        checks.append(Check("image", "block", f"本机不存在镜像 {image}，请先 docker pull 或在设置页更换",
+                            hard=True))
 
     # 2. 题面必须符合平台口径，不然两个容器跑完也交不上去
     if normalize_choice(task.difficulty, DIFFICULTIES):
@@ -122,7 +131,7 @@ async def run_checks(task: Task) -> list[Check]:
 
     # 3. 仓库与分支
     if not task.repo_url:
-        checks.append(Check("repo_url", "block", "题块里没有仓库地址（「仓库：」那一行）"))
+        checks.append(Check("repo_url", "block", "题块里没有仓库地址（「仓库：」那一行）", hard=True))
         return checks
     checks.append(Check("repo_url", "ok",
                         f"仓库 {gsb_repo.repo_slug(task.repo_url) or task.repo_url}"))
@@ -134,7 +143,8 @@ async def run_checks(task: Task) -> list[Check]:
         checks.append(Check("snapshot", "ok", f"初始快照 {snapshot[:12]}"))
     else:
         checks.append(Check("snapshot", "block",
-                            "初始环境快照不是 40 位 SHA 的 commit 链接，两边都没法对起跑点"))
+                            "初始环境快照不是 40 位 SHA 的 commit 链接，两边都没法对起跑点",
+                            hard=True))
 
     # 4. 两侧各自的工作目录、轨迹目录、容器名
     patterns = [p.strip() for p in settings_store.get("gate.blacklist").split(",") if p.strip()]
@@ -143,11 +153,12 @@ async def run_checks(task: Task) -> list[Check]:
         ws = paths.workspace
         if not (ws / ".git").exists():
             checks.append(Check(f"workspace_{side}", "block",
-                                f"{side} 侧还没 clone 到 {ws}", fix="clone_sides"))
+                                f"{side} 侧还没 clone 到 {ws}", fix="clone_sides", hard=True))
         else:
             hv = await gsb_repo.verify_head(task.task_no, side, snapshot)
             checks.append(Check(f"workspace_{side}", "ok" if hv["ok"] else "block",
-                                hv["message"], fix="" if hv["ok"] else "reset_sides"))
+                                hv["message"], fix="" if hv["ok"] else "reset_sides",
+                                hard=not hv["ok"]))
             hits = _scan_blacklist(str(ws), patterns)
             checks.append(Check(f"leak_{side}", "block" if hits else "ok",
                                 f"{side} 侧发现可能泄漏的文件：{', '.join(hits[:5])}" if hits
@@ -157,7 +168,7 @@ async def run_checks(task: Task) -> list[Check]:
         if tr.exists() and any(tr.iterdir()):
             checks.append(Check(f"traces_{side}", "block",
                                 f"{side} 侧轨迹目录非空：{tr}（一次跑只能有一份轨迹）",
-                                fix="archive_traces"))
+                                fix="archive_traces", hard=True))
         else:
             checks.append(Check(f"traces_{side}", "ok", f"{side} 侧轨迹目录为空"))
 
@@ -165,7 +176,7 @@ async def run_checks(task: Task) -> list[Check]:
         if state:
             checks.append(Check(f"container_{side}", "block",
                                 f"容器 {paths.container_name} 已存在（{state}）",
-                                fix="remove_containers"))
+                                fix="remove_containers", hard=True))
         else:
             checks.append(Check(f"container_{side}", "ok", f"容器名 {paths.container_name} 可用"))
 
@@ -191,9 +202,13 @@ async def prepare_workspaces(task: Task) -> dict:
 
 def summarize(checks: list[Check]) -> dict:
     blocked = [c for c in checks if c.level == "block"]
+    hard = [c for c in blocked if c.hard]
     return {
         "passed": not blocked,
         "blocked": len(blocked),
+        # 强制启动能放行的只是剩下那些；这几条得先修好，没有别的路
+        "hard_blocked": [c.name for c in hard],
+        "hard_messages": [c.message for c in hard],
         "warnings": len([c for c in checks if c.level == "warn"]),
         "checks": [asdict(c) for c in checks],
     }

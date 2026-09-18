@@ -59,6 +59,26 @@ def test_parse_repo_url_from_meta():
     assert gsb_repo.parse_repo_url({}) == ""
 
 
+def test_parse_repo_url_drops_trailing_note():
+    """题面里地址后面跟着括号说明，连说明一起存会让 clone 与同项目判定一起失效。"""
+    meta = {"仓库": "https://github.com/acme/widget（本题专属，分支只有 main / A / B）"}
+    assert gsb_repo.parse_repo_url(meta) == "https://github.com/acme/widget"
+    assert gsb_repo.repo_slug(gsb_repo.parse_repo_url(meta)) == "acme/widget"
+
+
+def test_parse_repo_url_keeps_non_url_value():
+    """本地裸仓库路径没有 scheme，按原值留着。"""
+    assert gsb_repo.parse_repo_url({"仓库": "/tmp/bare/widget.git"}) == "/tmp/bare/widget.git"
+
+
+def test_first_url_cleans_snapshot_link():
+    """快照链接后面也跟着括号说明，脏着存会让 snapshot_sha 认不出 SHA。"""
+    sha = "f" * 40
+    raw = f"https://github.com/acme/widget/commit/{sha}（A、B 两侧共用）"
+    assert gsb_repo.first_url(raw) == f"https://github.com/acme/widget/commit/{sha}"
+    assert gsb_repo.snapshot_sha(gsb_repo.first_url(raw)) == sha
+
+
 def test_snapshot_sha():
     sha = "b" * 40
     assert gsb_repo.snapshot_sha(f"https://github.com/a/b/commit/{sha}") == sha

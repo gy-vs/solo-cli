@@ -177,7 +177,7 @@ async function claimAll() {
     <div v-else class="card empty">
       <template v-if="tab === 'discarded'">没有废弃的题</template>
       <template v-else-if="store.tasks.length">没有匹配的题</template>
-      <template v-else>prompt.md 中没有可解析的题，请检查格式后重新扫描</template>
+      <template v-else>题面文件里没有可解析的题，请检查格式后重新扫描</template>
     </div>
 
     <GateModal v-model:show="gateShow" :task="gateTask" :report="gateReport" @recheck="recheck" @queued="refreshTasks" />

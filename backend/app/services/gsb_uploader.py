@@ -79,6 +79,22 @@ async def probe_gateway() -> dict:
     return {"ok": False, "message": f"网关返回 HTTP {r.status_code}"}
 
 
+async def build_values_for(task_id: int) -> dict:
+    """按题号装配提交字段。
+
+    质检要的字段和上传是同一套：送去质检的必须就是将来要提交的那份，
+    两边各拼一次早晚会拼出差异，于是质检过了、提交却被打回。
+    """
+    with session() as db:
+        task = db.get(Task, task_id)
+        if task is None:
+            raise ValueError("题目不存在")
+        runs = {r.side: r for r in db.query(TaskRun).filter(TaskRun.task_id == task_id).all()}
+        if set(runs) != set(config.SIDES):
+            raise ValueError(f"两侧的运行记录不全，只有 {sorted(runs) or '空'}")
+        return await build_values(task, runs)
+
+
 async def build_values(task: Task, runs: dict[str, TaskRun]) -> dict:
     """算出所有能自动填的字段值。轨迹附件要先上传拿到引用，所以不在这里。"""
     gsb = task.gsb or {}

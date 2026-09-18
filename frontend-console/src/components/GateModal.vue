@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { NButton, NModal, useDialog, useMessage } from 'naive-ui'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { api, type GateReport, type TaskBrief } from '../api'
 import GateChecks from './GateChecks.vue'
 
@@ -9,6 +9,8 @@ const emit = defineEmits<{ (e: 'update:show', v: boolean): void; (e: 'queued'): 
 const msg = useMessage()
 const dialog = useDialog()
 const busy = ref(false)
+/** 容器起不来、起点不对这两类，强制启动也不放行，按钮直接收起来 */
+const hard = computed(() => props.report?.hard_blocked?.length || 0)
 
 function forceStart() {
   if (!props.task) return
@@ -36,8 +38,11 @@ function forceStart() {
     <GateChecks :task="task" :report="report" @recheck="emit('recheck')" />
     <template #footer>
       <div class="flex items-center justify-end gap-2">
+        <span v-if="hard" class="mr-auto text-xs text-err">
+          有 {{ hard }} 项是跑不起来或起点不对，强制启动也绕不过去，先用上面的修复动作处理
+        </span>
         <NButton size="small" tertiary @click="emit('update:show', false)">关闭</NButton>
-        <NButton v-if="report && !report.passed" size="small" type="error" secondary :loading="busy" @click="forceStart">仍然强制启动</NButton>
+        <NButton v-if="report && !report.passed && !hard" size="small" type="error" secondary :loading="busy" @click="forceStart">仍然强制启动</NButton>
       </div>
     </template>
   </NModal>

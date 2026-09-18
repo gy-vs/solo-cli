@@ -129,7 +129,9 @@ def test_normalize_survives_garbage_field_types():
     got = ga.normalize(obj, {})
     assert got["a_findings"] == {"good": [], "bad": []}
     assert got["b_startup"]["steps"] == []
-    assert got["evidence"] == [{"side": "B", "step": None, "file": "x.py", "quote": ""}]
+    # evidence 不再带 step：理由里禁止出现步数说法，证据里留着这个字段
+    # 等于给模型留了个照抄步号的出口
+    assert got["evidence"] == [{"side": "B", "file": "x.py", "quote": ""}]
 
 
 # ---------------- JSON 提取 ----------------
@@ -156,45 +158,153 @@ def test_extract_json_raises_without_verdict():
 
 # ---------------- prompt ----------------
 
+def _material(side: str, **over) -> dict:
+    m = {"side": side, "status": "FINISHED", "num_turns": 12,
+         "diff_stat": f" src/{side}.ts | 3 +++", "files": [f"M\tsrc/{side}.ts"],
+         "patch": f"diff --git a/src/{side}.ts b/src/{side}.ts\n+改动{side}",
+         "steps": [f"Edit 改了 src/{side}.ts"], "counts": {}}
+    m.update(over)
+    return m
+
+
+def _task(db, **over):
+    from app.models import Task
+
+    fields = {"task_no": "07", "prompt_hash": "h", "user_prompt": "做个解析器",
+              "question_type": "0-1代码生成", "difficulty": "困难"}
+    fields.update(over)
+    t = Task(**fields)
+    db.add(t)
+    db.flush()
+    return t
+
+
 def test_prompt_shows_both_sides_and_bans_excluded_factors(tmp_db):
     from app.db import session
-    from app.models import Task, TaskRun
 
     with session() as db:
-        t = Task(task_no="07", prompt_hash="h", user_prompt="做个解析器",
-                 question_type="0-1代码生成", difficulty="困难")
-        db.add(t)
-        db.flush()
-        runs = {}
-        for side in ("A", "B"):
-            r = TaskRun(task_id=t.id, side=side, trace_file=f"/x/{side}.jsonl",
-                        git_diff_stat=f"{side} 侧改了 3 个文件")
-            db.add(r)
-            db.flush()
-            runs[side] = r
-        text = ga.build_prompt(t, runs, {"A": Path("/x/repo-A"), "B": Path("/x/repo-B")})
+        text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
 
-    assert "repo-A" in text and "repo-B" in text
-    assert "A 侧改了 3 个文件" in text and "B 侧改了 3 个文件" in text
+    assert "src/A.ts" in text and "src/B.ts" in text
+    assert "改动A" in text and "改动B" in text
     assert "做个解析器" in text
     # 三类被排除的因素必须写进 prompt，否则模型会拿耗时差异当理由
     assert "推理时长" in text
     assert "戛然而止" in text
     assert "网络" in text
     # 不能暗示哪侧是基准
-    assert "基准" in text and "不要假设某一侧是基准" in text
+    assert "不要假设某一侧是基准" in text
+
+
+def test_prompt_is_symmetric_between_sides(tmp_db):
+    """两侧的段落结构必须一模一样。
+
+    A、B 是同一个模型跑两次，差异只来自随机性。材料的措辞要是有偏差，
+    模型会顺着措辞去找理由，结论就不再是对产物的判断。
+    """
+    from app.db import session
+
+    with session() as db:
+        text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
+    a = text.split("=== A 侧 ===")[1].split("=== B 侧 ===")[0]
+    b = text.split("=== B 侧 ===")[1].split("【工作步骤】")[0]
+    skeleton = lambda s: [ln.split("：")[0] for ln in s.splitlines() if "：" in ln]  # noqa: E731
+    assert skeleton(a) == skeleton(b)
+    assert "先跑" not in text and "基准侧" not in text
+
+
+def test_prompt_carries_writing_rules_that_ban_machine_metrics(tmp_db):
+    """写作规范必须进 prompt，否则模型写出来的理由会被质检判成机器写的。"""
+    from app.db import session
+
+    with session() as db:
+        text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
+    assert "不写步数" in text
+    assert "工具调用次数" in text
+    assert "数字密度" in text
+    # 反过来，书面语和长篇幅是允许的，不能在 prompt 里禁掉
+    assert "写得书面、正式、术语密集" in text
 
 
 def test_prompt_asks_for_startup_instructions(tmp_db):
     from app.db import session
-    from app.models import Task, TaskRun
 
     with session() as db:
-        t = Task(task_no="08", prompt_hash="h", user_prompt="x")
-        db.add(t)
-        db.flush()
-        runs = {s: TaskRun(task_id=t.id, side=s) for s in ("A", "B")}
-        text = ga.build_prompt(t, runs, {"A": Path("/x/repo-A"), "B": Path("/x/repo-B")})
+        text = ga.build_prompt(_task(db, task_no="08"), {s: _material(s) for s in ("A", "B")})
     # 录屏要靠这份启动说明
     assert "a_startup" in text and "b_startup" in text
     assert "录屏" in text
+
+
+def test_prompt_marks_missing_trace_instead_of_dropping_the_section(tmp_db):
+    """没有轨迹时要写明「没有轨迹」，不能让那一段凭空消失。
+
+    段落一旦缺失，两侧的结构就不对称了，模型会把缺失当成那一侧什么都没做。
+    """
+    from app.db import session
+
+    with session() as db:
+        text = ga.build_prompt(_task(db), {"A": _material("A"), "B": _material("B", steps=[])})
+    assert "（没有轨迹）" in text
+
+
+# ---------------- 材料采集 ----------------
+
+def test_truncated_patch_cuts_on_file_boundaries():
+    """补丁超预算要按文件切。
+
+    直接切字符会把最后一个文件劈成半截，模型读到残缺的 hunk 会当成代码本身有问题。
+    """
+    blocks = [f"diff --git a/f{i}.ts b/f{i}.ts\n" + "+x\n" * 50 for i in range(10)]
+    out, cut = ga._truncate_patch("".join(blocks), budget=600)
+    assert cut is True
+    assert out.count("diff --git") < 10
+    # 切完不能留半截 hunk：最后一段必须是完整的文件块
+    body = out.split("（补丁过长")[0]
+    assert body.rstrip().endswith("+x")
+    assert "个文件未展开" in out
+
+
+def test_short_patch_is_not_truncated():
+    patch = "diff --git a/a.ts b/a.ts\n+x\n"
+    assert ga._truncate_patch(patch, budget=600) == (patch, False)
+
+
+def test_condensed_steps_drop_step_numbers():
+    """轨迹压缩后不能带步号。
+
+    理由里禁止出现步数说法，材料里摆着步号模型就会照抄。
+    """
+    index = {"steps": [{"tool": "Edit", "summary": "改了 src/a.ts", "index": 38},
+                       {"tool": "Bash", "summary": "npm test", "is_error": True}]}
+    steps = ga._condense_steps(index)
+    assert steps == ["Edit 改了 src/a.ts", "Bash [报错] npm test"]
+    assert not any("38" in s for s in steps)
+
+
+def test_condensed_steps_keep_every_error_when_over_limit():
+    """超限抽样时报错步一个都不能丢，失败过程正是判断依据。"""
+    steps = [{"tool": "Read", "summary": f"读 {i}"} for i in range(400)]
+    steps += [{"tool": "Bash", "summary": f"炸了 {i}", "is_error": True} for i in range(5)]
+    got = ga._condense_steps({"steps": steps})
+    assert len(got) <= ga.STEP_LIMIT
+    assert sum("[报错]" in s for s in got) == 5
+
+
+def test_condensed_steps_keep_late_errors_that_exceed_the_budget():
+    """报错集中在末尾、而且数量逼近上限时，也不能被截断切掉。
+
+    「先抽样再截断」会在这种形状上把末尾的报错整批切没，于是一次全程失败的运行
+    在材料里看起来一切正常。
+    """
+    steps = [{"tool": "Read", "summary": f"读 {i}"} for i in range(400)]
+    steps += [{"tool": "Bash", "summary": f"炸了 {i}", "is_error": True} for i in range(300)]
+    got = ga._condense_steps({"steps": steps})
+    assert len(got) <= ga.STEP_LIMIT
+    assert sum("[报错]" in s for s in got) == ga.STEP_LIMIT
+
+
+def test_condensed_steps_preserve_original_order():
+    index = {"steps": [{"tool": "Read", "summary": "一"}, {"tool": "Edit", "summary": "二"},
+                       {"tool": "Bash", "summary": "三"}]}
+    assert ga._condense_steps(index) == ["Read 一", "Edit 二", "Bash 三"]

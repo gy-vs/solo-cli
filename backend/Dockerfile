@@ -22,10 +22,12 @@ RUN set -eux; \
     docker --version
 
 # GitHub CLI：出题要建仓库、推初始快照。Token 运行时注入，不写入镜像。
+# GH_DOWNLOAD_BASE 可覆盖，用于 github.com 直连不通时走镜像站。
 ARG GH_VERSION=2.63.2
+ARG GH_DOWNLOAD_BASE=https://github.com
 RUN set -eux; \
     ARCH="${TARGETARCH:-amd64}"; \
-    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" -o /tmp/gh.tgz; \
+    curl -fsSL "${GH_DOWNLOAD_BASE}/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" -o /tmp/gh.tgz; \
     tar -xzf /tmp/gh.tgz -C /tmp; \
     mv "/tmp/gh_${GH_VERSION}_linux_${ARCH}/bin/gh" /usr/local/bin/gh; \
     rm -rf /tmp/gh*; \
