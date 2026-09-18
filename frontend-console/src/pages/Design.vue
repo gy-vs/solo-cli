@@ -31,10 +31,15 @@ async function toggleLog(id: number) {
 const CHECK_LABEL: Record<string, string> = {
   cursor_cli: 'Cursor CLI', cursor_key: 'Cursor API Key', skill: 'solo-prompt SOP',
   gh: 'GitHub CLI', gh_token: 'GitHub Token', requirements: '需求文档', dedup: '查重通道',
-  pool: '跨设备查重池',
+  pool: '跨设备查重池', isolation: '出题资料隔离',
 }
-/** 缺了就跑不起来的项；gh 类只影响建仓库那一步，先放行 */
-const BLOCKING = ['cursor_cli', 'cursor_key', 'skill', 'requirements']
+/**
+ * 缺了就跑不起来的项；gh 类只影响建仓库那一步，先放行。
+ *
+ * isolation 在列：它不是"缺了什么"，而是路径配错让模型能读到题库，
+ * 这种情况下出的题全部作废，必须挡在开始之前。
+ */
+const BLOCKING = ['cursor_cli', 'cursor_key', 'skill', 'requirements', 'isolation']
 const blocking = computed(() => checks.value.filter((c) => !c.ok && BLOCKING.includes(c.name)))
 const active = computed(() => runs.value.find((r) => ['QUEUED', 'RUNNING', 'DEDUP'].includes(r.status)))
 

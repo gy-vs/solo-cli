@@ -64,6 +64,73 @@ def test_source_c_does_not_need_upstream():
     assert designer.validate_candidate(_candidate(source="C", upstream="")) == ""
 
 
+@pytest.mark.parametrize("url", [
+    "https://github.com/gy-vs/solo-cli",
+    "https://github.com/gy-vs/solo-cli.git",
+    "https://github.com/someone-else/solo-cli",   # 换个 owner 也得拦住
+    "https://github.com/gy-vs/solo-pool",
+    "https://github.com/gy-vs/solo-qa",
+])
+def test_own_tooling_repos_cannot_be_the_base(url):
+    """自有工具仓库当基底就会被 clone 进容器交给模型改，题面模板、判定点和
+    泄漏扫描规则会一起发下去。
+
+    这些仓库是私有的，但私有在这条路径上防不住：模型凭名字猜一个地址填进来，
+    后面的 ls-remote 带着 gh token 跑，照样能拉下来。
+    """
+    got = designer.validate_candidate(_candidate(upstream=url))
+    assert "自有工具仓库" in got, url
+
+
+def test_a_normal_upstream_is_not_caught_by_the_own_repo_rule():
+    """别误伤：只按整个仓库名比，名字里带 solo 的正常项目要放行。"""
+    assert designer.validate_candidate(_candidate(upstream="https://github.com/acme/solo-guitar")) == ""
+
+
+def test_repo_name_cannot_collide_with_own_tooling():
+    assert "自有工具仓库" in designer.validate_candidate(_candidate(repo_name="solo-pool"))
+
+
+# ---------------- 出题资料隔离 ----------------
+
+def test_isolation_passes_for_the_normal_layout(monkeypatch):
+    """本项目与 coder_root 平级时没有问题。"""
+    monkeypatch.setattr(designer.config, "CODER_ROOT_HOST", "/Users/me/solo-coder")
+    monkeypatch.setattr(designer.config, "DATA_DIR_HOST", "/Users/me/solo-cli/data")
+    monkeypatch.setattr(designer.config, "BRIDGE_DIR_HOST", "/Users/me/solo-cli/backend/bridges")
+    assert designer.isolation_problem() == ""
+
+
+def test_isolation_catches_the_project_cloned_into_the_workspace(monkeypatch):
+    """换设备时把本项目 clone 到 coder_root/workspace 下面，整套出题资料就进了
+    容器可见范围，而界面上看不出任何异常。"""
+    monkeypatch.setattr(designer.config, "CODER_ROOT_HOST", "/Users/me/solo-coder")
+    monkeypatch.setattr(designer.config, "DATA_DIR_HOST",
+                        "/Users/me/solo-coder/workspace/solo-cli/data")
+    monkeypatch.setattr(designer.config, "BRIDGE_DIR_HOST",
+                        "/Users/me/solo-coder/workspace/solo-cli/backend/bridges")
+    got = designer.isolation_problem()
+    assert "workspace" in got and "模型能读到" in got
+
+
+def test_isolation_catches_coder_root_pointed_at_the_home_dir(monkeypatch):
+    """CODER_ROOT 配成家目录时，workspace 子树会把同在家目录下的本项目圈进去。"""
+    monkeypatch.setattr(designer.config, "CODER_ROOT_HOST", "/Users/me")
+    monkeypatch.setattr(designer.config, "DATA_DIR_HOST", "/Users/me/workspace/data")
+    monkeypatch.setattr(designer.config, "BRIDGE_DIR_HOST", "/Users/me/solo-cli/backend/bridges")
+    assert "运行数据" in designer.isolation_problem()
+
+
+def test_isolation_is_blocking_in_preflight(monkeypatch, tmp_db):
+    """这条必须出现在检查列表里并且为 false，否则界面不会拦。"""
+    monkeypatch.setattr(designer.config, "CODER_ROOT_HOST", "/Users/me/solo-coder")
+    monkeypatch.setattr(designer.config, "DATA_DIR_HOST",
+                        "/Users/me/solo-coder/sessions/data")
+    monkeypatch.setattr(designer.config, "BRIDGE_DIR_HOST", "/Users/me/solo-cli/backend/bridges")
+    item = next(c for c in designer.preflight() if c["name"] == "isolation")
+    assert item["ok"] is False
+
+
 # ---------------- 题号分配 ----------------
 
 def test_next_task_no_fills_the_first_gap():

@@ -28,7 +28,7 @@ import logging
 import re
 import shutil
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from app import config
 from app.db import session
@@ -105,12 +105,44 @@ def _append_log(run_id: int, line: str) -> None:
     _publish(run_id)
 
 
+def isolation_problem() -> str:
+    """出题资料是否落在了会挂进容器的路径下。返回空串表示没问题。
+
+    做题容器只挂 `workspace/<题号>/<侧>` 与 `sessions/<题号>/<侧>` 这两棵子树
+    （见 runner.run_side 的 -v），别的地方模型看不到。反过来说，出题资料一旦落进
+    这两棵子树，就会连同题目一起交到模型手上。
+
+    这不是理论风险，换设备部署时有两种配法会踩到：把本项目 clone 到 coder_root
+    下面，或者把 CODER_ROOT 配成了家目录。两种情况界面上都看不出异常，题照样出、
+    容器照样跑，只是模型手里多了一份题库和判定点。
+    """
+    root = PurePosixPath(config.CODER_ROOT_HOST)
+    exposed = [root / config.WORKSPACE_DIR, root / config.TRACES_DIR]
+    suspects = {
+        "运行数据（题库、查重池、导出轨迹）": config.DATA_DIR_HOST,
+        # bridges 在 backend/ 下，往上两级是项目根
+        "本项目代码": str(PurePosixPath(config.BRIDGE_DIR_HOST).parent.parent),
+        "题库与当期口径": str(root / config.PROMPTS_ARCHIVE_DIR),
+    }
+    for label, raw in suspects.items():
+        if not raw:
+            continue
+        path = PurePosixPath(raw)
+        for area in exposed:
+            if path == area or path.is_relative_to(area):
+                return f"{label}（{path}）在会挂进容器的 {area} 下面，模型能读到它"
+    return ""
+
+
 def preflight() -> list[dict]:
     """出题前的条件检查，界面上直接显示缺什么。"""
     checks = []
 
     def add(name: str, ok: bool, msg: str) -> None:
         checks.append({"name": name, "ok": ok, "message": msg})
+
+    leak = isolation_problem()
+    add("isolation", not leak, leak or "出题资料不在容器可见范围内")
 
     add("cursor_cli", bool(llm.agent_bin()), "已安装" if llm.agent_bin() else "后端镜像里没有 agent")
     key = settings_store.get("cursor.api_key")
@@ -251,6 +283,21 @@ _REPO_NAME_OK = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$")
 # 暴露出题语义的仓库名，红线里明确禁止
 _REPO_NAME_BAD = re.compile(r"\b(q\d|task|case|test|demo|exam|quiz|bench|eval)\b|^q\d")
 
+# 自有工具仓库，绝不能当题目基底。
+#
+# 题目基底会被 clone 进容器交给模型改，拿出题工具本身当基底，等于把题面模板、
+# 判定点、泄漏扫描规则和整套出题流程一起发下去。这些仓库都是私有的，模型正常
+# 选不中，但它可以凭名字猜一个 https 地址填进 upstream —— 而后面的 ls-remote
+# 带着 gh token 跑，私有仓库照样能拉下来，于是私有这层防护在这条路径上不成立。
+_OWN_REPOS = {"solo-cli", "solo-pool", "solo-qa", "solo-coder"}
+
+
+def _is_own_repo(url_or_name: str) -> str:
+    """命中自有工具仓库就返回它的名字。按仓库名比，换个 owner 也躲不过。"""
+    slug = gsb_repo.repo_slug(url_or_name)
+    name = (slug.split("/")[-1] if slug else url_or_name).strip().lower()
+    return name if name in _OWN_REPOS else ""
+
 
 def validate_candidate(c: dict) -> str:
     """候选题目的硬性检查。返回空串表示通过。"""
@@ -259,12 +306,17 @@ def validate_candidate(c: dict) -> str:
         return f"仓库名 {name!r} 不合法，应为小写字母数字加连字符"
     if _REPO_NAME_BAD.search(name):
         return f"仓库名 {name!r} 暴露了出题语义"
+    if _is_own_repo(name):
+        return f"仓库名 {name!r} 与自有工具仓库同名"
     if str(c.get("difficulty") or "").strip() not in ("困难", "地狱"):
         return f"难度 {c.get('difficulty')!r} 不收，只要困难或地狱"
     if len(str(c.get("prompt_body") or "").strip()) < 200:
         return "prompt 正文太短，撑不起困难档"
-    if str(c.get("source") or "").upper() == "A" and not str(c.get("upstream") or "").startswith("https://github.com/"):
+    upstream = str(c.get("upstream") or "").strip()
+    if str(c.get("source") or "").upper() == "A" and not upstream.startswith("https://github.com/"):
         return f"上游地址 {c.get('upstream')!r} 不是 GitHub https 地址"
+    if upstream and (own := _is_own_repo(upstream)):
+        return f"上游 {upstream} 是自有工具仓库（{own}），不能当题目基底"
     return ""
 
 
