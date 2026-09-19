@@ -11,7 +11,7 @@
 |---|---|
 | 五维打分与描述 | 调用 **Cursor CLI（`agent`）+ Opus 5** 做项目实现分析并按需求文档五维评分表打分与描述；描述第一人称、口语化、去 AI 化、禁表情与修辞；结果须与轨迹文件相互印证 |
 | `prompt.md` 形态 | 多题汇总文件，以 `题号：` 分段 |
-| 镜像 | `adminfather/benzhi-claude-code:20260915-mount`：在 `20260909-isolated-git` 之上仅去掉「`/workspace` 必须为空」检查，允许映射非空的初始快照仓库；其余隔离参数不变。构建方式见 `cc-image/Dockerfile`（基础镜像按 digest 固定）；多架构推送待 `docker login` 后用发布脚本完成，在那之前这个 tag 只存在于本机，被 prune 掉就得重建 |
+| 镜像 | `adminfather/benzhi-claude-code2:20260919`：已推到 Docker Hub，`docker pull` 即可获得。入口脚本与隔离参数同 `20260915-mount`（`/workspace` 允许非空，用于映射初始快照仓库），CLI 仍为 2.1.197。旧的 `adminfather/benzhi-claude-code:20260915-mount` 不再使用 |
 | 容器销毁 | 人工点「完成」后销毁 |
 | 轮次 | 每题只跑一轮 |
 
@@ -102,7 +102,7 @@ solo-cli/
 
 ### 3.2 W2 · 一次性容器执行与隔离
 
-**镜像入口事实（`20260915-mount`，CLI 2.1.197，源文件 `~/Desktop/claude-code-镜像/runtime/entrypoint.sh`）**
+**镜像入口事实（`benzhi-claude-code2:20260919`，CLI 2.1.197，源文件 `~/Desktop/claude-code-镜像/runtime/entrypoint.sh`）**
 
 - `ENTRYPOINT /usr/local/bin/entrypoint.sh`，`CMD interactive`，`WORKDIR /workspace`，`USER node`
 - 只接受一个参数 `interactive | print`；`print` = `-p --output-format stream-json --verbose`
@@ -118,7 +118,7 @@ docker run -i --name solo-cc-NN --label solo-cli.task=NN \
   -v <coder_root>/workspace/NN:/workspace \
   -v <coder_root>/出题/轨迹/NN:/home/node/.claude/projects \
   --memory 4g --cpus 2 \
-  adminfather/benzhi-claude-code:<cc.image_tag> print  < prompt.txt
+  <cc.image> print  < prompt.txt
 ```
 
 prompt 经 stdin 注入，不出现在命令行、`docker inspect`、`ps`。stdout 逐行为 `stream-json` 事件，写入 `RunEvent` 并 SSE 推送；`result` 事件即结论。容器退出后**保留**，供人工点「完成」后销毁。
@@ -204,7 +204,7 @@ agent -p --force --trust --model <cursor.model> --output-format json \
 | `qa.session_cookie` | `solo_qa_session` 值 | — |
 | `qa.csrf_token` | `solo_qa_csrf` 值，同时用于 `X-CSRF-Token` 头 | — |
 | `cc.api_key` | 网关 Key，注入容器 `apikey` | — |
-| `cc.image_tag` | 镜像 tag | `20260915-mount` |
+| `cc.image` | 镜像 | `adminfather/benzhi-claude-code2:20260919` |
 | `cursor.api_key` / `cursor.model` | Cursor CLI 凭证与模型；首次启动可从 `.env` 的 `CURSOR_API_KEY` / `CURSOR_MODEL` 种子导入 | — / `claude-opus-5-thinking-high` |
 | `paths.coder_root` | 宿主机绝对路径 | `/Users/gaoyong/solo-coder-0908` |
 | `scheduler.max_parallel` / `run.timeout_minutes` | 并发与超时 | `3` / `120` |
