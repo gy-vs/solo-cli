@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { NButton, NInput, useDialog, useMessage } from 'naive-ui'
+import { NButton, NInput, NInputNumber, useDialog, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, ApiError, type GateReport, type Status, type TaskBrief } from '../api'
@@ -124,11 +124,23 @@ async function doSync() {
   } catch (e: any) { msg.error(e.message) } finally { syncing.value = false }
 }
 const batching = ref(false)
-async function claimAll() {
-  const ids = liveTasks.value.filter((t) => t.status === 'AVAILABLE').map((t) => t.id)
+/** 待领取的题，按题号排（列表也是这个序），所以「前几道」指的就是看到的前几道 */
+const availableIds = computed(() => liveTasks.value.filter((t) => t.status === 'AVAILABLE').map((t) => t.id))
+const claimN = ref(5)
+/** 想领的道数不能超过现有的，否则按钮上写着 5 道、实际只领到 2 道 */
+const claimCount = computed(() => Math.min(claimN.value || 1, counts.value.available))
+
+function claimSome() {
+  batchClaim(availableIds.value.slice(0, claimCount.value), `领取前 ${claimCount.value} 道并启动`)
+}
+function claimAll() {
+  batchClaim(availableIds.value, '全部领取并启动')
+}
+
+function batchClaim(ids: number[], title: string) {
   if (!ids.length) return
   dialog.info({
-    title: '全部领取并启动',
+    title,
     content: `将对 ${ids.length} 道题逐个在远端登记领取，再拉取 A、B 分支并执行门禁，通过的进队列。`
       + '一道题占两个容器槽位，排不下的会在队列里等。门禁不通过的保持「已领取」，需单独处理。',
     positiveText: '开始',
@@ -165,12 +177,17 @@ async function claimAll() {
           来自 <span class="mono">{{ store.status?.paths.prompt_file }}</span>，领取后拉取 A、B 分支并各起一个容器
         </div>
       </div>
-      <div class="ml-auto flex gap-2">
+      <div class="ml-auto flex gap-2 items-center">
         <NButton size="small" secondary :loading="syncing" @click="doSync">
           {{ pool?.enabled ? '同步远端题库' : '重新扫描' }}
         </NButton>
+        <NInputNumber v-model:value="claimN" size="small" :min="1" :max="counts.available || 1"
+          :disabled="!counts.available" class="!w-24" />
+        <NButton size="small" type="primary" secondary :loading="batching" :disabled="!counts.available" @click="claimSome">
+          领取 {{ claimCount }} 道
+        </NButton>
         <NButton size="small" type="primary" secondary :loading="batching" :disabled="!counts.available" @click="claimAll">
-          全部领取并启动（{{ counts.available }}）
+          全部（{{ counts.available }}）
         </NButton>
       </div>
     </div>
