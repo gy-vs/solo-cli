@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from app import config
 from app.db import session
-from app.models import AVAILABLE, CLAIMED, ORIGIN_POOL, QUEUED, Task
+from app.models import AVAILABLE, CLAIMED, DISCARDED, ORIGIN_POOL, QUEUED, Task
 from app.services import pool, pool_bank, settings_store
 
 DRAFT = """题号：{no}
@@ -221,6 +221,26 @@ def test_an_existing_local_task_gets_linked_to_its_pool_entry(pooled):
     res = pool_bank.sync_tasks()
     assert res["adopted"] == ["01"]
     assert _tasks()[0].pool_entry_id == e.id
+
+
+def test_a_linked_task_is_found_by_entry_id_not_by_task_no(pooled):
+    """认过领的题只按 entry id 找，题号对不上也算同一道。
+
+    池启用之前从题面文件导进来的题用的是原题号 01，而这道题在远端属于别的设备，本机
+    口径叫 01-mac-air。只按 (题号, 指纹) 找必然落空，同一道题就会在本机多出一行待领取
+    的空壳 —— 而本机跑过的产物、废弃记录全挂在原来那行上，界面上两行并排摆着。
+    """
+    e = _entry(device="mac-air")
+    pool.append([e])
+    with session() as db:
+        db.add(Task(task_no="01", prompt_hash=e.prompt_sha, status=DISCARDED,
+                    user_prompt=e.user_prompt, origin=ORIGIN_POOL,
+                    pool_entry_id=e.id, pool_device="mac-air"))
+
+    res = pool_bank.sync_tasks()
+    assert res["added"] == []
+    assert [t.task_no for t in _tasks()] == ["01"]
+    assert _tasks()[0].status == DISCARDED
 
 
 def test_two_devices_numbering_from_01_coexist(pooled):

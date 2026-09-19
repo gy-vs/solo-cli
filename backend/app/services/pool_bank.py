@@ -90,8 +90,12 @@ def sync_tasks() -> dict:
     skipped: list[str] = []
 
     with session() as db:
-        existing = {(t.task_no, t.prompt_hash): t
-                    for t in db.execute(select(Task)).scalars()}
+        rows = list(db.execute(select(Task)).scalars())
+        existing = {(t.task_no, t.prompt_hash): t for t in rows}
+        # 已经认过领的题只认 entry id。题号是本机口径（别的设备的题带设备后缀），而池启用
+        # 之前从题面文件导进来的同一道题用的是原题号，靠 (题号, 指纹) 找必然落空，于是同一
+        # 道题会在本机多出一行待领取的空壳 —— 本机的产物、废弃记录全挂在老那行上。
+        by_entry = {t.pool_entry_id: t for t in rows if t.pool_entry_id}
         for entry in entries:
             local_no = pool.local_task_no(entry)
             if not entry.draft:
@@ -104,7 +108,7 @@ def sync_tasks() -> dict:
                 skipped.append(local_no)
                 continue
 
-            task = existing.get((local_no, parsed.prompt_hash))
+            task = by_entry.get(entry.id) or existing.get((local_no, parsed.prompt_hash))
             owner = held.get(entry.id, "")
             if owner and owner != me:
                 # 别的设备领走了。本机只是挂在待领列表里的，从列表上撤掉；已经动过手的
