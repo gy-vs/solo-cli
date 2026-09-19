@@ -66,6 +66,39 @@ def test_load_folds_the_duplicate_lines_union_leaves_behind(pooled):
     assert len(pool.load()) == 1
 
 
+def test_load_prefers_the_row_that_carries_the_full_draft(pooled):
+    """同一条记录补过题面之后，折叠要留补过的那份。
+
+    题面全文是后加的字段，补的办法是把整行重写一遍追加进去，两行 id 相同。而 union
+    合并后的行序不保证，取「先出现的」会让补进去的题面在一部分设备上永远读不到 ——
+    那边看到的仍是一道缺仓库地址、领不了的题。
+    """
+    bare = _entry()
+    filled = _entry(draft="题号：01\n\n完整题面")
+    assert bare.id == filled.id
+
+    for order in ([bare, filled], [filled, bare]):
+        pool._write_scaffold()
+        pooled.write_text("", encoding="utf-8")
+        with pooled.open("a", encoding="utf-8") as fh:
+            for e in order:
+                fh.write(json.dumps(e.to_json(), ensure_ascii=False) + "\n")
+        loaded = pool.load()
+        assert len(loaded) == 1
+        assert loaded[0].draft == "题号：01\n\n完整题面"
+
+
+def test_append_writes_a_readable_copy_of_each_draft(pooled):
+    """题面在仓库里另存一份 .md，好在 GitHub 上直接读。按设备分目录，两台设备的
+    01 题不会写到同一个文件上。"""
+    pool.append([_entry(device="mac", draft="题号：01\n本机"),
+                 _entry(device="mac-air", draft="题号：01\n那边")])
+
+    root = pooled.parent / pool.DRAFTS_DIR
+    assert (root / "mac" / "01.md").read_text(encoding="utf-8") == "题号：01\n本机"
+    assert (root / "mac-air" / "01.md").read_text(encoding="utf-8") == "题号：01\n那边"
+
+
 def test_append_skips_what_is_already_there(pooled):
     """出题失败重跑一次是常事，同一道题不该在池里堆几份。"""
     assert pool.append([_entry()]) == 1

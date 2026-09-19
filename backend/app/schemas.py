@@ -133,6 +133,8 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "submission_id": (t.upload or {}).get("submission_id"),
         "priority": t.priority,
         "origin": t.origin,
+        "pool_device": t.pool_device,
+        "claimed_by": t.claimed_by,
         "design_run_id": t.design_run_id,
         "auto_stage": t.auto_stage,
         "auto_error": t.auto_error,

@@ -13,7 +13,9 @@ from app import config
 from app.db import session
 from app.events import bus, sse_format
 from app.models import ALL_STATUSES, RUN_RUNNING, Task, TaskRun
-from app.services import designer, dockerx, gsb_uploader, llm, qa_bridge, settings_store, watchdog
+from app.services import (
+    designer, dockerx, gsb_uploader, llm, pool, qa_bridge, settings_store, watchdog,
+)
 from app.services.scheduler import scheduler
 
 router = APIRouter(prefix="/api", tags=["system"])
@@ -59,6 +61,7 @@ async def system_status() -> dict:
         "watchdog": watchdog.status(),
         "dedup": {"ok": dedup_ok, "message": dedup_why or "已启用",
                   "image": settings_store.get("qc.image")},
+        "pool": pool.snapshot(),
         "design": {"running": sorted(designer.running)},
         "counts": counts,
         "running_sides": running_sides,

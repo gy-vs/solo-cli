@@ -37,7 +37,9 @@ from app.models import (
     AVAILABLE, DESIGN_CANCELLED, DESIGN_DEDUP, DESIGN_DONE, DESIGN_FAILED, DESIGN_RUNNING,
     DISCARDED, ORIGIN_DESIGNED, DesignRun, Task, utc_now,
 )
-from app.services import dockerx, gsb_repo, llm, pool, prompt_bank, qa_bridge, settings_store
+from app.services import (
+    dockerx, gsb_repo, llm, pool, pool_bank, prompt_bank, qa_bridge, settings_store,
+)
 
 log = logging.getLogger("designer")
 
@@ -119,7 +121,7 @@ def isolation_problem() -> str:
     root = PurePosixPath(config.CODER_ROOT_HOST)
     exposed = [root / config.WORKSPACE_DIR, root / config.TRACES_DIR]
     suspects = {
-        "运行数据（题库、查重池、导出轨迹）": config.DATA_DIR_HOST,
+        "运行数据（题库副本、领取记录、导出轨迹）": config.DATA_DIR_HOST,
         # bridges 在 backend/ 下，往上两级是项目根
         "本项目代码": str(PurePosixPath(config.BRIDGE_DIR_HOST).parent.parent),
         "题库与当期口径": str(root / config.PROMPTS_ARCHIVE_DIR),
@@ -237,6 +239,8 @@ def _skill_prompt(count: int, note: str, env_facts: str) -> str:
   不要推分支。仓库、基线快照与 A / B 分支由调用方在你给出结果之后落地。
 - Phase 6 的写盘与 Phase 7 的剪贴板。不要创建或修改任何文件，题面与题库索引由调用方
   按 skill 的同一套模板渲染写入。
+- Phase 6 的「推上远端题库」。那一节针对人直接敲 /solo-prompt 的场景，这条路径上入池
+  由调用方完成。你这里的 localhost 是容器不是宿主机，调了也只会挂在连接超时上。
 - 上游 commit 不要给。基线由调用方用 git ls-remote 取上游默认分支当前 HEAD，
   你报不出一个真实存在的 40 位 SHA。
 
@@ -508,17 +512,17 @@ async def run_design(run_id: int) -> None:
         if not caps.get("ok"):
             _append_log(run_id, f"容器能力实测失败 · {caps.get('error', '')[:200]}")
 
-        # 跨设备查重池：先拉最新，再把全池投影成题库索引。skill 的 Phase 3 读那个索引
+        # 跨设备题库：先拉最新，再把全池投影成题库索引。skill 的 Phase 3 读那个索引
         # 做功能点查重与配额统计，于是另一台设备出过的题自动进入设计阶段的语义查重。
         pool_ready, pool_why = pool.available()
         if pool_ready:
             synced = await pool.sync()
-            _append_log(run_id, f"查重池 · {synced['message']}")
+            _append_log(run_id, f"远端题库 · {synced['message']}")
             pool_ready = synced["ok"]
             if pool_ready:
-                _append_log(run_id, f"查重池 · {pool.write_index()['message']}")
+                _append_log(run_id, f"远端题库 · {pool.write_index()['message']}")
         else:
-            _append_log(run_id, f"查重池未参与 · {pool_why}")
+            _append_log(run_id, f"远端题库未参与 · {pool_why}")
 
         _append_log(run_id, f"调 /solo-prompt 设计 {count} 道题（规则取自 {skill_msg}）")
         planned = await llm.ask(
@@ -585,13 +589,16 @@ async def run_design(run_id: int) -> None:
                 difficulty=str(c.get("difficulty") or ""),
                 summary=str(c.get("summary") or ""), snapshot=landed["snapshot"],
                 user_prompt=str(c.get("prompt_body") or "").strip(),
+                # 整份题面一起入池：另一台设备要靠它还原出仓库地址与初始快照才领得了这道题，
+                # 光有 prompt 正文只够查重
+                draft=text,
             ))
 
         # 推池：让另一台设备下次出题时能查到这一批。放在导入题库之前，
         # 因为查重失败也不该影响已经落地的题，而池落后一批就等于那边会重出。
         if pool_ready and pooled:
             res = await pool.add(pooled)
-            _append_log(run_id, f"查重池 · {res['message']}")
+            _append_log(run_id, f"远端题库 · {res['message']}")
 
         stats = {"planned": len(candidates), "landed": len(written),
                  "new_files": [p.name for p in written], "failures": failures,
@@ -604,6 +611,12 @@ async def run_design(run_id: int) -> None:
                                             design_run_id=run_id)
         stats.update({"parsed": imported["parsed"], "imported": len(imported["added"]),
                       "task_nos": imported["added"]})
+        # 把刚建出来的题挂到它们的池条目上。不挂的话这批题在本机没有远端归属，领取时
+        # 绕过跨设备独占，另一台设备同步到之后照样能领同一道题。
+        if pool_ready and pooled:
+            linked = pool_bank.sync_tasks()
+            _append_log(run_id, f"远端题库 · 关联本机 {len(linked['adopted'])} 道、"
+                                f"新增 {len(linked['added'])} 道")
         _set(run_id, status=DESIGN_DEDUP, stats_json=json.dumps(stats, ensure_ascii=False),
              task_ids_json=json.dumps(imported["added_ids"]))
 

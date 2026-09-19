@@ -104,7 +104,12 @@ export interface TaskBrief {
   upload_ok: boolean | null
   submission_id: number | null
   priority: number
-  origin: 'bank' | 'designed'
+  /** pool 是从远端题库同步来的，可能出自别的设备 */
+  origin: 'bank' | 'designed' | 'pool'
+  /** 出这道题的设备标识。与本机不同就是别的设备出的，题号带设备后缀 */
+  pool_device: string
+  /** 远端登记的领取者。非空且不是本机，说明这道题已经被别人领走 */
+  claimed_by: string
   design_run_id: number
   auto_stage: string
   auto_error: string
@@ -240,6 +245,16 @@ export interface SystemStatus {
     last_stats: { adopted?: number; requeued?: number; discarded?: number; held?: number; advanced?: number }
   }
   dedup: { ok: boolean; message: string; image: string }
+  /** 远端题库。enabled 为假就是单设备模式，题目来自本机题面文件 */
+  pool: {
+    enabled: boolean; ok: boolean; message: string
+    repo: string; device: string
+    total: number; mine: number
+    /** 领取是跨设备口径：unclaimed 才是这台机器还能领的 */
+    claimed: number; claimed_by_me: number; claimed_by_others: number; unclaimed: number
+    /** 缺题面全文、暂时领不了的老条目数 */
+    draftless: number
+  }
   design: { running: number[] }
   counts: Record<Status, number>
   running_sides: number
@@ -296,7 +311,8 @@ export const api = {
     return get<{ items: TaskBrief[] }>(`/api/tasks${q.toString() ? '?' + q : ''}`)
   },
   task: (id: number) => get<TaskDetail>(`/api/tasks/${id}`),
-  importBank: () => post<{ parsed: number; added: string[]; skipped: number }>('/api/tasks/import'),
+  /** 拉远端题库。池没启用时后端会自动退回本地题面文件的导入 */
+  syncBank: () => post<{ ok: boolean; message: string; added?: string[]; removed?: string[]; skipped?: string[] }>('/api/tasks/sync'),
 
   // ---- 领取与门禁 ----
   gate: (id: number) => post<GateReport>(`/api/tasks/${id}/gate`),

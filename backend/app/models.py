@@ -82,8 +82,9 @@ ANALYSIS_RUNNING = "RUNNING"
 ANALYSIS_DONE = "DONE"
 ANALYSIS_FAILED = "FAILED"
 
-ORIGIN_BANK = "bank"
-ORIGIN_DESIGNED = "designed"
+ORIGIN_BANK = "bank"        # 本机题面文件解析而来
+ORIGIN_DESIGNED = "designed"  # 本机 /solo-prompt 刚出的
+ORIGIN_POOL = "pool"        # 从远端题库拉下来的（可能是别的设备出的）
 
 # 设计任务状态
 DESIGN_QUEUED = "QUEUED"
@@ -178,6 +179,14 @@ class Task(Base, JsonMixin):
     # ---- 队列与来源 ----
     priority: Mapped[int] = mapped_column(Integer, default=0, index=True)   # 越小越先出队
     origin: Mapped[str] = mapped_column(String(16), default=ORIGIN_BANK)
+    # 这道题在远端题库里的条目 id（pool.Entry.id）。领取要拿它去远端占位，没有这个值
+    # 的题就是纯本机题（池没启用时导入的），领取不走跨设备独占。
+    pool_entry_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    # 出这道题的设备。与本机标识不同就是别的设备出的，题号带设备后缀，见 pool.local_task_no。
+    pool_device: Mapped[str] = mapped_column(String(64), default="")
+    # 远端登记的领取者。本机领到时写自己的标识，释放后清空。做题进度不看它 —— 远端只
+    # 管「这道题归谁」，归属之后走到哪一步由本机的 status 说了算。
+    claimed_by: Mapped[str] = mapped_column(String(64), default="")
     design_run_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     dedup_json: Mapped[str] = mapped_column(Text, default="{}")             # 设计产出的查重结论
     # 自动流水线当前卡在哪一步，仅供界面展示；取值由流水线模块自行定义

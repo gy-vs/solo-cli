@@ -6,11 +6,13 @@ import SideStrip from './SideStrip.vue'
 import StatusPill from './StatusPill.vue'
 import { fmtTime, HEX, VERDICT_LABEL } from '../status'
 
-const props = defineProps<{ task: TaskBrief; busy?: boolean }>()
+const props = defineProps<{ task: TaskBrief; busy?: boolean; device?: string }>()
 const emit = defineEmits<{
   (e: 'claim'): void; (e: 'release'): void; (e: 'open'): void
   (e: 'discard'): void; (e: 'restore'): void
 }>()
+/** 别的设备出的题。题号带设备后缀，来源也要标出来，否则两台机器的题在列表里分不开 */
+const fromOther = computed(() => !!props.task.pool_device && props.task.pool_device !== props.device)
 const diffColor = (d: string) => (d.includes('困难') ? HEX.warn : d.includes('中') ? HEX.run : HEX.fg1)
 const claimable = () => props.task.status === 'AVAILABLE' || props.task.status === 'CLAIMED'
 const discardable = () => !['RUNNING', 'QUEUED', 'ANALYZING', 'DISCARDED'].includes(props.task.status)
@@ -22,7 +24,12 @@ const branchBad = computed(() => props.task.branch_check?.ok === false)
 <template>
   <div class="card card-hover p-4 flex flex-col gap-3" :class="task.status === 'DISCARDED' ? 'opacity-70' : ''">
     <div class="flex items-start justify-between gap-2">
-      <span class="mono text-xs px-2 h-6 inline-flex items-center rounded-md bg-bg3 text-fg0 border border-line">#{{ task.task_no }}</span>
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="mono text-xs px-2 h-6 inline-flex items-center rounded-md bg-bg3 text-fg0 border border-line">#{{ task.task_no }}</span>
+        <span v-if="fromOther" class="pill h-6 text-[12px] text-fg1 shrink-0" :title="`由 ${task.pool_device} 出题`">
+          {{ task.pool_device }}
+        </span>
+      </div>
       <div class="flex items-center gap-2">
         <span class="pill h-6 text-[12px]" :style="{ color: diffColor(task.difficulty), borderColor: diffColor(task.difficulty) + '66' }">{{ task.difficulty || '未标难度' }}</span>
         <StatusPill v-if="task.status !== 'AVAILABLE'" :status="task.status" small />

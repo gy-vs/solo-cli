@@ -12,7 +12,7 @@ from app.db import session
 from app.events import bus, sse_format
 from app.models import DesignRun, Task
 from app.schemas import DesignStart, IdList, design_run, task_brief
-from app.services import designer, pool, settings_store
+from app.services import designer, pool, pool_bank, settings_store
 
 router = APIRouter(prefix="/api/design", tags=["design"])
 
@@ -67,7 +67,7 @@ async def dedup(body: IdList) -> dict:
     return {"ok": True, "passed": passed, "discarded": discarded}
 
 
-# ---------------- 跨设备查重池 ----------------
+# ---------------- 跨设备题库 ----------------
 
 @router.get("/pool")
 async def pool_status() -> dict:
@@ -85,14 +85,16 @@ async def pool_sync() -> dict:
 
 @router.post("/pool/bootstrap")
 async def pool_bootstrap() -> dict:
-    """把本机已有的题一次性推进池。第一次启用池时用。
+    """把本机已有的题一次性推上远端题库。第一次启用时用。
 
-    幂等：已经在池里的题会被跳过，重复点不会写重复行。
+    幂等：已经在上面的题会被跳过，重复点不会写重复行。推完顺带投影一次，让本机的题
+    立刻带上远端条目 id —— 没有它的题领取时绕过跨设备独占，另一台设备照样能领。
     """
     res = await pool.bootstrap()
     if not res["ok"]:
         raise HTTPException(409, res["message"])
-    return {**res, "pool": pool.snapshot()}
+    linked = pool_bank.sync_tasks()
+    return {**res, "linked": len(linked["adopted"]), "pool": pool.snapshot()}
 
 
 @router.get("/{run_id}")

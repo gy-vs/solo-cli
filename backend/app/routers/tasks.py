@@ -24,12 +24,16 @@ from app.schemas import (
     GsbUpdate, IdList, QueueMove, RerunRequest, ScreencastUpdate, task_brief, task_detail,
 )
 from app.services import (
-    dockerx, gate, gsb_analyzer, gsb_repo, gsb_uploader, gsb_verifier, prompt_bank, runner,
-    scheduler, settings_store, trace, watchdog,
+    dockerx, gate, gsb_analyzer, gsb_repo, gsb_uploader, gsb_verifier, pool, pool_bank,
+    prompt_bank, runner, scheduler, settings_store, trace, watchdog,
 )
 
 log = logging.getLogger("tasks")
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+# 领取被别的设备抢先时的错误码。界面靠它区分「这题没了」和普通的领取失败：
+# 前者要提示一句并立刻刷新列表，后者停在原地让人看门禁报告。
+POOL_TAKEN = "POOL_TAKEN"
 
 
 def _get(db, task_id: int) -> Task:  # noqa: ANN001
@@ -52,13 +56,27 @@ def _side(value: str) -> str:
 
 # ---------------- 题库 ----------------
 
+@router.post("/sync")
+async def sync_bank() -> dict:
+    """从远端题库拉最新的可领取题目。池没启用时退回本地题面文件。"""
+    if not pool.enabled():
+        return await import_bank()
+    res = await pool_bank.refresh()
+    if not res["ok"]:
+        raise HTTPException(400, res["message"])
+    bus.publish("tasks", {"type": "bank"})
+    return res
+
+
 @router.post("/import")
 async def import_bank() -> dict:
+    """解析本机题面文件导入。单设备模式下的题库来源，也给远端不可用时兜底。"""
     if not config.prompt_file().exists():
         raise HTTPException(400, f"找不到题库文件 {config.prompt_file()}")
     res = prompt_bank.import_tasks()
     bus.publish("tasks", {"type": "bank"})
-    return res
+    return {"ok": True, "message": f"解析 {res['parsed']} 题，新增 {len(res['added'])}，"
+                                   f"已存在 {res['skipped']}", **res}
 
 
 @router.get("")
@@ -146,7 +164,17 @@ async def batch_claim(body: IdList) -> dict:
         try:
             results.append({"id": tid, **(await _claim(tid, force=False))})
         except HTTPException as exc:
-            results.append({"id": tid, "queued": False, "error": exc.detail})
+            # 被别的设备抢先时 detail 是结构化的，拆出错误码让界面能单独统计一句
+            # 「N 道被其他设备领走」，混在门禁未过里报会让人以为是自己这边有问题。
+            #
+            # 404 在这里也归到同一类：批量领取跑到一半时题目整行消失，只可能是前一道题
+            # 被抢先触发的那次重投影把它一起撤掉了，而撤掉的唯一条件就是它也被别的设备
+            # 领走了（见 pool_bank.sync_tasks）。
+            d = exc.detail
+            structured = isinstance(d, dict)
+            code = d.get("code", "") if structured else ("POOL_TAKEN" if exc.status_code == 404 else "")
+            results.append({"id": tid, "queued": False, "code": code,
+                            "error": d.get("message", "") if structured else str(d)})
     return {"results": results}
 
 
@@ -171,12 +199,46 @@ async def claim(task_id: int, force: bool = Query(default=False)) -> dict:
     return await _claim(task_id, force)
 
 
+async def _take_remote(task_id: int) -> None:
+    """在远端把这道题占下来。占不到就抛 409，并把本机列表刷成远端的样子。
+
+    必须发生在准备工作区之前：clone 两个分支要几十秒到几分钟，等跑完再发现题被人领走了，
+    这段机器时间就白烧了，磁盘上还留着一份没人要的工作区。
+    """
+    with session() as db:
+        t = _get(db, task_id)
+        entry_id, task_no = t.pool_entry_id, t.task_no
+    if not entry_id:
+        return      # 纯本机题（池没启用时导入的），不存在跨设备归属
+
+    res = await pool.claim_remote(entry_id, task_no=task_no)
+    if res["ok"]:
+        with session() as db:
+            _get(db, task_id).claimed_by = pool.device()
+        return
+
+    taken_by = res.get("taken_by", "")
+    if not taken_by:
+        raise HTTPException(409, detail={"code": "POOL_UNREACHABLE", "message": res["message"]})
+    # 被抢先了。顺手按远端刷一遍本机题库：这道题会从待领列表里消失，界面收到
+    # bank 事件后重新拉一次就是最新的，不必让人自己去点同步。
+    pool_bank.sync_tasks()
+    bus.publish("tasks", {"type": "bank"})
+    raise HTTPException(409, detail={"code": POOL_TAKEN, "taken_by": taken_by,
+                                     "task_no": task_no, "message": res["message"]})
+
+
 async def _claim(task_id: int, force: bool) -> dict:
     """领取的实际动作。进程内的调用方一律走这里，见 batch_claim 的说明。"""
     with session() as db:
         t = _get(db, task_id)
         if t.status not in (AVAILABLE, CLAIMED):
             raise HTTPException(409, f"当前状态 {t.status} 不能领取")
+
+    await _take_remote(task_id)
+
+    with session() as db:
+        t = _get(db, task_id)
         t.status = CLAIMED
         t.claimed_at = t.claimed_at or utc_now()
         db.flush()
@@ -216,16 +278,33 @@ async def _claim(task_id: int, force: bool) -> dict:
 
 @router.post("/{task_id}/release")
 async def release(task_id: int) -> dict:
+    """放回题库。题在远端登记过的，先撤销那边的领取再动本机状态。
+
+    顺序不能反：先把本机改成待领取、再去撤远端，万一撤不掉，这道题在远端还记在本机名下，
+    别的设备领不了，本机却已经把它摆回待领列表 —— 界面上看是可领的，实际上谁都领不走。
+    """
     with session() as db:
         t = _get(db, task_id)
         if t.status not in (CLAIMED, QUEUED):
             raise HTTPException(409, "只有未开始运行的任务可以放回题库")
+        entry_id, task_no = t.pool_entry_id, t.task_no
+
+    message = ""
+    if entry_id:
+        res = await pool.release_remote(entry_id, task_no=task_no)
+        if not res["ok"]:
+            raise HTTPException(409, f"远端没能撤销领取，题仍归本机：{res['message']}")
+        message = res["message"]
+
+    with session() as db:
+        t = _get(db, task_id)
         t.status = AVAILABLE
         t.claimed_at = None
+        t.claimed_by = ""
         for r in _runs(db, task_id):
             db.delete(r)
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return {"ok": True}
+    return {"ok": True, "message": message or "已放回题库"}
 
 
 @router.post("/{task_id}/discard")

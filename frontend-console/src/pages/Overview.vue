@@ -21,14 +21,14 @@ const recent = computed(() => [...liveTasks.value]
   .sort((a, b) => (b.finished_at || b.claimed_at || '').localeCompare(a.finished_at || a.claimed_at || ''))
   .slice(0, 8))
 
-const importing = ref(false)
-async function doImport() {
-  importing.value = true
+const syncing = ref(false)
+async function doSync() {
+  syncing.value = true
   try {
-    const r = await api.importBank()
-    msg.success(`解析 ${r.parsed} 题，新增 ${r.added.length} 题${r.added.length ? '：' + r.added.join(', ') : ''}`)
+    const r = await api.syncBank()
+    msg.success(r.message)
     await Promise.all([refreshTasks(), refreshStatus()])
-  } catch (e: any) { msg.error(e.message) } finally { importing.value = false }
+  } catch (e: any) { msg.error(e.message) } finally { syncing.value = false }
 }
 const pipeline: Status[] = ['AVAILABLE', 'QUEUED', 'RUNNING', 'RUN_DONE', 'ANALYZED', 'UPLOADED', 'DONE']
 const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => !t.screencast?.[x])
@@ -42,7 +42,9 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
         <div class="text-fg1 text-xs mt-0.5">设计题目 → 题库 → A/B 双容器同时跑 → 自动提交产物 → 自动对比出 GSB → 补录屏链接 → 上传</div>
       </div>
       <div class="ml-auto flex gap-2">
-        <NButton size="small" secondary :loading="importing" @click="doImport">重新扫描题面</NButton>
+        <NButton size="small" secondary :loading="syncing" @click="doSync">
+          {{ s?.pool.enabled ? '同步远端题库' : '重新扫描题面' }}
+        </NButton>
         <NButton size="small" secondary @click="router.push('/design')">设计题目</NButton>
         <NButton size="small" type="primary" @click="router.push('/bank')">去题库领题</NButton>
       </div>

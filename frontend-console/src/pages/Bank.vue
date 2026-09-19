@@ -2,7 +2,7 @@
 import { NButton, NInput, useDialog, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, type GateReport, type Status, type TaskBrief } from '../api'
+import { api, ApiError, type GateReport, type Status, type TaskBrief } from '../api'
 import GateModal from '../components/GateModal.vue'
 import TaskCard from '../components/TaskCard.vue'
 import { discardedTasks, liveTasks, refreshTasks, store } from '../store'
@@ -46,6 +46,13 @@ const gateTask = ref<TaskBrief | null>(null)
 const gateReport = ref<GateReport | null>(null)
 const busyId = ref<number | null>(null)
 
+const pool = computed(() => store.status?.pool)
+
+/** 这道题在别的设备上先被领走了。后端已经把它从本机题库里撤掉，这里只负责说一声并刷新 */
+function takenBy(e: unknown): string {
+  return e instanceof ApiError && e.detail?.code === 'POOL_TAKEN' ? e.detail.message : ''
+}
+
 async function claim(t: TaskBrief) {
   busyId.value = t.id
   try {
@@ -62,7 +69,13 @@ async function claim(t: TaskBrief) {
       gateShow.value = true
       await refreshTasks()
     }
-  } catch (e: any) { msg.error(e.message) } finally { busyId.value = null }
+  } catch (e: any) {
+    const taken = takenBy(e)
+    if (taken) msg.warning(`${taken}，已从本机题库移除`, { duration: 6000 })
+    else msg.error(e.message)
+    // 被抢走时列表必须重拉：那道题的卡片还留在页面上，不刷新就会让人反复点同一张
+    await refreshTasks()
+  } finally { busyId.value = null }
 }
 async function recheck() {
   if (!gateTask.value) return
@@ -101,14 +114,14 @@ async function restore(t: TaskBrief) {
   } catch (e: any) { msg.error(e.message) } finally { busyId.value = null }
 }
 
-const importing = ref(false)
-async function doImport() {
-  importing.value = true
+const syncing = ref(false)
+async function doSync() {
+  syncing.value = true
   try {
-    const r = await api.importBank()
-    msg.success(`解析 ${r.parsed} 题，新增 ${r.added.length}，已存在 ${r.skipped}`)
+    const r = await api.syncBank()
+    msg.success(r.message)
     await refreshTasks()
-  } catch (e: any) { msg.error(e.message) } finally { importing.value = false }
+  } catch (e: any) { msg.error(e.message) } finally { syncing.value = false }
 }
 const batching = ref(false)
 async function claimAll() {
@@ -116,8 +129,8 @@ async function claimAll() {
   if (!ids.length) return
   dialog.info({
     title: '全部领取并启动',
-    content: `将对 ${ids.length} 道题逐个拉取 A、B 分支并执行门禁，通过的进队列。一道题占两个容器槽位，`
-      + '排不下的会在队列里等。门禁不通过的保持「已领取」，需单独处理。',
+    content: `将对 ${ids.length} 道题逐个在远端登记领取，再拉取 A、B 分支并执行门禁，通过的进队列。`
+      + '一道题占两个容器槽位，排不下的会在队列里等。门禁不通过的保持「已领取」，需单独处理。',
     positiveText: '开始',
     negativeText: '取消',
     onPositiveClick: async () => {
@@ -125,7 +138,11 @@ async function claimAll() {
       try {
         const r = await api.batchClaim(ids)
         const ok = r.results.filter((x) => x.queued).length
-        msg.info(`${ok} 题入队，${ids.length - ok} 题门禁未过`)
+        const taken = r.results.filter((x) => x.code === 'POOL_TAKEN').length
+        // 被其他设备领走的单独报一句：混在「门禁未过」里会让人以为是本机环境有问题
+        msg.info(`${ok} 题入队`
+          + (taken ? `，${taken} 题已被其他设备领走` : '')
+          + (ids.length - ok - taken ? `，${ids.length - ok - taken} 题门禁未过` : ''))
         await refreshTasks()
       } catch (e: any) { msg.error(e.message) } finally { batching.value = false }
     },
@@ -138,10 +155,20 @@ async function claimAll() {
     <div class="flex items-center gap-3">
       <div>
         <div class="h1">题库</div>
-        <div class="text-fg1 text-xs mt-0.5">来自 <span class="mono">{{ store.status?.paths.prompt_file }}</span>，领取后拉取 A、B 分支并各起一个容器</div>
+        <div v-if="pool?.enabled" class="text-fg1 text-xs mt-0.5">
+          来自远端 <span class="mono">{{ pool.repo || '未配置仓库' }}</span>，本机标识
+          <span class="mono">{{ pool.device }}</span>，共 {{ pool.total }} 道
+          <span v-if="pool.claimed_by_others">，其他设备已领走 {{ pool.claimed_by_others }} 道</span>
+          。领取会先在远端占位，再拉取 A、B 分支并各起一个容器
+        </div>
+        <div v-else class="text-fg1 text-xs mt-0.5">
+          来自 <span class="mono">{{ store.status?.paths.prompt_file }}</span>，领取后拉取 A、B 分支并各起一个容器
+        </div>
       </div>
       <div class="ml-auto flex gap-2">
-        <NButton size="small" secondary :loading="importing" @click="doImport">重新扫描</NButton>
+        <NButton size="small" secondary :loading="syncing" @click="doSync">
+          {{ pool?.enabled ? '同步远端题库' : '重新扫描' }}
+        </NButton>
         <NButton size="small" type="primary" secondary :loading="batching" :disabled="!counts.available" @click="claimAll">
           全部领取并启动（{{ counts.available }}）
         </NButton>
@@ -158,6 +185,11 @@ async function claimAll() {
       <NInput v-model:value="q" size="small" placeholder="搜索题号 / 类型 / 语言 / 仓库 / 正文" clearable class="!w-72 ml-auto" />
     </div>
 
+    <div v-if="pool?.enabled && pool.draftless" class="card px-4 py-3 text-xs text-fg1">
+      <span class="text-warn">远端有 {{ pool.draftless }} 道题只存了 prompt 正文</span>，
+      缺仓库地址与初始快照，暂时领不了。出这些题的设备同步一次就会自动补齐。
+    </div>
+
     <div v-if="badBranch.length" class="card px-4 py-3 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs">
       <span class="text-err">分支结构不合规，领不了：</span>
       <span v-for="t in badBranch" :key="t.id" class="flex items-center gap-1.5 text-fg1"
@@ -170,13 +202,14 @@ async function claimAll() {
     </div>
 
     <div v-if="items.length" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-      <TaskCard v-for="t in items" :key="t.id" :task="t" :busy="busyId === t.id"
+      <TaskCard v-for="t in items" :key="t.id" :task="t" :busy="busyId === t.id" :device="pool?.device"
         @claim="claim(t)" @release="release(t)" @open="router.push(`/tasks/${t.id}`)"
         @discard="discard(t)" @restore="restore(t)" />
     </div>
     <div v-else class="card empty">
       <template v-if="tab === 'discarded'">没有废弃的题</template>
       <template v-else-if="store.tasks.length">没有匹配的题</template>
+      <template v-else-if="pool?.enabled">远端题库里没有可领的题，点右上角同步一次，或先去出一批</template>
       <template v-else>题面文件里没有可解析的题，请检查格式后重新扫描</template>
     </div>
 

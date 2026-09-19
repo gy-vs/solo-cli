@@ -14,7 +14,7 @@ from app.routers import design as design_router
 from app.routers import settings as settings_router
 from app.routers import system as system_router
 from app.routers import tasks as tasks_router
-from app.services import prompt_bank, settings_store, watchdog
+from app.services import pool, pool_bank, prompt_bank, settings_store, watchdog
 from app.services.scheduler import scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,8 +31,16 @@ async def lifespan(_: FastAPI):
     seeded = settings_store.seed_from_env()
     if seeded:
         log.info("从环境变量导入设置种子：%s", ", ".join(seeded))
+    # 题库来源二选一，不并存：池启用时远端是唯一真相源，本机题面文件只是出题的产物，
+    # 再导一遍会让同一道题在本机多出一行没有远端归属、因而不受跨设备独占保护的副本。
     try:
-        if config.prompt_file().exists():
+        if pool.enabled():
+            res = await pool_bank.refresh()
+            if res["ok"]:
+                log.info("题库同步：%s", res["message"])
+            else:
+                log.warning("题库同步失败，本机题目仍是上次同步的样子：%s", res["message"])
+        elif config.prompt_file().exists():
             res = prompt_bank.import_tasks()
             log.info("题库导入：解析 %s 题，新增 %s，已存在 %s", res["parsed"], res["added"] or 0, res["skipped"])
         else:
@@ -46,6 +54,13 @@ async def lifespan(_: FastAPI):
     log.info("Console : http://localhost:%s", config.HOST_PORT)
     log.info("API     : http://localhost:%s/api/health", config.HOST_PORT)
     log.info("Coder   : %s (mount %s)", config.CODER_ROOT_HOST, config.CODER_ROOT_MOUNT)
+    snap = pool.snapshot()
+    if snap["enabled"]:
+        log.info("题库    : 远端 %s，本机标识 %s；共 %s 道，本机已领 %s 道、其他设备领走 %s 道",
+                 snap["repo"] or "未配置", snap["device"], snap["total"],
+                 snap["claimed_by_me"], snap["claimed_by_others"])
+    else:
+        log.info("题库    : 本地 %s（单设备模式，未启用远端题库）", config.prompt_file())
     log.info("巡检    : 每 %s 秒一轮，一侧最多跑 %s 次 / 超时 %s 次，用尽自动废弃整题%s",
              settings_store.get_int("watchdog.interval_seconds", watchdog.INTERVAL_DEFAULT),
              settings_store.get_int("watchdog.max_retries", watchdog.MAX_RETRIES_DEFAULT),

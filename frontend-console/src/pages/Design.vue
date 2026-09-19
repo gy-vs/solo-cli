@@ -31,7 +31,7 @@ async function toggleLog(id: number) {
 const CHECK_LABEL: Record<string, string> = {
   cursor_cli: 'Cursor CLI', cursor_key: 'Cursor API Key', skill: 'solo-prompt SOP',
   gh: 'GitHub CLI', gh_token: 'GitHub Token', requirements: '需求文档', dedup: '查重通道',
-  pool: '跨设备查重池', isolation: '出题资料隔离',
+  pool: '跨设备题库', isolation: '出题资料隔离',
 }
 /**
  * 缺了就跑不起来的项；gh 类只影响建仓库那一步，先放行。
@@ -81,7 +81,7 @@ onUnmounted(() => clearInterval(timer))
     <div>
       <div class="h1">设计题目</div>
       <div class="text-fg1 text-xs mt-0.5">
-        Cursor CLI 按 solo-prompt 的 SOP 出题，产出直接进题库，随后用 solo-qa 的规则 A 与规则 C 查重，命中的自动废弃
+        Cursor CLI 按 solo-prompt 的 SOP 出题，整批推上跨设备题库供两台设备领取，随后用 solo-qa 的规则 A 与规则 C 查重，命中的自动废弃
       </div>
     </div>
 
