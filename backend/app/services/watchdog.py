@@ -35,7 +35,8 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import (
-    ANALYSIS_FAILED, ANALYSIS_IDLE, ANALYZING, DISCARDED, NEEDS_ATTENTION, QUEUED, RUN_DONE,
+    ANALYSIS_FAILED, ANALYSIS_IDLE, ANALYSIS_RUNNING, ANALYZING, DISCARDED, NEEDS_ATTENTION,
+    QUEUED, RUN_DONE,
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
     RUN_TIMEOUT, WATCHED, RunEvent, Task, TaskRun, utc_now,
 )
@@ -62,6 +63,11 @@ _stopping = False
 # 分析纯属白做；而且 Lock 会绑到创建它的事件循环上，测试里每个用例各起一个循环，
 # 同一把锁跨循环复用会直接抛错。判断与写入之间没有 await，单线程事件循环里是原子的。
 _advancing: set[int] = set()
+# 在跑的后台推进，{task_id: task}。推进不能在巡检循环里直接 await：它要跑 GSB 分析和
+# 质检，两个都在调模型，一道题十几二十分钟是常态，模型不返回时还要再乘上 llm 的重试
+# 次数。占住的不只是配对这一步 —— 补记账、异常重跑跟它在同一轮 tick 里，于是跑挂的等
+# 不到重跑、跑完的等不到配对，整套定时任务看上去就是停摆了，而容器照常在跑。
+_advance_tasks: dict[int, asyncio.Task] = {}
 _last_tick_at: datetime | None = None
 _last_error = ""
 _last_stats: dict = {}
@@ -90,6 +96,7 @@ def status() -> dict:
         "max_retries": settings_store.get_int("watchdog.max_retries", MAX_RETRIES_DEFAULT),
         "max_timeouts": settings_store.get_int("watchdog.max_timeouts", MAX_TIMEOUTS_DEFAULT),
         "alive": alive(),
+        "advancing": len(_advance_tasks),
         "last_tick_at": _last_tick_at.isoformat() if _last_tick_at else None,
         "last_error": _last_error,
         "last_stats": _last_stats,
@@ -824,16 +831,49 @@ async def _reconcile_containers() -> int:
     return fixed
 
 
+def _reap_advances() -> None:
+    """把跑完的后台推进从台账上划掉，顺带把没接住的异常记一笔。
+
+    不记的话这种异常就彻底无声：create_task 出来的任务谁也不 await 它，抛了什么
+    只留在 Task 对象里，而那个对象下一刻就被丢掉了。
+    """
+    for task_id, job in list(_advance_tasks.items()):
+        if not job.done():
+            continue
+        _advance_tasks.pop(task_id, None)
+        if job.cancelled():
+            continue
+        if exc := job.exception():
+            log.error("题 %s 推进异常：%s: %s", task_id, type(exc).__name__, exc)
+
+
+async def _advance_one(task_id: int) -> None:
+    r = await advance_pair(task_id)
+    if not r.get("ok"):
+        log.warning("题 %s 推进失败：%s", task_id, r.get("message") or r.get("error"))
+
+
 async def _scan_pairs() -> int:
-    advanced = 0
+    """把两侧都跑完的题交给后台推进，不等它跑完。返回这一轮新起了几个。
+
+    并发额度就是设置里那个「分析/质检并发」：这两步都在调模型，一起开太多只会互相
+    拖慢。额度占满时剩下的题留到下一轮，它们的状态没变，扫描照样挑得到。
+    """
+    _reap_advances()
+    limit = max(1, settings_store.get_int("auto.max_parallel", 2))
+    started = 0
     for task_id in _pairs_ready():
-        log.info("题 %s 两侧都跑完了，开始推产物、写描述、质检", task_id)
-        r = await advance_pair(task_id)
-        if r.get("ok"):
-            advanced += 1
-        else:
-            log.warning("题 %s 推进失败：%s", task_id, r.get("message") or r.get("error"))
-    return advanced
+        if len(_advance_tasks) >= limit:
+            break
+        # create_task 排到事件循环里才真正开跑，在那之前题的状态还是原样，下一轮扫描
+        # 照样会挑中它。所以占位要在这里同步做，不能等 advance_pair 自己去 _advancing。
+        if task_id in _advance_tasks or task_id in _advancing:
+            continue
+        log.info("题 %s 两侧都跑完了，交给后台推产物、写描述、质检", task_id)
+        _advance_tasks[task_id] = asyncio.create_task(
+            _advance_one(task_id), name=f"advance-{task_id}")
+        started += 1
+    return started
 
 
 async def tick() -> dict:
@@ -875,9 +915,11 @@ async def _loop() -> None:
             _last_tick_at, _last_error, _last_stats = utc_now(), "", stats
             # 每轮都留一行。巡检绝大多数时候什么都不做，一声不吭的话，「它到底还在不在
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
-            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 推进 %s · 耗时 %.1fs",
+            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 起推进 %s（在跑 %s）"
+                     " · 耗时 %.1fs",
                      stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
-                     stats["advanced"], (utc_now() - began).total_seconds())
+                     stats["advanced"], len(_advance_tasks),
+                     (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001
@@ -892,9 +934,30 @@ async def _loop() -> None:
         _wake.clear()
 
 
+def reset_stale_analyses() -> list[str]:
+    """把上一个进程留下的「分析中」复位，返回被复位的题号。
+
+    analysis_status 记的是一个进程内的协程在不在跑，而协程随进程一起没了，库里那个
+    RUNNING 还留着。配对扫描只挑 IDLE 的题，于是这些题谁也不会再碰：界面上永远显示
+    分析中，人只能挨个去点重新分析。产物都在分支上了，重跑一次分析没有副作用。
+    """
+    out: list[str] = []
+    with session() as db:
+        for task in db.execute(select(Task).where(
+                Task.analysis_status == ANALYSIS_RUNNING)).scalars():
+            task.analysis_status = ANALYSIS_IDLE
+            if task.status == ANALYZING:
+                task.status = RUN_DONE
+            task.auto_error = ""
+            out.append(task.task_no)
+    return out
+
+
 async def start() -> None:
     global _task, _stopping
     _stopping = False
+    if stale := reset_stale_analyses():
+        log.warning("上次进程留下 %s 道题卡在分析中，已复位重排：%s", len(stale), "、".join(stale))
     _task = asyncio.create_task(_loop(), name="watchdog-loop")
 
 
@@ -902,6 +965,9 @@ async def stop() -> None:
     global _stopping
     _stopping = True
     _wake.set()
+    for job in _advance_tasks.values():
+        job.cancel()
+    _advance_tasks.clear()
     if _task:
         _task.cancel()
 

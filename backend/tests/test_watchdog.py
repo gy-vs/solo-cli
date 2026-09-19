@@ -691,6 +691,117 @@ def test_pairs_ready_needs_both_sides_finished(task_with_runs):
     assert wd._pairs_ready() == [task_id]
 
 
+@pytest.fixture()
+def clean_advances():
+    """后台推进的台账是模块级的，用例之间必须擦干净。"""
+    wd._advance_tasks.clear()
+    yield
+    for job in wd._advance_tasks.values():
+        job.cancel()
+    wd._advance_tasks.clear()
+
+
+def _ready_task(task_no: str) -> int:
+    """再造一道两侧都正常跑完、等着推进的题。"""
+    from app.db import session
+
+    with session() as db:
+        t = m.Task(task_no=task_no, prompt_hash=f"h-{task_no}", user_prompt="做点事",
+                   status=m.QUEUED, repo_url="https://github.com/acme/widget",
+                   env_snapshot="https://github.com/acme/widget/commit/" + "c" * 40)
+        db.add(t)
+        db.flush()
+        task_id = t.id
+        ids = {}
+        for side in ("A", "B"):
+            r = m.TaskRun(task_id=task_id, side=side,
+                          container_name=f"solo-cc-{task_no}-{side}")
+            db.add(r)
+            db.flush()
+            ids[side] = r.id
+    _finish_both(ids)
+    return task_id
+
+
+def test_scan_pairs_hands_the_advance_to_the_background(task_with_runs, monkeypatch,
+                                                        clean_advances):
+    """推进不能在巡检循环里等它跑完。
+
+    推进要跑 GSB 分析和质检，两个都在调模型，一道题十几二十分钟是常态，模型不返回时
+    还要按 llm 的重试次数再乘一遍。而补记账、异常重跑跟配对在同一轮 tick 里，等它就
+    等于整套定时任务停摆：容器照常跑，跑挂的没人重跑，跑完的也没人配对。
+    """
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+
+    async def main():
+        gate = asyncio.Event()
+
+        async def slow(tid):
+            await gate.wait()
+            return {"ok": True}
+
+        monkeypatch.setattr(wd, "advance_pair", slow)
+        # 推进还卡在模型上，这一轮扫描必须已经回来了
+        assert await asyncio.wait_for(wd._scan_pairs(), timeout=2) == 1
+        assert task_id in wd._advance_tasks
+        gate.set()
+        await wd._advance_tasks[task_id]
+
+    asyncio.run(main())
+
+
+def test_scan_pairs_stops_at_the_concurrency_limit(task_with_runs, monkeypatch,
+                                                   clean_advances):
+    """并发额度就是设置里那个「分析/质检并发」，两步都在调模型，开太多互相拖慢。"""
+    from app.services import settings_store
+
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    _ready_task("08")
+    settings_store.set_one("auto.max_parallel", "1")
+    assert len(wd._pairs_ready()) == 2
+
+    async def main():
+        gate = asyncio.Event()
+
+        async def slow(tid):
+            await gate.wait()
+            return {"ok": True}
+
+        monkeypatch.setattr(wd, "advance_pair", slow)
+        # 包一层超时：推进一旦变回在扫描里直接 await，这里会卡到天荒地老而不是报错
+        assert await asyncio.wait_for(wd._scan_pairs(), timeout=2) == 1
+        # 额度占满，第二道留到下一轮：它的状态没变，扫描照样挑得到
+        assert await asyncio.wait_for(wd._scan_pairs(), timeout=2) == 0
+        assert len(wd._advance_tasks) == 1
+        gate.set()
+        for job in list(wd._advance_tasks.values()):
+            await job
+
+    asyncio.run(main())
+
+
+def test_a_stale_analysis_is_reset_so_the_pair_can_be_picked_up(task_with_runs):
+    """进程没了，库里那个「分析中」还留着。
+
+    analysis_status 记的是一个协程在不在跑，而协程随进程一起没了。配对扫描只挑 IDLE
+    的题，不复位就谁也不会再碰它：界面上永远显示分析中，人只能挨个去点重新分析。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.status = m.ANALYZING
+        t.analysis_status = m.ANALYSIS_RUNNING
+
+    assert wd._pairs_ready() == []          # 卡住的时候扫描够不着它
+    assert wd.reset_stale_analyses() == ["07"]
+    assert wd._pairs_ready() == [task_id]
+
+
 # ---------------- 收养孤儿 ----------------
 
 @pytest.fixture()
