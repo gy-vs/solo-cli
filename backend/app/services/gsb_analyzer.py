@@ -37,9 +37,11 @@ VERDICTS = tuple(VERDICT_LABEL)
 
 # 单侧材料的字符预算。补丁最占地方，但它也是判断产物好坏的唯一依据，所以给得最宽；
 # 超了就按文件截断并说明，而不是整段砍掉——半截补丁比没有补丁更容易让人误判。
-DIFF_BUDGET = 60000
-STEP_LIMIT = 220
-STEP_TEXT_LIMIT = 160
+# 预算不能再放宽：两侧补丁加轨迹曾经到过 190KB，Opus 生成加上 HTTP/2 长流，
+# 容器里经常 15 分钟被掐掉再整段重跑。
+DIFF_BUDGET = 40000
+STEP_LIMIT = 140
+STEP_TEXT_LIMIT = 120
 
 # 这三类差异不反映模型能力，写进理由等于拿环境问题给模型定罪，平台也不认。
 EXCLUDED_FACTORS = """
@@ -444,8 +446,9 @@ async def analyze_task(task_id: int) -> dict:
 
         analysis_dir.mkdir(parents=True, exist_ok=True)
         (analysis_dir / "gsb_prompt.md").write_text(prompt_text, encoding="utf-8")
+        log.info("GSB %s prompt %d 字符，开始调用模型", task_no, len(prompt_text))
 
-        result = await llm.ask(prompt_text, purpose=f"GSB {task_no}")
+        result = await llm.ask(prompt_text, purpose=f"GSB {task_no}", attempts=2)
         (analysis_dir / "gsb_raw.txt").write_text(result.text, encoding="utf-8")
 
         parsed = extract_json(result.text)

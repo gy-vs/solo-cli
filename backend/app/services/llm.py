@@ -16,6 +16,14 @@ Cursor 没有公开的 chat-completions 接口，能用的只有 CLI，所以这
 
 --trust 必须给：CLI 对未信任目录一律拒绝启动，只读模式也不例外。它只表示「这个目录
 可以用」，不等于放开 shell；放开 shell 的是 --force / --yolo，这里一次都不传。
+
+--sandbox disabled 也必须给：后端跑在容器里，Landlock / bwrap 没有权限，CLI 每次
+启动都会先做一次必失败的 sandbox preflight。关掉能省掉这段空转，也不改变 ask
+模式本身不跑 shell 的约束。
+
+输出用 stream-json：json 要等整轮结束才吐一行，HTTP/2 长流在 Docker 里经常被掐掉，
+掐掉之后 CLI 自己静默重试、Python 再整进程重来，一次分析能拖到四五十分钟。流式
+事件既能保活，也能在进程稍后崩溃时把已经到达的 result 捞出来，不必整段重跑。
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import re
 import shutil
 import signal
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,6 +50,14 @@ log = logging.getLogger("llm")
 ASK_DIR = Path("/tmp/solo-ask")
 
 DEFAULT_MODEL = "claude-opus-5-thinking-high"
+
+# 流式输出连续这么久没有任何一行，判定卡住。ask 模式下正常生成会不断打 assistant
+# 增量；json 那版 stdout 一直是空的，卡住和「还在想」从外面分不出来。
+STALL_S = 300
+# 心跳只是给人看进度，不影响判定。
+HEARTBEAT_S = 30
+# stream-json 一行就是一个事件。默认 64KB 限制会被设计题那种超长 result 打穿。
+STREAM_LIMIT = 8 * 1024 * 1024
 
 
 class LlmError(RuntimeError):
@@ -109,15 +126,15 @@ def kill_group(proc: asyncio.subprocess.Process) -> None:
     agent 用 start_new_session 起，进程组 ID 等于它的 PID。只杀 agent 本身的话，
     它派生出去的东西会挂到 init 上继续占 CPU。
     """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    except OSError:
-        log.exception("杀进程组失败，退回只杀 agent 本身")
+    pid = getattr(proc, "pid", None)
+    if pid:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
         proc.kill()
-    except ProcessLookupError:
+    except (ProcessLookupError, AttributeError):
         pass
 
 
@@ -140,10 +157,13 @@ _FATAL_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
      "Cursor 账号无权调用该模型"),
 )
 
-# 这些是真·临时故障，值得再试
+# 这些是真·临时故障，值得再试。HTTP/2 长流在容器里被掐掉时，CLI 打的是
+# ConnectError / aborted / stream ended，不进 5xx 那组关键字就会被当成「未知错误」
+# ——虽然未知也是可重试，但日志里那句原文太长，这里认出来方便对照。
 _RETRYABLE = re.compile(
     r"\b(429|500|502|503|504)\b|rate.?limit|timed? ?out|ECONNRESET|ETIMEDOUT|EAI_AGAIN"
-    r"|socket hang up|network|temporarily", re.I)
+    r"|socket hang up|network|temporarily|ConnectError|\[internal\] aborted"
+    r"|stream ended without turnEnded|connection likely dropped", re.I)
 
 
 def error_from(text: str) -> LlmError:
@@ -175,23 +195,124 @@ def classify(text: str) -> tuple[str, bool]:
 
 
 def _parse_envelope(stdout: str) -> tuple[str, str, dict]:
-    """--output-format json 的外层是单个对象，result 里才是模型说的话。"""
+    """从 CLI 输出里抽出模型正文。json 和 stream-json 都认。
+
+    stream-json 前面会铺一串 system / assistant 事件，真正的话在 type=result
+    那一行的 result 字段。只看最后一行会把半截增量或空行当成正文。
+    """
     text = (stdout or "").strip()
     if not text:
         return "", "", {}
+    last: dict | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "result" in obj:
+            last = obj
+    if last is None:
+        return text, "", {}
+    if last.get("is_error"):
+        raise error_from(str(last.get("result") or ""))
+    return str(last.get("result") or ""), str(last.get("session_id") or ""), last.get("usage") or {}
+
+
+def _event_kind(line: bytes) -> str:
     try:
-        obj = json.loads(text.splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
-        return text, "", {}
-    if not isinstance(obj, dict) or "result" not in obj:
-        return text, "", {}
-    if obj.get("is_error"):
-        raise error_from(str(obj.get("result") or ""))
-    return str(obj.get("result") or ""), str(obj.get("session_id") or ""), obj.get("usage") or {}
+        obj = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return "text"
+    if not isinstance(obj, dict):
+        return "text"
+    return str(obj.get("type") or obj.get("subtype") or "event")
+
+
+def _cli_cmd(binary: str, model: str, workdir: Path) -> list[str]:
+    """拼 agent 命令行。参数顺序稳定，方便测试对照。"""
+    return [
+        binary, "-p",
+        "--output-format", "stream-json",
+        "--stream-partial-output",
+        "--mode", "ask",
+        "--trust",
+        "--sandbox", "disabled",
+        "--workspace", str(workdir),
+        "--model", model,
+    ]
+
+
+async def _feed_stdin(proc: asyncio.subprocess.Process, prompt: str) -> None:
+    if proc.stdin is None:
+        raise LlmError("无法向 Cursor CLI 写入 prompt", retryable=False)
+    data = prompt.encode("utf-8")
+    try:
+        proc.stdin.write(data)
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except (BrokenPipeError, ConnectionResetError) as exc:
+        raise LlmError("Cursor CLI 在读完 prompt 之前退出", retryable=True) from exc
+
+
+async def _read_stdout(proc: asyncio.subprocess.Process, buf: list[bytes],
+                       tick: dict) -> None:
+    if proc.stdout is None:
+        return
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+        buf.append(line)
+        tick["n"] = int(tick.get("n") or 0) + 1
+        tick["kind"] = _event_kind(line)
+        tick["at"] = time.time()
+        if tick["kind"] == "result":
+            log.info("%s CLI 收到 result · %d 个事件 · %.0fs",
+                     tick.get("purpose") or "llm", tick["n"],
+                     time.time() - float(tick.get("started") or time.time()))
+
+
+async def _read_stderr(proc: asyncio.subprocess.Process, buf: list[bytes]) -> None:
+    if proc.stderr is None:
+        return
+    while True:
+        chunk = await proc.stderr.read(4096)
+        if not chunk:
+            break
+        buf.append(chunk)
+
+
+async def _heartbeat(proc: asyncio.subprocess.Process, tick: dict, stalled: dict) -> None:
+    """定期打进度；stdout 长时间完全没动就杀进程，让外层去重试。
+
+    HTTP/2 被掐掉时 CLI 自己会 resume，stdout 仍可能继续有事件，这种情况不要杀。
+    杀的是「进程还在、一行都不吐」——旧的 json 格式就会这样，看起来像在跑，其实
+    外面什么都看不到，要等 40 分钟超时。
+    """
+    while True:
+        await asyncio.sleep(HEARTBEAT_S)
+        idle = time.time() - float(tick.get("at") or time.time())
+        log.info("%s CLI 运行中 %.0fs · 事件 %d · 最近 %s · 空闲 %.0fs",
+                 tick.get("purpose") or "llm",
+                 time.time() - float(tick.get("started") or time.time()),
+                 int(tick.get("n") or 0), tick.get("kind") or "start", idle)
+        if idle >= STALL_S:
+            stalled["yes"] = True
+            log.warning("%s CLI %.0fs 没有新输出，判定卡住",
+                        tick.get("purpose") or "llm", idle)
+            kill_group(proc)
+            return
+
+
+def _decode(chunks: list[bytes]) -> str:
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 async def _once(prompt: str, model: str, timeout_s: int,
-                cwd: Path | None = None) -> tuple[str, str, dict]:
+                cwd: Path | None = None, purpose: str = "") -> tuple[str, str, dict]:
     binary = agent_bin()
     if not binary:
         raise LlmError("后端镜像里没有 Cursor CLI（agent）", retryable=False)
@@ -210,33 +331,71 @@ async def _once(prompt: str, model: str, timeout_s: int,
     # prompt 走 stdin 而不是命令行参数：GSB 分析要把两侧的 diff 与轨迹摘要
     # 一起送进去，几百 KB 是常态，当参数传会直接撞上 ARG_MAX，
     # 报一个跟模型毫无关系的 “Argument list too long”。
-    cmd = [binary, "-p", "--output-format", "json", "--mode", "ask", "--trust",
-           "--model", model]
+    cmd = _cli_cmd(binary, model, workdir)
     # 单开进程组：超时要连同 CLI 派生的子进程一起收掉
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=str(workdir), env=env, start_new_session=True,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_LIMIT,
     )
+    out_buf: list[bytes] = []
+    err_buf: list[bytes] = []
+    stalled = {"yes": False}
+    tick = {"n": 0, "kind": "start", "at": time.time(), "started": time.time(),
+            "purpose": purpose or "llm"}
+    log.info("%s CLI 启动 pid=%s model=%s prompt=%d 字符 timeout=%ds",
+             purpose or "llm", getattr(proc, "pid", "?"), model, len(prompt), timeout_s)
+
+    async def pump() -> None:
+        await _feed_stdin(proc, prompt)
+        hb = asyncio.create_task(_heartbeat(proc, tick, stalled), name="llm-heartbeat")
+        try:
+            await asyncio.gather(
+                _read_stdout(proc, out_buf, tick),
+                _read_stderr(proc, err_buf),
+                proc.wait(),
+            )
+        finally:
+            hb.cancel()
+            with suppress(asyncio.CancelledError):
+                await hb
+
     try:
-        out, err = await asyncio.wait_for(
-            proc.communicate(prompt.encode("utf-8")), timeout=timeout_s)
+        await asyncio.wait_for(pump(), timeout=timeout_s)
     except asyncio.TimeoutError:
         kill_group(proc)
+        stdout, stderr = _decode(out_buf), _decode(err_buf)
+        # 超时前已经到过 result 就别整段重跑：CLI 收尾阶段被掐掉很常见
+        text, sid, usage = _parse_envelope(stdout)
+        if text.strip():
+            log.warning("%s CLI 超时但已经拿到结果，按成功处理", purpose or "llm")
+            return text, sid, usage
         raise LlmError(f"模型 {timeout_s // 60} 分钟没有返回", retryable=True) from None
-    stdout = out.decode("utf-8", "replace")
-    stderr = err.decode("utf-8", "replace")
-    if proc.returncode != 0:
+
+    stdout, stderr = _decode(out_buf), _decode(err_buf)
+    text, sid, usage = _parse_envelope(stdout)
+    if text.strip():
+        if proc.returncode not in (0, None):
+            log.warning("%s CLI 退出码 %s，但已经拿到结果，按成功处理",
+                        purpose or "llm", proc.returncode)
+        return text, sid, usage
+    if stalled["yes"]:
+        raise LlmError(f"模型 {STALL_S // 60} 分钟没有新输出", retryable=True)
+    if proc.returncode not in (0, None):
         # 真正的原因通常在 stderr，stdout 这时多半只有一条 init 事件
         raise error_from(stderr or stdout)
-    return _parse_envelope(stdout)
+    return text, sid, usage
 
 
 async def ask(prompt: str, *, model: str = "", timeout_s: int = 0,
-              attempts: int = 3, purpose: str = "", cwd: Path | None = None) -> LlmResult:
+              attempts: int = 2, purpose: str = "", cwd: Path | None = None) -> LlmResult:
     """问一次模型，拿回文本。失败按可重试与否决定是退避重试还是直接抛。
 
     cwd 给 CLI 的工作目录，不给就用空的 ASK_DIR，两者的区别见模块头部说明。
+
+    默认只重试 1 次（attempts=2）。CLI 自己已经会对 HTTP/2 断流做 checkpoint
+    resume；外面再整进程重来三次，一次分析就会被拖到四五十分钟。
     """
     model = model or settings_store.get("cursor.model") or DEFAULT_MODEL
     timeout_s = timeout_s or max(120, settings_store.get_int("cursor.timeout_minutes", 40) * 60)
@@ -246,7 +405,8 @@ async def ask(prompt: str, *, model: str = "", timeout_s: int = 0,
 
     for attempt in range(1, attempts + 1):
         try:
-            text, session_id, usage = await _once(prompt, model, timeout_s, cwd=cwd)
+            text, session_id, usage = await _once(
+                prompt, model, timeout_s, cwd=cwd, purpose=purpose)
         except LlmError as exc:
             last = exc
             if not exc.retryable:
@@ -292,6 +452,7 @@ async def probe_models() -> list[str]:
     env.pop("CURSOR_MODEL", None)
     proc = await asyncio.create_subprocess_exec(
         binary, "-p", "--output-format", "json", "--mode", "ask", "--trust",
+        "--sandbox", "disabled",
         "--model", "__probe__", "x",
         env=env, cwd=str(ASK_DIR), start_new_session=True,
         stdin=asyncio.subprocess.DEVNULL,

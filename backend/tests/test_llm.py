@@ -46,6 +46,8 @@ def test_unpaid_invoice_message_points_away_from_the_network():
     "socket hang up",
     "rate limit exceeded",
     "Failed to reach the Cursor API",
+    "ConnectError: [internal] aborted",
+    "Stream ended without turnEnded — connection likely dropped mid-stream",
 ])
 def test_transient_errors_are_retryable(blob):
     assert llm.classify(blob)[1] is True
@@ -69,10 +71,16 @@ def test_envelope_unwraps_the_result_field():
     assert (text, sid, usage) == ("模型说的话", "s1", {"input": 10})
 
 
-def test_envelope_reads_the_last_line_only():
-    """stream 残留的前置事件不能被当成正文。"""
-    blob = '{"type":"system","subtype":"init"}\n{"type":"result","result":"正文"}'
-    assert llm._parse_envelope(blob)[0] == "正文"
+def test_envelope_reads_the_last_result_from_stream_json():
+    """stream-json 前面的 init / assistant 增量不能盖掉最后的 result。"""
+    blob = "\n".join([
+        '{"type":"system","subtype":"init"}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"半"}]}}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"句"}]}}',
+        '{"type":"result","result":"正文","session_id":"s2","usage":{"output":3}}',
+    ])
+    text, sid, usage = llm._parse_envelope(blob)
+    assert (text, sid, usage) == ("正文", "s2", {"output": 3})
 
 
 def test_envelope_falls_back_to_raw_text():
@@ -90,9 +98,10 @@ def _stub_once(monkeypatch, outcomes):
     """把 _once 换成按脚本返回的假实现，记录调用次数。"""
     calls = {"n": 0}
 
-    async def fake(prompt, model, timeout_s, cwd=None):
+    async def fake(prompt, model, timeout_s, cwd=None, purpose=""):
         calls["n"] += 1
         calls["cwd"] = cwd
+        calls["purpose"] = purpose
         item = outcomes[min(calls["n"] - 1, len(outcomes) - 1)]
         if isinstance(item, Exception):
             raise item
@@ -134,6 +143,14 @@ def test_ask_gives_up_after_the_attempt_budget(monkeypatch):
     assert calls["n"] == 3
 
 
+def test_ask_defaults_to_two_attempts(monkeypatch):
+    """CLI 自己会 resume 断流，外面再整进程重来三次会把一次分析拖到四五十分钟。"""
+    calls = _stub_once(monkeypatch, [llm.LlmError("504", retryable=True)])
+    with pytest.raises(llm.LlmError):
+        asyncio.run(llm.ask("x", model="m", timeout_s=5))
+    assert calls["n"] == 2
+
+
 def test_ask_treats_empty_output_as_retryable(monkeypatch):
     calls = _stub_once(monkeypatch, ["   ", "有内容了"])
     r = asyncio.run(llm.ask("x", model="m", timeout_s=5, attempts=3))
@@ -143,27 +160,85 @@ def test_ask_treats_empty_output_as_retryable(monkeypatch):
 
 # ---------------- prompt 怎么送进 CLI ----------------
 
-def _stub_subprocess(monkeypatch, tmp_path, stdout: str):
-    """拦住真正的进程创建，记下 argv 与写进 stdin 的内容。"""
+def _stub_subprocess(monkeypatch, tmp_path, stdout: str, *, returncode: int = 0):
+    """拦住真正的进程创建，记下 argv 与写进 stdin 的内容。
+
+    _once 现在按行读 stdout，不再走 communicate()，假进程必须提供同样的接口。
+    """
     seen: dict = {}
 
-    class FakeProc:
-        returncode = 0
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.buf = bytearray()
 
-        async def communicate(self, data=None):
-            seen["stdin"] = data
-            return stdout.encode("utf-8"), b""
+        def write(self, data: bytes) -> None:
+            self.buf.extend(data)
+            seen["stdin"] = bytes(self.buf)
+
+        async def drain(self) -> None:
+            seen["stdin"] = bytes(self.buf)
+
+        def close(self) -> None:
+            seen["stdin"] = bytes(self.buf)
+
+    class FakeStream:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+            self._pos = 0
+
+        async def readline(self) -> bytes:
+            if self._pos >= len(self._data):
+                return b""
+            nl = self._data.find(b"\n", self._pos)
+            if nl < 0:
+                chunk = self._data[self._pos:]
+                self._pos = len(self._data)
+                return chunk
+            chunk = self._data[self._pos:nl + 1]
+            self._pos = nl + 1
+            return chunk
+
+        async def read(self, n: int = -1) -> bytes:
+            if self._pos >= len(self._data):
+                return b""
+            if n < 0:
+                chunk = self._data[self._pos:]
+                self._pos = len(self._data)
+                return chunk
+            chunk = self._data[self._pos:self._pos + n]
+            self._pos += len(chunk)
+            return chunk
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.pid = 999999
+            self.stdin = FakeStdin()
+            payload = stdout.encode("utf-8")
+            if payload and not payload.endswith(b"\n"):
+                payload += b"\n"
+            self.stdout = FakeStream(payload)
+            self.stderr = FakeStream(b"")
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode
 
     async def fake_exec(*cmd, **kw):
         seen["cmd"] = list(cmd)
         seen["stdin_mode"] = kw.get("stdin")
         seen["cwd"] = kw.get("cwd")
+        seen["limit"] = kw.get("limit")
         return FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(llm, "agent_bin", lambda: "/usr/bin/agent")
     monkeypatch.setattr(llm.settings_store, "get", lambda key, *a: "k" if "api_key" in key else "")
     monkeypatch.setattr(llm, "ASK_DIR", tmp_path)
+    monkeypatch.setattr(llm, "HEARTBEAT_S", 3600)
+    monkeypatch.setattr(llm, "STALL_S", 3600)
     return seen
 
 
@@ -183,7 +258,22 @@ def test_prompt_goes_through_stdin_not_argv(monkeypatch, tmp_path):
     assert seen["stdin"] == huge.encode("utf-8")
     assert huge not in seen["cmd"]
     # 整条命令行应当短得离谱，与 prompt 长度无关
-    assert sum(len(c) for c in seen["cmd"]) < 200
+    assert sum(len(c) for c in seen["cmd"]) < 500
+    assert "--output-format" in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--output-format") + 1] == "stream-json"
+    assert "--sandbox" in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--sandbox") + 1] == "disabled"
+    assert "--stream-partial-output" in seen["cmd"]
+    assert "--workspace" in seen["cmd"]
+    assert seen["limit"] == llm.STREAM_LIMIT
+
+
+def test_nonzero_exit_still_keeps_a_result(monkeypatch, tmp_path):
+    """CLI 拿到 result 之后收尾阶段被掐掉很常见，有正文就不要整段重跑。"""
+    blob = '{"type":"system","subtype":"init"}\n{"type":"result","result":"已经写完了"}'
+    _stub_subprocess(monkeypatch, tmp_path, blob, returncode=1)
+    text, _sid, _usage = asyncio.run(llm._once("x", "auto", 60))
+    assert text == "已经写完了"
 
 
 # ---------------- 工作目录与 skill ----------------
