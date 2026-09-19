@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from app import config
 from app.db import init_db
 from app.routers import design as design_router
+from app.routers import host as host_router
 from app.routers import settings as settings_router
 from app.routers import system as system_router
 from app.routers import tasks as tasks_router
@@ -79,6 +80,7 @@ app.include_router(system_router.router)
 app.include_router(settings_router.router)
 app.include_router(tasks_router.router)
 app.include_router(design_router.router)
+app.include_router(host_router.router)
 
 
 @app.exception_handler(Exception)

@@ -1,9 +1,11 @@
 <script setup lang="ts">
 /** 录屏环节。流程里唯一等人的地方：两侧链接都填上才让上传。 */
 import { NButton, NInput, useMessage } from 'naive-ui'
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { api, SIDES, type Gsb, type Side, type TaskDetail } from '../api'
+import { refreshHost } from '../store'
 import { SIDE_HEX } from '../status'
+import SideLauncher from './SideLauncher.vue'
 
 const props = defineProps<{ task: TaskDetail; gsb: Gsb }>()
 const emit = defineEmits<{ (e: 'saved'): void }>()
@@ -17,6 +19,7 @@ const saving = ref(false)
 watch(() => props.task.screencast, (v) => {
   urls.value = { A: v?.A || '', B: v?.B || '' }
 }, { immediate: true, deep: true })
+onMounted(refreshHost)
 
 const dirty = computed(() => SIDES.some((s) => urls.value[s] !== (props.task.screencast?.[s] || '')))
 const filled = computed(() => SIDES.every((s) => !!urls.value[s].trim()))
@@ -56,7 +59,8 @@ async function upload(side: Side) {
       <NButton v-if="dirty" size="small" type="primary" class="ml-auto" :loading="saving" @click="save">保存链接</NButton>
     </div>
     <div class="text-xs text-fg1">
-      照下面的步骤把两侧项目分别跑起来录屏，再把链接贴回来。工作目录里的代码已是各侧的最终产物，不用再改。
+      点「启动项目」会在本机开一个终端窗口，装依赖的命令自动跑掉，剩下的放进历史按 ↑ 调出来。
+      录屏按 720p 存到这道题的产物目录，停录后路径自动填好，点上传就能换回链接。
     </div>
     <div class="grid grid-cols-2 gap-3">
       <div v-for="s in SIDES" :key="s" class="inner p-3 space-y-2">
@@ -65,6 +69,8 @@ async function upload(side: Side) {
             :style="{ color: SIDE_HEX[s], background: SIDE_HEX[s] + '1f' }">{{ s }}</span>
           <span class="mono text-[11px] text-fg2 truncate">workspace/{{ task.task_no }}/{{ s }}</span>
         </div>
+        <SideLauncher :task-id="task.id" :task-no="task.task_no" :side="s"
+          @recorded="(p) => (paths = { ...paths, [s]: p })" />
         <ol v-if="startup(s).steps.length" class="text-[12px] text-fg1 space-y-0.5 list-decimal pl-4">
           <li v-for="(st, i) in startup(s).steps" :key="i">{{ st }}</li>
         </ol>

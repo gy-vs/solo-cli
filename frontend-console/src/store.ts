@@ -1,18 +1,27 @@
 /** 轻量全局状态：系统状态 + 任务列表，供各页面共享并由 SSE 驱动刷新。 */
 import { computed, reactive, ref } from 'vue'
-import { api, SIDES, type SystemStatus, type TaskBrief } from './api'
+import { api, SIDES, type HostHealth, type SystemStatus, type TaskBrief } from './api'
 
 export const store = reactive({
   status: null as SystemStatus | null,
   tasks: [] as TaskBrief[],
   loadingTasks: false,
   lastRefresh: 0,
+  /** 宿主机代理。null 表示还没问过 */
+  host: null as HostHealth | null,
 })
 
 let pending: number | null = null
 
 export async function refreshStatus() {
   try { store.status = await api.status() } catch { /* 顶栏会显示断连 */ }
+}
+
+/** 宿主机代理的近况。录屏按钮要靠它判断能不能点，正在录的是哪几侧也从这儿来 */
+export async function refreshHost() {
+  try { store.host = await api.hostHealth() } catch {
+    store.host = { ok: false, reachable: false, message: '问不到宿主机代理', screens: [], recordings: [] }
+  }
 }
 
 /** 上一轮每道题的原样内容，用来认出「这题其实没变」 */

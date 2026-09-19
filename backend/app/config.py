@@ -26,6 +26,9 @@ SECRET_KEY_FILE = Path(_env("SECRET_KEY_FILE") or str(DATA_DIR / "secret.key"))
 DB_PATH = DATA_DIR / "solo-cli.db"
 EXPORT_DIR = DATA_DIR / "exports"
 HOST_PORT = _env("HOST_PORT", "8788")
+# 宿主机代理。录屏与在本机启动项目都得由它代劳：后端在容器里，既没有 macOS 的屏幕
+# 录制权限，在挂载目录上执行命令用的也是容器自己的运行时。本机直跑时改成 127.0.0.1。
+HOST_AGENT_URL = _env("HOST_AGENT_URL") or "http://host.docker.internal:8790"
 
 # Cursor skills 目录（后端容器里看到的路径）。出题靠 Cursor CLI 执行 /solo-prompt，
 # 出题规则的唯一来源就是这个目录下的 solo-prompt skill，不在本项目里另存一份。

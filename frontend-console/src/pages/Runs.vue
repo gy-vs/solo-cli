@@ -3,6 +3,7 @@ import { NButton, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, SIDES, type Side, type TaskBrief } from '../api'
+import LaunchModal from '../components/LaunchModal.vue'
 import RunCard from '../components/RunCard.vue'
 import StatusPill from '../components/StatusPill.vue'
 import { fmtDuration, fmtTime, RUN_END, SIDE_HEX, VERDICT_LABEL } from '../status'
@@ -57,6 +58,14 @@ function badSides(t: TaskBrief): Side[] {
     if (!r || !RUN_END.includes(r.status)) return false
     return r.status !== 'FINISHED' || !!r.abnormal?.reason
   })
+}
+
+/** 待录屏的题在这一行就能起项目、录屏，不用先点进详情 */
+const launchShow = ref(false)
+const launchTask = ref<TaskBrief | null>(null)
+function launch(t: TaskBrief) {
+  launchTask.value = t
+  launchShow.value = true
 }
 
 const rerunning = ref('')
@@ -127,6 +136,9 @@ async function rerunSide(t: TaskBrief, s: Side) {
         </div>
         <div class="mono text-[12px] text-fg2 nums">{{ fmtTime(t.finished_at) }}</div>
         <div class="flex items-center gap-2">
+          <NButton v-if="t.status === 'ANALYZED'" size="tiny" type="primary" secondary @click.stop="launch(t)">
+            启动 / 录屏
+          </NButton>
           <NButton v-for="s in badSides(t)" :key="s" size="tiny" quaternary
             :loading="rerunning === `${t.id}${s}`" @click.stop="rerunSide(t, s)">
             重跑 {{ s }}
@@ -137,5 +149,7 @@ async function rerunSide(t: TaskBrief, s: Side) {
         </div>
       </div>
     </div>
+
+    <LaunchModal v-model:show="launchShow" :task="launchTask" />
   </div>
 </template>

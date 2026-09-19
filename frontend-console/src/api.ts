@@ -264,6 +264,61 @@ export interface SystemStatus {
   paths: { coder_root_host: string; coder_root_mount: string; prompt_file: string; prompt_exists: boolean }
 }
 
+/** 宿主机代理的近况。不可达时 reachable 为假，界面把按钮按灰并教人怎么起它 */
+export interface HostHealth {
+  ok: boolean
+  reachable: boolean
+  message?: string
+  version?: string
+  coder_root?: string
+  ffmpeg?: boolean
+  /** index 是 avfoundation 的设备号，和「Capture screen 0」里的编号不是一回事，别自己算 */
+  screens: { index: number; label: string }[]
+  height?: number
+  recordings: { id: string; task_no: string; side: Side; file: string; seconds: number; alive: boolean }[]
+}
+
+export interface HostStart {
+  ok: boolean
+  tty: string
+  cwd: string
+  /** 代理替你跑掉的装依赖命令 */
+  auto: string[]
+  /** 留在终端历史里等你按 ↑ 调出来的命令 */
+  manual: string[]
+  message: string
+  note: string
+  steps: string[]
+}
+
+/** 这一侧是个什么项目、录屏该怎么录。认不出形态时 kind 是 unknown，不瞎猜 */
+export interface RecordPlan {
+  kind: 'fullstack' | 'frontend' | 'backend' | 'headless' | 'unknown'
+  kind_label: string
+  stack: string[]
+  /** 判成这个形态的依据，人要能复核 */
+  evidence: string[]
+  serve: string
+  test: string
+  install: string
+  port: number | null
+  root: string
+  steps: { title: string; why: string; cmds: string[] }[]
+  /** GSB 启动命令里除去装依赖的那些，无界面项目全靠它们撑起内容 */
+  demo_commands: string[]
+  note: string
+}
+
+export interface HostProjectStatus {
+  ok: boolean
+  reachable?: boolean
+  running: boolean
+  tty?: string
+  cwd?: string
+  ports: number[]
+  urls?: string[]
+}
+
 export interface RunEvent { seq: number; side?: Side; kind: string; summary: string; ts: string | null; payload: any }
 
 /** 一侧容器此刻的样子。全部现问 docker，跟收尾时记下的那份账无关 */
@@ -354,6 +409,19 @@ export const api = {
     put<{ verify: VerifyReport; task: TaskBrief }>(`/api/tasks/${id}/screencast`, body),
   uploadScreencast: (id: number, side: Side, path: string) =>
     post<{ ok: boolean; url: string; message: string }>(`/api/tasks/${id}/screencast/upload?side=${side}&path=${encodeURIComponent(path)}`),
+
+  // ---- 宿主机动作（启动项目、录屏）----
+  /** 这两件事后端在容器里干不了，统一转给宿主机上的 host-agent */
+  hostHealth: () => get<HostHealth>('/api/host/health'),
+  /** 项目形态与录制步骤。后端自己看挂载目录，不经过宿主机代理，代理没起也能看 */
+  hostPlan: (id: number, side: Side) => get<RecordPlan>(`/api/host/tasks/${id}/plan?side=${side}`),
+  hostStart: (id: number, side: Side) => post<HostStart>(`/api/host/tasks/${id}/start?side=${side}`),
+  hostStatus: (id: number, side: Side) => get<HostProjectStatus>(`/api/host/tasks/${id}/status?side=${side}`),
+  hostRecordStart: (id: number, side: Side, screen: number) =>
+    post<{ ok: boolean; id: string; file: string; message: string }>(`/api/host/tasks/${id}/record/start?side=${side}&screen=${screen}`),
+  /** 停录返回的 file 是后端可见路径，直接能喂给 uploadScreencast */
+  hostRecordStop: (id: number, side: Side) =>
+    post<{ ok: boolean; file: string; host_file: string; size: number; seconds: number; message: string }>(`/api/host/tasks/${id}/record/stop?side=${side}`),
 
   // ---- 上传与收尾 ----
   upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),

@@ -9,7 +9,7 @@ import { fmtTime, HEX, VERDICT_LABEL } from '../status'
 const props = defineProps<{ task: TaskBrief; busy?: boolean; device?: string }>()
 const emit = defineEmits<{
   (e: 'claim'): void; (e: 'release'): void; (e: 'open'): void
-  (e: 'discard'): void; (e: 'restore'): void
+  (e: 'discard'): void; (e: 'restore'): void; (e: 'launch'): void
 }>()
 /** 别的设备出的题。题号带设备后缀，来源也要标出来，否则两台机器的题在列表里分不开 */
 const fromOther = computed(() => !!props.task.pool_device && props.task.pool_device !== props.device)
@@ -69,6 +69,9 @@ const branchBad = computed(() => props.task.branch_check?.ok === false)
     <div class="flex gap-2 mt-auto">
       <NButton v-if="claimable()" size="small" type="primary" class="flex-1" :loading="busy" @click="emit('claim')">领取并启动</NButton>
       <NButton v-if="task.status === 'DISCARDED'" size="small" type="primary" secondary class="flex-1" :loading="busy" @click="emit('restore')">恢复</NButton>
+      <NButton v-if="task.status === 'ANALYZED'" size="small" type="primary" secondary class="flex-1" @click="emit('launch')">
+        启动 / 录屏
+      </NButton>
       <NButton v-if="task.status === 'CLAIMED' || task.status === 'QUEUED'" size="small" tertiary @click="emit('release')">放回</NButton>
       <NButton size="small" tertiary @click="emit('open')">详情</NButton>
       <NButton v-if="discardable()" size="small" quaternary type="error" :loading="busy" @click="emit('discard')">废弃</NButton>

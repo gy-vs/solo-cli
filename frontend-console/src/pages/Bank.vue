@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, ApiError, type GateReport, type Status, type TaskBrief } from '../api'
 import GateModal from '../components/GateModal.vue'
+import LaunchModal from '../components/LaunchModal.vue'
 import TaskCard from '../components/TaskCard.vue'
 import { discardedTasks, liveTasks, refreshTasks, store } from '../store'
 
@@ -47,6 +48,14 @@ const gateReport = ref<GateReport | null>(null)
 const busyId = ref<number | null>(null)
 
 const pool = computed(() => store.status?.pool)
+
+/** 待录屏的题不必进详情页：这里直接把两侧跑起来、录完、传掉 */
+const launchShow = ref(false)
+const launchTask = ref<TaskBrief | null>(null)
+function launch(t: TaskBrief) {
+  launchTask.value = t
+  launchShow.value = true
+}
 
 /** 这道题在别的设备上先被领走了。后端已经把它从本机题库里撤掉，这里只负责说一声并刷新 */
 function takenBy(e: unknown): string {
@@ -221,7 +230,7 @@ function batchClaim(ids: number[], title: string) {
     <div v-if="items.length" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
       <TaskCard v-for="t in items" :key="t.id" :task="t" :busy="busyId === t.id" :device="pool?.device"
         @claim="claim(t)" @release="release(t)" @open="router.push(`/tasks/${t.id}`)"
-        @discard="discard(t)" @restore="restore(t)" />
+        @discard="discard(t)" @restore="restore(t)" @launch="launch(t)" />
     </div>
     <div v-else class="card empty">
       <template v-if="tab === 'discarded'">没有废弃的题</template>
@@ -231,5 +240,6 @@ function batchClaim(ids: number[], title: string) {
     </div>
 
     <GateModal v-model:show="gateShow" :task="gateTask" :report="gateReport" @recheck="recheck" @queued="refreshTasks" />
+    <LaunchModal v-model:show="launchShow" :task="launchTask" />
   </div>
 </template>

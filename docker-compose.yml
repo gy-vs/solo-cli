@@ -33,6 +33,10 @@ services:
       - QA_CSRF_TOKEN=${QA_CSRF_TOKEN:-}
       - QA_PROJECT_HOST=${QA_PROJECT_HOST:-/Users/gaoyong/solo-qa-0908}
       - GH_TOKEN=${GH_TOKEN:-}
+      # 录屏和在本机启动项目都得找宿主机代理代劳，见 host-agent/
+      - HOST_AGENT_URL=${HOST_AGENT_URL:-http://host.docker.internal:8790}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CODER_ROOT:-/Users/gaoyong/solo-coder-0908}:/host/coder
