@@ -16,7 +16,7 @@ import re
 from app import config
 from app.db import session
 from app.events import bus
-from app.models import Task, TaskRun
+from app.models import ANALYSIS_DONE, Task, TaskRun
 from app.services import dockerx, gsb_repo, gsb_rules, settings_store, trace
 from app.services.gsb_analyzer import VERDICTS
 
@@ -103,6 +103,35 @@ def _ai_trace_items(reason: str) -> list[dict]:
     return items
 
 
+def _style_items(reason: str, peers: dict) -> list[dict]:
+    """查写法，不查合规。
+
+    这里每一条平台都不管：写到两千字不会被打回，每道题用同一个开场也不会被打回。
+    管的是这段话读起来像不像一个人写的——篇幅一长，颗粒度必然细到真人评审观察不到
+    的地步；几道题摆在一起句式雷同，就看得出是照着骨架填的。所以全部只提示。
+    """
+    items: list[dict] = []
+    n = _chars(reason)
+    if n > gsb_rules.REASON_SOFT_MAX_CHARS:
+        items.append(_item("reason_too_long", "warn",
+                           f"理由 {n} 字，超过 {gsb_rules.REASON_TARGET_MAX} 字的上限；"
+                           f"挑一两个决定胜负的点展开，其余一句带过"))
+    if hits := gsb_rules.word_swap_hits(reason):
+        word, suggest = hits[0]
+        more = f"，另有 {'、'.join(w for w, _ in hits[1:4])}" if len(hits) > 1 else ""
+        items.append(_item("reason_wording", "warn",
+                           f"理由里有「{word}」这类比喻或口语说法{more}，改成{suggest}"))
+    sig = gsb_rules.opening_signature(reason)
+    if sig:
+        same = sorted(no for no, s in (peers or {}).items()
+                      if s and (s == sig or s.startswith(sig) or sig.startswith(s)))
+        if same:
+            items.append(_item("reason_opening_repeat", "warn",
+                               f"开头的句式和第 {'、'.join(same[:3])} 题一样（{sig}），"
+                               f"按这道题自己的矛盾换一个写法"))
+    return items
+
+
 def verify(data: dict) -> dict:
     """按平台规则核验。data 的形状见 collect 的返回值。"""
     items: list[dict] = []
@@ -123,6 +152,7 @@ def verify(data: dict) -> dict:
         items.append(_item("reason_both_sides", "block", "理由里没有分别写到 A 和 B 两侧"))
 
     items.extend(_ai_trace_items(reason))
+    items.extend(_style_items(reason, data.get("peer_openings") or {}))
     if m := _ABS_PATH.search(reason):
         items.append(_item("reason_abs_path", "block",
                            f"理由里有绝对路径（{m.group(0)[:40]}），会把本机目录结构一起交出去"))
@@ -230,6 +260,13 @@ async def collect(task_id: int) -> dict:
             "user_prompt": task.user_prompt,
             "env_snapshot_sha": gsb_repo.snapshot_sha(task.env_snapshot),
             "harness_version": task.harness_version,
+            # 别的题的开头句式，用来发现几道题套同一个开场。已分析的题目本来就不多，
+            # 全取出来也就几条，不值得为此加索引或缓存
+            "peer_openings": {
+                other.task_no: gsb_rules.opening_signature((other.gsb or {}).get("reason", ""))
+                for other in db.query(Task).filter(Task.id != task_id,
+                                                   Task.analysis_status == ANALYSIS_DONE).all()
+            },
             "sides": {},
         }
         task_no = task.task_no

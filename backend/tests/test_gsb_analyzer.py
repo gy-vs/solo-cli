@@ -222,8 +222,9 @@ def test_prompt_carries_writing_rules_that_ban_machine_metrics(tmp_db):
     assert "不写步数" in text
     assert "工具调用次数" in text
     assert "数字密度" in text
-    # 反过来，书面语和长篇幅是允许的，不能在 prompt 里禁掉
-    assert "写得书面、正式、术语密集" in text
+    # 反过来，书面语是允许的，不能在 prompt 里禁掉；要收的是篇幅和颗粒度
+    assert "写得正式、用词专业不算机器痕迹" in text
+    assert "只挑一到两个真正决定胜负的点展开" in text
 
 
 def test_prompt_asks_for_startup_instructions(tmp_db):

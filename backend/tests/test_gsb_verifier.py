@@ -266,3 +266,34 @@ def test_harness_version_mismatch_is_only_a_warning():
 def test_overall_block_wins_over_warn():
     sides = {"A": _side("A", changed_files=0, session_id=""), "B": _side("B")}
     assert gv.verify(_data(sides=sides))["overall"] == "block"
+
+
+# ---------------- 写法 ----------------
+# 这一组平台都不管，所以只能是黄项。它们对应的是「读起来像不像一个人写的」：
+# 篇幅一长颗粒度必然细到真人观察不到，几道题句式雷同就看得出是照骨架填的。
+
+def test_long_reason_is_only_a_warning():
+    r = gv.verify(_data(reason=GOOD_REASON * 6))
+    assert "reason_too_long" in _names(r, "warn")
+    assert r["overall"] == "warn"
+
+
+@pytest.mark.parametrize("bad", ["真正的分水岭在测试上", "B 的实现差一口气",
+                                 "装不上就手搓了一套", "把内部记账固化成了对外契约"])
+def test_figurative_and_colloquial_wording_is_flagged(bad):
+    assert "reason_wording" in _names(gv.verify(_data(reason=GOOD_REASON + bad)), "warn")
+
+
+def test_repeated_opening_across_tasks_is_flagged():
+    """同一个开场套在几道题上，单看哪道题都正常，摆在一起才露馅。"""
+    reason = "这道题我比较在意两点。" + GOOD_REASON
+    peers = {"87": gv.gsb_rules.opening_signature("这道题我比较在意两点。别的题这么起的头")}
+    r = gv.verify(_data(reason=reason, peer_openings=peers))
+    assert "reason_opening_repeat" in _names(r, "warn")
+
+
+def test_distinct_openings_are_not_flagged():
+    """「两侧都……」这类自然开头不该被当成套模板。"""
+    peers = {"87": gv.gsb_rules.opening_signature("两侧都把校验挪进了构建器")}
+    r = gv.verify(_data(reason="两侧对根因的判断一致。" + GOOD_REASON, peer_openings=peers))
+    assert _names(r, "warn") == set()
