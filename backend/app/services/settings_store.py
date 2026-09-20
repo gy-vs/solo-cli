@@ -40,7 +40,7 @@ SPECS: tuple[Spec, ...] = (
     Spec("gsb.csrf_token", "solo_qa_csrf", "GSB 平台", secret=True,
          help="Cookie 中 solo_qa_csrf 的值，同时作为 X-CSRF-Token 头"),
     Spec("cc.api_key", "网关 Key", "Claude Code 容器", secret=True, help="注入容器的 apikey，形如 sk-…"),
-    Spec("cc.image", "镜像", "Claude Code 容器", default="adminfather/benzhi-claude-code:20260915-mount"),
+    Spec("cc.image", "镜像", "Claude Code 容器", default="adminfather/benzhi-claude-code2:20260919"),
     Spec("cc.memory", "容器内存上限", "Claude Code 容器", default="4g"),
     Spec("cc.cpus", "容器 CPU 上限", "Claude Code 容器", default="2"),
     Spec("cursor.api_key", "Cursor API Key", "Cursor CLI 分析", secret=True, help="cursor.com/dashboard/api 创建的 User API Key"),

@@ -26,7 +26,7 @@ API     : http://localhost:8788/api/health
 | 分组 | 必填项 | 说明 |
 |---|---|---|
 | solo-qa 身份 | `solo_qa_session`、`solo_qa_csrf` | 从已登录浏览器的 Cookie 复制；「测试 solo-qa 身份」应显示登录用户 |
-| Claude Code 容器 | 网关 Key | 注入容器的 `apikey`；镜像默认 `adminfather/benzhi-claude-code:20260915-mount`，这个 tag 没推到 Hub，本机没有就 `docker build -t adminfather/benzhi-claude-code:20260915-mount cc-image` 重建 |
+| Claude Code 容器 | 网关 Key | 注入容器的 `apikey`；镜像默认 `adminfather/benzhi-claude-code2:20260919`，本机没有就 `docker pull adminfather/benzhi-claude-code2:20260919` |
 | Cursor CLI 分析 | Cursor API Key、模型 | Key 在 cursor.com/dashboard/api 创建；「测试 Cursor」返回 `pong` 即可 |
 | 调度 | 并发数、超时、暂停出队 | 默认 3 并发、单题 120 分钟 |
 | 自动流水线 | 销毁 / 分析 / 质检三个开关 | 默认全开；分析与质检共用并发额度，默认 2 |
