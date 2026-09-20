@@ -163,6 +163,15 @@ export interface TaskDetail extends TaskBrief {
   runs: TaskRunDetail[]
 }
 
+/** 批量动作里一道题的结果。逐题带原因回来，界面要按原因分类报数 */
+export interface BatchResult {
+  id: number
+  ok?: boolean
+  message?: string
+  /** 批量分析专用：假表示排在队列里等分析并发额度，不是失败 */
+  started?: boolean
+}
+
 export interface GateCheck { name: string; level: 'ok' | 'warn' | 'block'; message: string; fix: string; hard: boolean }
 /** hard_blocked 里的项强制启动也绕不过去，得先修好 */
 export interface GateReport {
@@ -425,8 +434,15 @@ export const api = {
 
   // ---- 上传与收尾 ----
   upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),
-  batchUpload: (ids: number[]) => post<{ results: any[] }>('/api/tasks/batch/upload', { ids }),
+  batchUpload: (ids: number[]) => post<{ results: BatchResult[] }>('/api/tasks/batch/upload', { ids }),
   batchClaim: (ids: number[]) => post<{ results: any[] }>('/api/tasks/batch/claim', { ids }),
+  /** 批量重跑。sides 留空表示每道题两侧都重跑 */
+  batchRerun: (ids: number[], sides: Side[] = []) =>
+    post<{ results: BatchResult[] }>('/api/tasks/batch/rerun', { ids, sides }),
+  /** 提交产物并分析。单题也走批量口：那一步要推 git 再调两轮模型，十几二十分钟，
+   *  只能排进后台队列，同步等的话请求先超时而动作还在后台跑，界面上看到的是一个假失败。
+   *  started 为假不是失败，是在队列里等分析并发额度，照原话说给人听。 */
+  queueAnalysis: (ids: number[]) => post<{ results: BatchResult[] }>('/api/tasks/batch/advance', { ids }),
   complete: (id: number, force = false) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/complete${force ? '?force=true' : ''}`),
   destroyContainer: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/destroy-container`),
 

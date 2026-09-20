@@ -695,10 +695,12 @@ def test_pairs_ready_needs_both_sides_finished(task_with_runs):
 def clean_advances():
     """后台推进的台账是模块级的，用例之间必须擦干净。"""
     wd._advance_tasks.clear()
+    wd._advance_wanted.clear()
     yield
     for job in wd._advance_tasks.values():
         job.cancel()
     wd._advance_tasks.clear()
+    wd._advance_wanted.clear()
 
 
 def _ready_task(task_no: str) -> int:
@@ -778,6 +780,92 @@ def test_scan_pairs_stops_at_the_concurrency_limit(task_with_runs, monkeypatch,
         gate.set()
         for job in list(wd._advance_tasks.values()):
             await job
+
+    asyncio.run(main())
+
+
+def test_queue_advance_starts_once_and_reports_the_second_click(task_with_runs, monkeypatch,
+                                                               clean_advances):
+    """同一道题点两次只跑一次，第二次照原话告诉人它已经在推进了。
+
+    推同一个分支的两条 push 里落后的那条会被远端拒掉，接着它把「push 失败」写进
+    auto_error，盖掉另一条已经成功的事实 —— 产物明明推上去了，界面上却挂着一句假报错。
+    """
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+
+    async def main():
+        gate = asyncio.Event()
+        started = []
+
+        async def slow(tid):
+            started.append(tid)
+            await gate.wait()
+            return {"ok": True}
+
+        monkeypatch.setattr(wd, "advance_pair", slow)
+
+        first = wd.queue_advance(task_id)
+        assert first["started"] is True
+        await asyncio.sleep(0.01)
+
+        second = wd.queue_advance(task_id)
+        assert second["started"] is False
+        assert "正在推进" in second["message"]
+        assert started == [task_id]
+
+        gate.set()
+        for job in list(wd._advance_tasks.values()):
+            await job
+
+    asyncio.run(main())
+
+
+def test_manual_advance_goes_in_before_the_ones_the_scan_found(task_with_runs, monkeypatch,
+                                                               clean_advances):
+    """额度满了，人工点的那道要留在队列里等，而且比扫描自己捡到的先走。
+
+    当场丢掉是最坏的做法：人工点的这批里有需人工、有分析失败过的题，配对扫描一律够不着，
+    于是那几道永远没动静，人只会觉得按钮点了没反应。
+    """
+    from app.services import settings_store
+
+    task_id, ids = task_with_runs          # 07：扫描能挑到的那道
+    other = _ready_task("08")              # 08：人工点的那道
+    settings_store.set_one("auto.max_parallel", "1")
+
+    async def main():
+        gate = asyncio.Event()
+        started = []
+
+        async def slow(tid):
+            started.append(tid)
+            await gate.wait()
+            return {"ok": True}
+
+        monkeypatch.setattr(wd, "advance_pair", slow)
+        # 拿一个不相干的 job 占满那唯一的额度，好让人工点的那道只能排队
+        hold = asyncio.create_task(gate.wait())
+        wd._advance_tasks[-1] = hold
+
+        queued = wd.queue_advance(other)
+        assert queued["started"] is False
+        assert "等额度" in queued["message"]
+        assert wd._advance_wanted == [other]
+        # 额度还是满的，这一轮谁都起不来，但队列得留着
+        assert await asyncio.wait_for(wd._scan_pairs(), timeout=2) == 0
+        assert wd._advance_wanted == [other]
+
+        wd._advance_tasks.pop(-1)
+        assert await asyncio.wait_for(wd._scan_pairs(), timeout=2) == 1
+        await asyncio.sleep(0.01)
+        assert started == [other], "人工排的队该先走，扫描捡到的 07 再等一轮"
+        assert wd._advance_wanted == []
+
+        gate.set()
+        for job in list(wd._advance_tasks.values()):
+            await job
+        await hold
 
     asyncio.run(main())
 

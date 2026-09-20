@@ -2,13 +2,14 @@
 import { computed, onMounted } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import { useGlobalEvents } from '../sse'
-import { refreshStatus, refreshTasks, scheduleRefresh, store } from '../store'
+import { refreshStatus, refreshTasks, scheduleRefresh, store, stuckTasks } from '../store'
 
 const route = useRoute()
 const nav = [
   { to: '/', label: '总览', key: 'overview', glyph: '◉' },
   { to: '/design', label: '设计题目', key: 'design', glyph: '✎' },
   { to: '/bank', label: '题库', key: 'bank', glyph: '▤' },
+  { to: '/list', label: '题目列表', key: 'list', glyph: '▦' },
   { to: '/queue', label: '队列', key: 'queue', glyph: '≡' },
   { to: '/runs', label: '运行舱', key: 'runs', glyph: '▶' },
   { to: '/settings', label: '设置', key: 'settings', glyph: '⚙' },
@@ -63,7 +64,9 @@ const probes = computed(() => {
           :class="{ '!bg-accent/15 !text-accent font-medium': route.name === n.key || n.key === taskOwner }">
           <span class="mono text-xs w-4 text-center opacity-80">{{ n.glyph }}</span>
           <span>{{ n.label }}</span>
-          <span v-if="n.key === 'runs' && slots && slots.running" class="ml-auto mono text-[12px] text-run">{{ slots.running }}</span>
+          <!-- 失败的题只在列表页有出路（重跑、重试推进），数字挂在这儿人才会想到去点它 -->
+          <span v-if="n.key === 'list' && stuckTasks.length" class="ml-auto mono text-[12px] text-err">{{ stuckTasks.length }}</span>
+          <span v-else-if="n.key === 'runs' && slots && slots.running" class="ml-auto mono text-[12px] text-run">{{ slots.running }}</span>
           <span v-else-if="n.key === 'queue' && slots?.queued" class="ml-auto mono text-[12px] text-run">{{ slots.queued }}</span>
           <span v-else-if="n.key === 'design' && store.status?.design.running.length" class="ml-auto dot bg-run animate-breathe" />
         </RouterLink>

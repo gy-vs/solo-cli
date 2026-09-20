@@ -68,6 +68,11 @@ _advancing: set[int] = set()
 # 次数。占住的不只是配对这一步 —— 补记账、异常重跑跟它在同一轮 tick 里，于是跑挂的等
 # 不到重跑、跑完的等不到配对，整套定时任务看上去就是停摆了，而容器照常在跑。
 _advance_tasks: dict[int, asyncio.Task] = {}
+# 人工点过「提交产物并分析」、还没轮到额度的题，按点击顺序排。
+# 批量发起时一次能点十几道，而并发额度通常是 2，超出的必须留个凭据等着：这批题里有
+# NEEDS_ATTENTION 的、有分析失败过的，配对扫描一律够不着（见 _pairs_ready），
+# 当场丢掉就是悄无声息地不干活 —— 人在界面上只会看到自己点过的那批里有几道永远没动静。
+_advance_wanted: list[int] = []
 _last_tick_at: datetime | None = None
 _last_error = ""
 _last_stats: dict = {}
@@ -890,25 +895,50 @@ async def _advance_one(task_id: int) -> None:
         log.warning("题 %s 推进失败：%s", task_id, r.get("message") or r.get("error"))
 
 
-async def _scan_pairs() -> int:
-    """把两侧都跑完的题交给后台推进，不等它跑完。返回这一轮新起了几个。
+def _advance_slots() -> int:
+    """还能再开几个后台推进。额度就是设置里那个「分析/质检并发」：推产物之后的两步
+    都在调模型，一起开太多只会互相拖慢。"""
+    limit = max(1, settings_store.get_int("auto.max_parallel", 2))
+    return max(0, limit - len(_advance_tasks))
 
-    并发额度就是设置里那个「分析/质检并发」：这两步都在调模型，一起开太多只会互相
-    拖慢。额度占满时剩下的题留到下一轮，它们的状态没变，扫描照样挑得到。
+
+def _advancing_now(task_id: int) -> bool:
+    """这道题此刻是不是已经在推进。
+
+    create_task 排到事件循环里才真正开跑，在那之前题的状态还是原样，扫描照样会挑中它；
+    所以占位看的是 _advance_tasks 而不是题的状态，不能等 advance_pair 自己去 _advancing。
+    """
+    return task_id in _advance_tasks or task_id in _advancing
+
+
+def _start_advance(task_id: int) -> None:
+    """占一个额度把推进跑起来。额度与重复由调用方先判。"""
+    _advance_tasks[task_id] = asyncio.create_task(
+        _advance_one(task_id), name=f"advance-{task_id}")
+
+
+async def _scan_pairs() -> int:
+    """把该推进的题交给后台，不等它跑完。返回这一轮新起了几个。
+
+    人工排的队先走：那是人在界面上点过的，而扫描自己捡到的题等一轮无妨。额度占满时
+    两边剩下的都留到下一轮 —— 扫描那批的状态没变，照样挑得到；人工那批在队列里等着。
     """
     _reap_advances()
-    limit = max(1, settings_store.get_int("auto.max_parallel", 2))
     started = 0
+    while _advance_wanted and _advance_slots():
+        task_id = _advance_wanted.pop(0)
+        if _advancing_now(task_id):
+            continue
+        log.info("题 %s 是人工点的推进，开始推产物、写描述、质检", task_id)
+        _start_advance(task_id)
+        started += 1
     for task_id in _pairs_ready():
-        if len(_advance_tasks) >= limit:
+        if not _advance_slots():
             break
-        # create_task 排到事件循环里才真正开跑，在那之前题的状态还是原样，下一轮扫描
-        # 照样会挑中它。所以占位要在这里同步做，不能等 advance_pair 自己去 _advancing。
-        if task_id in _advance_tasks or task_id in _advancing:
+        if _advancing_now(task_id) or task_id in _advance_wanted:
             continue
         log.info("题 %s 两侧都跑完了，交给后台推产物、写描述、质检", task_id)
-        _advance_tasks[task_id] = asyncio.create_task(
-            _advance_one(task_id), name=f"advance-{task_id}")
+        _start_advance(task_id)
         started += 1
     return started
 
@@ -1009,6 +1039,7 @@ async def stop() -> None:
     for job in _advance_tasks.values():
         job.cancel()
     _advance_tasks.clear()
+    _advance_wanted.clear()
     if _task:
         _task.cancel()
 
@@ -1039,6 +1070,34 @@ def retry_failed_analyses() -> list[str]:
         log.info("凭据已更新，把分析失败的题 %s 放回流程", "、".join(out))
         wake()
     return out
+
+
+def queue_advance(task_id: int) -> dict:
+    """把一道题排进后台推进（推产物 + 分析 + 质检），不等它跑完。
+
+    列表页上那个「提交产物并分析」走这里而不是 advance_pair：推产物之后要跑 GSB 分析
+    和质检，两步都在调模型，一道题十几二十分钟是常态。同步等着的话，批量点十道那条
+    HTTP 请求必然先超时，而动作已经在后台跑起来了 —— 人看到的是一个失败，回头再点一遍，
+    于是同一道题的产物被推两遍（advance_pair 的 _advancing 能挡住，但界面上说不清）。
+
+    返回的 started 区分「已经开跑」和「在队列里等额度」，界面要照原话说给人听：
+    后者看上去什么都没发生，不说清楚就会被当成没点动。
+    """
+    _reap_advances()
+    if _advancing_now(task_id):
+        return {"ok": True, "started": False, "message": "这道题正在推进中"}
+    if task_id in _advance_wanted:
+        return {"ok": True, "started": False,
+                "message": f"已在推进队列里等额度，第 {_advance_wanted.index(task_id) + 1} 位"}
+    if _advance_slots():
+        _start_advance(task_id)
+        return {"ok": True, "started": True, "message": "已开始推产物与分析"}
+    _advance_wanted.append(task_id)
+    # 催一次巡检：额度是随推进结束腾出来的，而巡检默认五分钟一轮，不催的话队首那道题
+    # 可能在额度早就空了的情况下还干等着。
+    wake()
+    return {"ok": True, "started": False,
+            "message": f"分析并发已满，排在第 {len(_advance_wanted)} 位等额度"}
 
 
 async def manual_rerun(task_id: int, sides: tuple[str, ...] = config.SIDES) -> dict:

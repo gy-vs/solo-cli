@@ -43,6 +43,12 @@ class IdList(BaseModel):
     ids: list[int]
 
 
+class RerunBatch(IdList):
+    """批量重跑：ids 是题，sides 留空表示每道题两侧都重跑。"""
+
+    sides: list[str] = Field(default_factory=list)
+
+
 class DesignStart(BaseModel):
     count: int = 1
     note: str = ""

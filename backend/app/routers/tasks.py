@@ -21,7 +21,8 @@ from app.models import (
     QUEUED, RUN_DONE, RUN_RUNNING, RUNNING, UPLOADED, RunEvent, Task, TaskRun, utc_now,
 )
 from app.schemas import (
-    GsbUpdate, IdList, QueueMove, RerunRequest, ScreencastUpdate, task_brief, task_detail,
+    GsbUpdate, IdList, QueueMove, RerunBatch, RerunRequest, ScreencastUpdate, task_brief,
+    task_detail,
 )
 from app.services import (
     dockerx, gate, gsb_analyzer, gsb_repo, gsb_uploader, gsb_verifier, pool, pool_bank,
@@ -175,6 +176,51 @@ async def batch_claim(body: IdList) -> dict:
             code = d.get("code", "") if structured else ("POOL_TAKEN" if exc.status_code == 404 else "")
             results.append({"id": tid, "queued": False, "code": code,
                             "error": d.get("message", "") if structured else str(d)})
+    return {"results": results}
+
+
+@router.post("/batch/rerun")
+async def batch_rerun(body: RerunBatch) -> dict:
+    """批量重跑。一道题失败不影响后面的，各自报各自的原因。
+
+    逐道串行：重跑要销毁容器、把工作目录重置回初始快照、归档轨迹再退回队列，全是碰磁盘
+    和 docker 的活，一起发出去只会互相抢 IO，而真正的瓶颈在后面的容器槽位上。
+    """
+    sides = tuple(_side(s) for s in body.sides) or config.SIDES
+    results = []
+    for tid in body.ids:
+        with session() as db:
+            if db.get(Task, tid) is None:
+                results.append({"id": tid, "ok": False, "message": "题目不存在"})
+                continue
+            # 与单题重跑同一个口径：在跑的那一侧要先停，否则容器刚被销毁、runner 还在
+            # 往这一行写收尾结果，重跑建出来的新一轮会被那份旧账盖掉。
+            if any(r.status == RUN_RUNNING for r in _runs(db, tid)):
+                results.append({"id": tid, "ok": False, "message": "还有容器在跑，请先停止"})
+                continue
+        results.append({"id": tid, **await watchdog.manual_rerun(tid, sides)})
+    return {"results": results}
+
+
+@router.post("/batch/advance")
+async def batch_advance(body: IdList) -> dict:
+    """批量发起「推产物 + 分析 + 质检」。只排队，不等任何一道跑完。
+
+    单题也走这里，不走 /{task_id}/advance：那个是同步等到质检出结果的，一道题十几
+    二十分钟，界面上点一下就得干等到请求超时。理由见 watchdog.queue_advance。
+    """
+    results = []
+    for tid in body.ids:
+        with session() as db:
+            t = db.get(Task, tid)
+            if t is None:
+                results.append({"id": tid, "ok": False, "message": "题目不存在"})
+                continue
+            if t.status not in (RUN_DONE, NEEDS_ATTENTION, ANALYZED):
+                results.append({"id": tid, "ok": False,
+                                "message": f"状态 {t.status} 不能推进"})
+                continue
+        results.append({"id": tid, **watchdog.queue_advance(tid)})
     return {"results": results}
 
 
