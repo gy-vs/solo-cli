@@ -38,7 +38,7 @@ from app.models import (
     ANALYSIS_FAILED, ANALYSIS_IDLE, ANALYSIS_RUNNING, ANALYZING, DISCARDED, NEEDS_ATTENTION,
     QUEUED, RUN_DONE,
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
-    RUN_TIMEOUT, WATCHED, RunEvent, Task, TaskRun, utc_now,
+    RUN_TIMEOUT, SCHEDULABLE, WATCHED, RunEvent, Task, TaskRun, utc_now,
 )
 from app.services import dockerx, gsb_repo, settings_store
 
@@ -811,6 +811,43 @@ async def _scan_abnormal() -> dict:
     return stats
 
 
+def _settle_stopped() -> int:
+    """人按了停止、两侧都停下来的题，从「运行中」挪到「需人工」。返回挪了几道。
+
+    题级状态是从两侧 run 推出来的：有一侧在跑就是 RUNNING，有一侧在等就是 QUEUED，
+    两侧都结束了就推不出来，交给巡检。而巡检对人工停止的态度是「不碰」——这本是对的，
+    人停下来多半是要去改配置，悄悄重跑会盖掉他刚改的东西。但「不碰」只管住了这一侧
+    的 run，没人来收题级状态：异常扫描放行、配对扫描又只认两侧 FINISHED，于是两个容器
+    早就 Exited 了，题还挂着「运行中」，界面上连「废弃」都点不了（那个按钮在运行中不亮）。
+
+    所以这一步专收这种题：两侧都结束、都不算异常、又不是都正常跑完 —— 按前面那几步
+    的排除法，剩下的只能是被人停掉的。转到「需人工」，详情页上会亮出「重跑 X 侧」与
+    「废弃」，人自己决定下一步。真异常的题不归这里管，异常扫描那步已经重跑、废弃
+    或挂起了它们。
+    """
+    moved: list[int] = []
+    with session() as db:
+        for task in db.execute(select(Task).where(Task.status.in_(SCHEDULABLE))).scalars():
+            runs = db.query(TaskRun).filter(TaskRun.task_id == task.id).all()
+            if len(runs) != 2 or any(r.status not in RUN_END_STATUSES for r in runs):
+                continue
+            if all(r.status == RUN_FINISHED for r in runs):
+                continue  # 两侧都跑完了，那是配对扫描的活
+            if any(abnormal_reason(r) for r in runs):
+                continue  # 真异常，异常扫描已经处理过或正挂起等着
+            stopped = sorted(r.side for r in runs if r.status != RUN_FINISHED)
+            task.status = NEEDS_ATTENTION
+            task.finished_at = task.finished_at or utc_now()
+            task.auto_error = (f"{'、'.join(stopped)} 侧被人工停止，两侧容器都已结束；"
+                               f"重跑{'这一侧' if len(stopped) == 1 else '两侧'}或废弃整题")
+            log.info("题 %s 两侧都已停下（%s 侧为人工停止），转需人工",
+                     task.task_no, "、".join(stopped))
+            moved.append(task.id)
+    for tid in moved:
+        bus.publish("tasks", {"type": "task", "id": tid})
+    return len(moved)
+
+
 async def _reconcile_containers() -> int:
     """校正容器台账：库里写着「保留中」而容器其实已经不在了的，改回去。返回改了几条。
 
@@ -880,6 +917,10 @@ async def tick() -> dict:
     """跑一轮定时任务。三步的先后都不能换，理由见上面那段注释。"""
     adopted = await _scan_orphans()
     stats = await _scan_abnormal()
+    # 异常扫描放行了的、又配不上对的，只剩人工停掉的那种。放在异常之后是因为
+    # 它靠「不算异常」这个结论做排除；放在配对之前是因为两者互斥，先后无所谓，
+    # 但转成需人工之后配对扫描本就不看它，顺序这样更省一次白扫。
+    stats["settled"] = _settle_stopped()
     advanced = await _scan_pairs()
     # 台账校正放最后：上面几步可能刚销毁过容器，这时对齐一次正好
     fixed = await _reconcile_containers()
@@ -915,10 +956,10 @@ async def _loop() -> None:
             _last_tick_at, _last_error, _last_stats = utc_now(), "", stats
             # 每轮都留一行。巡检绝大多数时候什么都不做，一声不吭的话，「它到底还在不在
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
-            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 起推进 %s（在跑 %s）"
-                     " · 耗时 %.1fs",
+            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 转人工 %s · 起推进 %s"
+                     "（在跑 %s） · 耗时 %.1fs",
                      stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
-                     stats["advanced"], len(_advance_tasks),
+                     stats["settled"], stats["advanced"], len(_advance_tasks),
                      (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise

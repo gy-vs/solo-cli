@@ -1315,6 +1315,96 @@ def _noop_requeue():
     return go
 
 
+def _stopped_by_hand(db, run_id: int) -> None:
+    r = db.get(m.TaskRun, run_id)
+    r.status = m.RUN_INTERRUPTED
+    r.exit_code = 143
+    r.verdict = {"process": {"exit_code": 143, "manual_stop": True}, "protocol": {}, "artifact": {}}
+
+
+def test_a_task_stopped_by_hand_leaves_running_and_waits_for_people(task_with_runs):
+    """人按了停止、两侧容器都 Exited 了，题不能还挂着「运行中」。
+
+    题级状态从两侧 run 推：两侧都结束就推不出来，交给巡检。巡检对人工停止的 run 是
+    「不碰」，异常扫描放行、配对扫描又只认两侧 FINISHED —— 两头都不管，题就永远停在
+    RUNNING，界面上连「废弃」都点不了。这一步把它转成「需人工」，让人自己决定重跑还是废弃。
+    """
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        for side in ("A", "B"):
+            _stopped_by_hand(db, ids[side])
+        db.get(m.Task, task_id).status = m.RUNNING
+
+    assert asyncio.run(wd.tick())["settled"] == 1
+
+    with session() as db:
+        task = db.get(m.Task, task_id)
+        assert task.status == m.NEEDS_ATTENTION
+        assert "A、B 侧被人工停止" in task.auto_error
+        assert task.finished_at is not None
+
+
+def test_one_side_stopped_by_hand_after_the_other_finished_also_waits_for_people(task_with_runs):
+    """A 正常跑完、B 被人停掉：配对凑不齐，也不算异常，同样得转人工并点名 B 侧。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        a = db.get(m.TaskRun, ids["A"])
+        a.status = m.RUN_FINISHED
+        a.git_diff_stat = "src/a.ts | 3 +-"
+        a.verdict = {"process": {"exit_code": 0}, "protocol": {"subtype": "success"},
+                     "artifact": {"trace_found": True, "changed_files": 3}}
+        _stopped_by_hand(db, ids["B"])
+        db.get(m.Task, task_id).status = m.RUNNING
+
+    assert wd._settle_stopped() == 1
+
+    with session() as db:
+        task = db.get(m.Task, task_id)
+        assert task.status == m.NEEDS_ATTENTION
+        assert task.auto_error.startswith("B 侧被人工停止")
+        assert "重跑这一侧" in task.auto_error
+
+
+def test_settling_stopped_tasks_does_not_touch_tasks_still_in_flight(task_with_runs):
+    """一侧还在跑、或一侧是真异常等着重跑的题，都不是这一步该碰的。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        _stopped_by_hand(db, ids["A"])
+        db.get(m.TaskRun, ids["B"]).status = m.RUN_RUNNING
+        db.get(m.Task, task_id).status = m.RUNNING
+    assert wd._settle_stopped() == 0
+
+    with session() as db:
+        b = db.get(m.TaskRun, ids["B"])
+        b.status = m.RUN_FAILED
+        b.verdict = {"process": {"exit_code": 1}, "protocol": {}, "artifact": {}}
+    assert wd._settle_stopped() == 0
+
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.RUNNING
+
+
+def test_settling_ignores_tasks_that_have_left_the_running_phase(task_with_runs):
+    """废弃时也会把没跑完的 run 标成 INTERRUPTED，但那道题已经不在运行阶段，不能被拽回「需人工」。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    with session() as db:
+        for side in ("A", "B"):
+            _stopped_by_hand(db, ids[side])
+        db.get(m.Task, task_id).status = m.DISCARDED
+
+    assert wd._settle_stopped() == 0
+    with session() as db:
+        assert db.get(m.Task, task_id).status == m.DISCARDED
+
+
 def test_stale_abnormal_record_is_cleared_once_it_no_longer_holds(task_with_runs, monkeypatch):
     """异常不成立了就要把记录抹掉，否则题永远出不了「需人工」。
 
