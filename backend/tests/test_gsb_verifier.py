@@ -263,6 +263,12 @@ def test_harness_version_mismatch_is_only_a_warning():
     assert r["overall"] == "warn"
 
 
+def test_harness_version_ignores_the_product_name_suffix():
+    """题块记的是「2.1.197 (Claude Code)」，镜像只给「2.1.197」，这不是版本对不上。"""
+    r = gv.verify(_data(harness_version="2.1.197 (Claude Code)", image_version="2.1.197"))
+    assert "harness_version" not in _names(r, "warn")
+
+
 def test_overall_block_wins_over_warn():
     sides = {"A": _side("A", changed_files=0, session_id=""), "B": _side("B")}
     assert gv.verify(_data(sides=sides))["overall"] == "block"

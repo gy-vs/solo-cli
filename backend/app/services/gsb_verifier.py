@@ -42,6 +42,16 @@ def _chars(text: str) -> int:
     return len(re.sub(r"\s+", "", text or ""))
 
 
+def _ver(text: str) -> str:
+    """只取版本号本身。
+
+    题块里记的是「2.1.197 (Claude Code)」，镜像实测只给「2.1.197」，直接比字符串
+    会把每道题都判成版本对不上。带不带这个后缀是出题时的书写差异，不是版本差异。
+    """
+    m = re.search(r"\d+(?:\.\d+)+", text or "")
+    return m.group(0) if m else (text or "").strip()
+
+
 def _norm_prompt(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
@@ -216,7 +226,7 @@ def verify(data: dict) -> dict:
 
     # ---- 提示项 ----
     iv, hv = data.get("image_version"), data.get("harness_version")
-    if iv and hv and iv != hv:
+    if iv and hv and _ver(iv) != _ver(hv):
         items.append(_item("harness_version", "warn",
                            f"题块记录的 Harness 版本是 {hv}，镜像实测是 {iv}，上传以实测为准"))
 
