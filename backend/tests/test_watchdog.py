@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 
@@ -1408,6 +1409,48 @@ def _stopped_by_hand(db, run_id: int) -> None:
     r.status = m.RUN_INTERRUPTED
     r.exit_code = 143
     r.verdict = {"process": {"exit_code": 143, "manual_stop": True}, "protocol": {}, "artifact": {}}
+
+
+def test_a_pair_waiting_for_the_analysis_quota_stops_showing_as_running(task_with_runs,
+                                                                       clean_advances):
+    """两侧都正常跑完、只是在排队等分析额度的题，不能还挂着「运行中」。
+
+    题级状态推不出「两侧都结束」这一种，而写 RUN_DONE 的只有 advance_pair，它排在额度
+    后面。额度默认 2、一道题的分析加质检十几二十分钟，跑完的题一多后面就得排队；排队
+    这一路上容器早已 Exited、产物也齐了，界面上却一直是「运行中」，看上去像是连巡检都
+    刷不过来。所以状态不跟着额度走，推进照旧排队。
+    """
+    from app.db import session
+    from app.services import settings_store
+
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    ended = m.utc_now()
+    with session() as db:
+        db.get(m.Task, task_id).status = m.RUNNING
+        db.get(m.TaskRun, ids["A"]).finished_at = ended - timedelta(minutes=14)
+        db.get(m.TaskRun, ids["B"]).finished_at = ended
+    settings_store.set_one("auto.max_parallel", "1")
+
+    async def main():
+        gate = asyncio.Event()
+        wd._advance_tasks[-1] = asyncio.create_task(gate.wait())  # 唯一那个额度占满
+        try:
+            return await wd.tick()
+        finally:
+            gate.set()
+
+    stats = asyncio.run(main())
+    assert stats["run_done"] == 1
+    assert stats["advanced"] == 0
+
+    with session() as db:
+        task = db.get(m.Task, task_id)
+        assert task.status == m.RUN_DONE
+        # 结束时刻取两侧较晚的那个，不是扫到它的此刻：列表按它排序、今日产出也数它
+        assert m.as_utc(task.finished_at) == ended
+    # 换了状态不等于放过了它：额度一空照样该推进
+    assert wd._pairs_ready() == [task_id]
 
 
 def test_a_task_stopped_by_hand_leaves_running_and_waits_for_people(task_with_runs):
