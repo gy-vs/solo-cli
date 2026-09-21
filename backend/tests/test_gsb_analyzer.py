@@ -79,6 +79,33 @@ def test_strip_steps_does_not_eat_ordinary_numbers():
     assert ga.strip_steps(text) == text
 
 
+# ---------------- 宣判式结论 ----------------
+# 光靠 prompt 拦不住，它又是每道题的最后一句，漏一次整段就露怯，所以在清洗里兜死。
+
+@pytest.mark.parametrize("text,want", [
+    ("这个权重更低，判 B 更好", "这个权重更低，B 更好"),
+    ("所以判 A 更好", "所以 A 更好"),
+    ("综合下来判定 B 更好", "综合下来 B 更好"),
+    ("这一局判给 A", "这一局 A"),
+    ("两边确实等价，判 Same", "两边确实等价，Same"),
+])
+def test_soften_verdict_drops_the_refereeing_word(text, want):
+    assert ga.soften_verdict(text) == want
+
+
+@pytest.mark.parametrize("text", [
+    "两侧对根因的判断一致",
+    "A 把未知描述符判成整条规则无效",
+    "所以 A 更好",
+])
+def test_soften_verdict_leaves_ordinary_uses_alone(text):
+    assert ga.soften_verdict(text) == text
+
+
+def test_clean_softens_the_verdict_sentence():
+    assert ga._clean("这个权重更低，判 B 更好") == "这个权重更低，B 更好"
+
+
 # ---------------- 绝对路径 ----------------
 
 def test_strip_paths_makes_sandbox_paths_relative():
@@ -224,9 +251,10 @@ def test_prompt_carries_writing_rules_that_ban_machine_metrics(tmp_db):
     assert "不写步数" in text
     assert "工具调用次数" in text
     assert "数字密度" in text
-    # 反过来，书面语是允许的，不能在 prompt 里禁掉；要收的是篇幅和颗粒度
-    assert "写得正式、用词专业不算机器痕迹" in text
+    # 反过来，书面语是允许的，不能在 prompt 里禁掉；要收的是篇幅、颗粒度和端着的措辞
+    assert "不必为了像人而刻意堆口语" in text
     assert "只挑一到两个真正决定胜负的点展开" in text
+    assert "不要用「判」字" in text
 
 
 def test_prompt_asks_for_startup_instructions(tmp_db):

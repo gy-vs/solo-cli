@@ -290,6 +290,36 @@ def test_figurative_and_colloquial_wording_is_flagged(bad):
     assert "reason_wording" in _names(gv.verify(_data(reason=GOOD_REASON + bad)), "warn")
 
 
+@pytest.mark.parametrize("bad", ["A 的毛病在收尾", "A 的做法很克制", "B 的设计更讲究",
+                                 "改完也没再复跑一遍", "断言的是实际运行输出",
+                                 "两种情况分别建模", "B 比 A 更贴规范"])
+def test_stiff_official_wording_is_flagged(bad):
+    """往公文那头偏也要拦。单个词不算错，通篇摞起来就不像一个人在说话。"""
+    assert "reason_wording" in _names(gv.verify(_data(reason=GOOD_REASON + bad)), "warn")
+
+
+def test_a_longer_phrase_that_merely_contains_a_banned_word_is_not_flagged():
+    """「反复跑探针」是正常说法，不能因为里面有「复跑」就拦，否则下一轮会被改坏。"""
+    ok = "它反复跑只有导入、不核对结果的探针"
+    assert "reason_wording" not in _names(gv.verify(_data(reason=GOOD_REASON + ok)), "warn")
+    bad = ok + "，改完作用域遍历也没再复跑"
+    assert "reason_wording" in _names(gv.verify(_data(reason=GOOD_REASON + bad)), "warn")
+
+
+@pytest.mark.parametrize("bad", ["所以判 A 更好", "判 B 更好", "这样看判 Same",
+                                 "综合下来判定 B 更好", "这一局判给 A"])
+def test_refereeing_verdict_sentence_is_flagged(bad):
+    """「判 X 更好」是裁判在宣判，人给意见只会说「所以 A 更好」。"""
+    assert "reason_verdict_tone" in _names(gv.verify(_data(reason=GOOD_REASON + bad)), "warn")
+
+
+@pytest.mark.parametrize("ok", ["两侧对根因的判断一致", "A 把未知描述符判成整条规则无效",
+                                "所以 A 更好", "这么看下来 B 更好"])
+def test_normal_uses_of_the_word_are_not_flagged(ok):
+    """「判断」「判成」是正常用词，别把它们一起拦掉。"""
+    assert "reason_verdict_tone" not in _names(gv.verify(_data(reason=GOOD_REASON + ok)), "warn")
+
+
 def test_repeated_opening_across_tasks_is_flagged():
     """同一个开场套在几道题上，单看哪道题都正常，摆在一起才露馅。"""
     reason = "这道题我比较在意两点。" + GOOD_REASON

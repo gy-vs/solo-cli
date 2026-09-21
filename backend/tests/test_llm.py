@@ -97,7 +97,7 @@ def test_envelope_refuses_to_pass_off_an_unfinished_event_stream_as_text():
         '{"type":"system","subtype":"init","apiKeySource":"env","session_id":"s3"}',
         '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"题目材料"}]}}',
     ])
-    assert llm._parse_envelope(blob)[0] == ""
+    assert llm._parse_envelope(blob) == ("", "", {})
 
 
 def test_envelope_raises_on_error_result():

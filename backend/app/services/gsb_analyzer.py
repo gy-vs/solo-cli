@@ -355,6 +355,30 @@ def strip_machine_metrics(text: str) -> str:
     return re.sub(r"([，。、；])\s*\1+", r"\1", out).strip(" ，、")
 
 
+_VERDICT_WORD = re.compile(r"判(?:定|为|给)?\s*(?=(?:[AB](?![A-Za-z0-9_])|[Ss]ame\b))")
+
+
+def soften_verdict(text: str) -> str:
+    """把「判 A 更好」里的「判」字去掉，剩下「所以 A 更好」这种人会说的话。
+
+    这一条本可以只靠 prompt，实测靠不住：模型要么留着「判」，要么为了换说法把整段
+    写长，超了篇幅又被改写那一轮丢弃，来回四轮还停在原地。而它恰恰是每道题的最后
+    一句，漏一次就整段露怯，所以在这里兜死。
+
+    只删「判」不补别的词：「这个权重更低，判 B 更好」删完就是「这个权重更低，B 更好」，
+    读起来是通的；补个「所以」反而会和前面已有的「所以」撞上。前面是汉字时留一个
+    空格，「综合下来判定 B」才不会挤成「综合下来B」。
+    """
+    if not text:
+        return text
+
+    def cut(m: re.Match) -> str:
+        prev = text[m.start() - 1] if m.start() else ""
+        return " " if "\u4e00" <= prev <= "\u9fff" else ""
+
+    return _VERDICT_WORD.sub(cut, text)
+
+
 def strip_markdown(text: str) -> str:
     """扒掉 markdown 记号与固定分栏，保留文字本身。"""
     if not text:
@@ -373,7 +397,7 @@ def strip_markdown(text: str) -> str:
 
 def _clean(value, repos: dict[str, Path] | None = None) -> str:
     text = strip_paths(str(value or "").strip(), repos)
-    return strip_machine_metrics(strip_steps(strip_markdown(text)))
+    return soften_verdict(strip_machine_metrics(strip_steps(strip_markdown(text))))
 
 
 def _clean_list(items, repos, limit: int = 20) -> list[str]:
@@ -492,7 +516,7 @@ def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
 {reason}
 REASON>>>
 
-【必须修掉的毛病】
+【必须改掉的地方】
 {listed}
 
 【写法要求】
@@ -564,7 +588,7 @@ def build_findings_fix_prompt(a: dict, b: dict, defects: list[str]) -> str:
 【当前内容】
 {current}
 
-【必须修掉的毛病】
+【必须改掉的地方】
 {listed}
 
 【写法要求】
