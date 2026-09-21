@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.models import Task, TaskRun
-from app.services import gsb_repo
+from app.services import gsb_precheck, gsb_repo
 
 
 class SettingsUpdate(BaseModel):
@@ -31,6 +31,12 @@ class ScreencastUpdate(BaseModel):
 
     A: str | None = None
     B: str | None = None
+
+
+class PrecheckConfirm(BaseModel):
+    """人工放行提交前质检。note 记一句为什么放行，只给自己看。"""
+
+    note: str = ""
 
 
 class RerunRequest(BaseModel):
@@ -111,6 +117,7 @@ def run_detail(r: TaskRun) -> dict:
 
 def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
     gsb = t.gsb or {}
+    precheck = t.precheck or {}
     return {
         "id": t.id,
         "task_no": t.task_no,
@@ -135,6 +142,15 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "screencast": t.screencast,
         "verify_overall": (t.verify or {}).get("overall"),
         "verify_blocked": (t.verify or {}).get("blocked") or 0,
+        # 提交前质检。按 verify 的做法在列表里摊成几个扁平字段，详情页才给完整报告。
+        # precheck_block 是能不能提交的唯一口径（空串表示能），界面上按钮灰不灰、
+        # 提示写什么都照它来，免得前端自己凑一套条件，和后端回绝的理由对不上。
+        "precheck_status": t.precheck_status,
+        "precheck_issues": len(precheck.get("issues") or []),
+        "precheck_summary": precheck.get("summary") or precheck.get("error") or "",
+        "precheck_stale": gsb_precheck.stale(t),
+        "precheck_block": gsb_precheck.submit_block(t),
+        "precheck_at": precheck.get("confirmed_at") or precheck.get("finished_at") or "",
         "upload_ok": (t.upload or {}).get("ok"),
         "submission_id": (t.upload or {}).get("submission_id"),
         "priority": t.priority,
@@ -164,6 +180,7 @@ def task_detail(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "gsb": t.gsb,
         "analysis": t.analysis,
         "verify": t.verify,
+        "precheck": t.precheck,
         "upload": t.upload,
         "dedup": t.dedup,
         "runs": [run_detail(r) for r in sorted(runs or [], key=lambda x: x.side)],

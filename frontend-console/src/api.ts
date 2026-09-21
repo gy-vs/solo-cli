@@ -30,7 +30,10 @@ const put = <T>(p: string, body?: any) => request<T>(p, { method: 'PUT', body: J
 /** 题级状态：只描述这道题走到哪一步，单侧容器跑得怎样看 TaskRun.status */
 export type Status =
   | 'AVAILABLE' | 'CLAIMED' | 'QUEUED' | 'RUNNING' | 'RUN_DONE' | 'ANALYZING'
-  | 'ANALYZED' | 'UPLOADED' | 'DONE' | 'NEEDS_ATTENTION' | 'DISCARDED'
+  | 'ANALYZED' | 'QC' | 'UPLOADED' | 'DONE' | 'NEEDS_ATTENTION' | 'DISCARDED'
+
+/** 提交前质检走到哪一档。ERROR 是质检自己没跑成，和 FAIL 不是一回事 */
+export type PrecheckStatus = 'IDLE' | 'RUNNING' | 'PASS' | 'FAIL' | 'CONFIRMED' | 'ERROR'
 
 /** 单侧运行状态。取值与题级有同名的，比较时别混用 */
 export type RunStatus = 'PENDING' | 'QUEUED' | 'RUNNING' | 'FINISHED' | 'FAILED' | 'TIMEOUT' | 'INTERRUPTED'
@@ -101,6 +104,14 @@ export interface TaskBrief {
   screencast: Partial<Record<Side, string>>
   verify_overall: 'ok' | 'warn' | 'block' | null
   verify_blocked: number
+  precheck_status: PrecheckStatus
+  precheck_issues: number
+  precheck_summary: string
+  /** 质检之后理由又改过，这份结论不再代表现在这一稿 */
+  precheck_stale: boolean
+  /** 不能提交的原因。空串表示能提交，按钮灰不灰照这个字段，别在前端另凑一套条件 */
+  precheck_block: string
+  precheck_at: string
   upload_ok: boolean | null
   submission_id: number | null
   priority: number
@@ -153,11 +164,37 @@ export interface VerifyReport {
   items: VerifyItem[]
 }
 
+/** 质检挑出的一处机械化表达。quote 一定是理由正文里的原文，能拿去对位置 */
+export interface PrecheckIssue {
+  quote: string
+  kind: string
+  why: string
+  suggest: string
+}
+
+/** 提交前质检报告。发起只能在对话里（见后端 app/cli.py），界面只读它 */
+export interface PrecheckReport {
+  passed?: boolean
+  summary?: string
+  issues?: PrecheckIssue[]
+  /** 整段改写稿。缩水太多或引入核验红项的稿子后端已经丢掉，这里拿到的都是可用的 */
+  rewrite?: string
+  rewrite_dropped?: string
+  model?: string
+  duration_s?: number
+  finished_at?: string
+  confirmed_at?: string
+  confirmed_from?: string
+  confirmed_note?: string
+  error?: string
+}
+
 export interface TaskDetail extends TaskBrief {
   user_prompt: string
   gsb: Gsb | Record<string, never>
   analysis: any
   verify: VerifyReport | Record<string, never>
+  precheck: PrecheckReport | Record<string, never>
   upload: any
   dedup: any
   runs: TaskRunDetail[]
@@ -434,6 +471,14 @@ export const api = {
   /** 停录返回的 file 是后端可见路径，直接能喂给 uploadScreencast */
   hostRecordStop: (id: number, side: Side) =>
     post<{ ok: boolean; file: string; host_file: string; size: number; seconds: number; message: string }>(`/api/host/tasks/${id}/record/stop?side=${side}`),
+
+  // ---- 提交前质检 ----
+  /** 这里只有「人工确认放行」。发起质检故意没有封装：它只能由对话里的
+   *  `docker compose exec backend python -m app.cli precheck` 发起，nginx 也把那两条
+   *  路由挡在外面。为什么这么关，见 backend/app/services/gsb_precheck.py 的说明。 */
+  confirmPrecheck: (id: number, note = '') =>
+    post<{ ok: boolean; message: string; submittable: boolean; task: TaskBrief }>(
+      `/api/tasks/${id}/precheck/confirm`, { note }),
 
   // ---- 上传与收尾 ----
   upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),

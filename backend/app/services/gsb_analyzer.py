@@ -24,7 +24,7 @@ from app.db import session
 from app.events import bus
 from app.models import (
     ANALYSIS_DONE, ANALYSIS_FAILED, ANALYSIS_RUNNING, ANALYZED, ANALYZING,
-    NEEDS_ATTENTION, Task, TaskRun, utc_now,
+    NEEDS_ATTENTION, PRECHECK_IDLE, Task, TaskRun, utc_now,
 )
 from app.services import dockerx, gsb_repo, gsb_rules, llm, trace
 
@@ -264,7 +264,7 @@ def _repair_truncated(text: str) -> str:
     return out + "".join("}" if ch == "{" else "]" for ch in reversed(stack))
 
 
-def _extract_object(text: str, key: str, what: str) -> dict:
+def extract_object(text: str, key: str, what: str) -> dict:
     """从模型最终文本里提取含 key 的 JSON 对象：容忍前置说明、代码围栏、结尾少括号。
 
     按 key 认而不是取第一个对象：模型经常先吐一个小对象当示例或说明，取第一个
@@ -287,7 +287,7 @@ def _extract_object(text: str, key: str, what: str) -> dict:
 
 
 def extract_json(text: str) -> dict:
-    return _extract_object(text, "verdict", "GSB JSON")
+    return extract_object(text, "verdict", "GSB JSON")
 
 
 _ABS_PATH = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/)+[A-Za-z0-9_.\-\u4e00-\u9fff]*")
@@ -598,7 +598,7 @@ async def polish_findings(a: dict, b: dict, *, repos: dict[str, Path] | None = N
             r = await llm.ask(build_findings_fix_prompt(a, b, defects),
                               purpose=f"{purpose} findings 改写", attempts=1,
                               timeout_s=REASON_FIX_TIMEOUT_S)
-            obj = _extract_object(r.text, "a_findings", "findings JSON")
+            obj = extract_object(r.text, "a_findings", "findings JSON")
         except (llm.LlmError, ValueError) as exc:
             log.warning("%s findings 改写失败，保留上一版：%s", purpose or "GSB", exc)
             break
@@ -644,6 +644,10 @@ async def analyze_task(task_id: int) -> dict:
         t.analysis_status = ANALYSIS_RUNNING
         t.status = ANALYZING
         t.auto_error = ""
+        # 重新分析会整段换掉理由，上一轮的提交前质检结论对新的这一段不再成立。
+        # 留着它，一道重新分析过的题会带着旧的「质检通过」直接可提交。
+        t.precheck_status = PRECHECK_IDLE
+        t.precheck = {}
         db.flush()
         task_no = t.task_no
         snapshot = gsb_repo.snapshot_sha(t.env_snapshot)
@@ -700,6 +704,12 @@ async def analyze_task(task_id: int) -> dict:
             t.gsb = gsb
             t.analysis_status = ANALYSIS_DONE
             t.status = ANALYZED
+            # 重新分析的题录屏可能早就录完了，那它该直接落回质检栏而不是待录屏栏。
+            # gsb_precheck 反过来要用这个模块的 JSON 提取和清洗，所以在这里延迟导入，
+            # 和下面的 gsb_verifier 一样。
+            from app.services import gsb_precheck
+
+            gsb_precheck.sync_stage(db, t)
             db.flush()
 
         from app.services import gsb_verifier

@@ -87,6 +87,19 @@ def test_envelope_falls_back_to_raw_text():
     assert llm._parse_envelope("就是一段纯文本")[0] == "就是一段纯文本"
 
 
+def test_envelope_refuses_to_pass_off_an_unfinished_event_stream_as_text():
+    """启动即被拒时 stdout 正好是 init 加一条 user 回显，这不是正文。
+
+    当成正文交出去，GSB 分析就会拿两行 NDJSON 去解业务 JSON，报一句「没有可解析的
+    JSON」，而真正的原因（账单、Key、TLS）只在 stderr，从此看不到。
+    """
+    blob = "\n".join([
+        '{"type":"system","subtype":"init","apiKeySource":"env","session_id":"s3"}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"题目材料"}]}}',
+    ])
+    assert llm._parse_envelope(blob)[0] == ""
+
+
 def test_envelope_raises_on_error_result():
     with pytest.raises(llm.LlmError):
         llm._parse_envelope('{"result":"You have an unpaid invoice","is_error":true}')
@@ -160,7 +173,8 @@ def test_ask_treats_empty_output_as_retryable(monkeypatch):
 
 # ---------------- prompt 怎么送进 CLI ----------------
 
-def _stub_subprocess(monkeypatch, tmp_path, stdout: str, *, returncode: int = 0):
+def _stub_subprocess(monkeypatch, tmp_path, stdout: str, *, returncode: int = 0,
+                     stderr: str = ""):
     """拦住真正的进程创建，记下 argv 与写进 stdin 的内容。
 
     _once 现在按行读 stdout，不再走 communicate()，假进程必须提供同样的接口。
@@ -218,7 +232,7 @@ def _stub_subprocess(monkeypatch, tmp_path, stdout: str, *, returncode: int = 0)
             if payload and not payload.endswith(b"\n"):
                 payload += b"\n"
             self.stdout = FakeStream(payload)
-            self.stderr = FakeStream(b"")
+            self.stderr = FakeStream(stderr.encode("utf-8"))
 
         def kill(self) -> None:
             self.returncode = -9
@@ -274,6 +288,166 @@ def test_nonzero_exit_still_keeps_a_result(monkeypatch, tmp_path):
     _stub_subprocess(monkeypatch, tmp_path, blob, returncode=1)
     text, _sid, _usage = asyncio.run(llm._once("x", "auto", 60))
     assert text == "已经写完了"
+
+
+# 账单被拦时 CLI 只吐 init 加一条 user 回显，报错单独走 stderr。
+_REJECTED_STDOUT = (
+    '{"type":"system","subtype":"init","apiKeySource":"env","session_id":"s"}\n'
+    '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"题目材料"}]}}'
+)
+_UNPAID = ("ActionRequiredError: You have an unpaid invoice Visit "
+           "[cursor.com/dashboard](https://cursor.com/dashboard) and pay your invoice.")
+
+
+@pytest.mark.parametrize("returncode", [1, 0])
+def test_rejected_before_generating_reports_the_real_reason(monkeypatch, tmp_path, returncode):
+    """启动即被拒必须报出 stderr 里的真因，而且不许重试。
+
+    退出码两种都要认：CLI 打完这句话有时以 1 退出，有时以 0 退出，只认非零退出码
+    就会把报错丢掉，最后只剩一句「返回空内容」，还要白重试一轮。
+    """
+    _stub_subprocess(monkeypatch, tmp_path, _REJECTED_STDOUT,
+                     returncode=returncode, stderr=_UNPAID)
+
+    with pytest.raises(llm.LlmError) as err:
+        asyncio.run(llm._once("x", "auto", 60))
+
+    assert "未付账单" in str(err.value)
+    assert err.value.retryable is False
+
+
+def test_rejected_stdout_never_reaches_the_caller_as_text(monkeypatch, tmp_path):
+    """这两行 NDJSON 绝不能当成模型正文往上走。
+
+    以前会当成正文返回，GSB 分析拿它去解业务 JSON，最后报成「没有可解析的 GSB
+    JSON」，一道题查半天，真正的原因（账号欠费）从头到尾没露过面。
+    """
+    _stub_subprocess(monkeypatch, tmp_path, _REJECTED_STDOUT, returncode=1, stderr=_UNPAID)
+
+    with pytest.raises(llm.LlmError) as err:
+        asyncio.run(llm._once("x", "auto", 60))
+
+    assert "apiKeySource" not in str(err.value)
+    assert "题目材料" not in str(err.value)
+
+
+def _hanging_proc(monkeypatch, tmp_path, err_chunks: list[bytes], killed: dict):
+    """假进程：吐完手里这些块就沉默，永不自行退出，只有被杀才收口。
+
+    现场就是这样的：stderr 第一秒已经有 unpaid invoice，stdout 停在 init 加一条 user
+    回显，进程却一直挂着，日志只剩一串「空闲 xxx 秒」，到五分钟才带退出码 1 结束。
+    """
+    class FakeStdin:
+        def write(self, data: bytes) -> None: ...
+        async def drain(self) -> None: ...
+        def close(self) -> None: ...
+
+    class HangingStream:
+        def __init__(self, chunks: list[bytes], done: asyncio.Event) -> None:
+            self._chunks = list(chunks)
+            self._done = done
+
+        async def readline(self) -> bytes:
+            if self._chunks:
+                return self._chunks.pop(0)
+            await self._done.wait()
+            return b""
+
+        async def read(self, n: int = -1) -> bytes:
+            return await self.readline()
+
+    class HangingProc:
+        def __init__(self) -> None:
+            self.pid = 4242424
+            self.returncode = None
+            self._done = asyncio.Event()
+            self.stdin = FakeStdin()
+            self.stdout = HangingStream(
+                [line.encode("utf-8") + b"\n" for line in _REJECTED_STDOUT.splitlines()],
+                self._done)
+            self.stderr = HangingStream(err_chunks, self._done)
+
+        def kill(self) -> None:
+            self.returncode = 1
+            self._done.set()
+
+        async def wait(self) -> int:
+            await self._done.wait()
+            return self.returncode
+
+    async def fake_exec(*cmd, **kw):
+        return HangingProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(llm, "agent_bin", lambda: "/usr/bin/agent")
+    monkeypatch.setattr(llm.settings_store, "get",
+                        lambda key, *a: "k" if "api_key" in key else "")
+    monkeypatch.setattr(llm, "ASK_DIR", tmp_path)
+    # 都设得远大于用例时长：这样能证明进程是按 stderr 主动收掉的，
+    # 不是靠心跳的卡住判定兜到的。
+    monkeypatch.setattr(llm, "HEARTBEAT_S", 3600)
+    monkeypatch.setattr(llm, "STALL_S", 3600)
+    # 别碰真进程：pid 是编的，getpgid 万一撞上活着的进程组就真杀了。
+    monkeypatch.setattr(llm.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(llm.os, "killpg", lambda pgid, sig: killed.__setitem__("pg", pgid))
+
+
+def test_fatal_stderr_kills_the_cli_instead_of_waiting_it_out(monkeypatch, tmp_path):
+    """账单被拦时不许陪着 CLI 空转到卡住判定，那五分钟是纯等待。
+
+    题 219 就是这么来的：23:36 起跑，stderr 第一秒就写了 unpaid invoice，界面上却一直
+    显示分析中，到 23:41:57 才落 FAILED。fail-fast 没生效的话这个用例会卡到 wait_for
+    超时——抛出来的是 TimeoutError 而不是 LlmError，用例直接红。
+    """
+    killed: dict = {}
+    _hanging_proc(monkeypatch, tmp_path, [_UNPAID.encode("utf-8")], killed)
+
+    async def run():
+        # 给 _once 一个很长的自身超时，逼它只能靠 fail-fast 出来
+        return await asyncio.wait_for(llm._once("x", "auto", 3600), timeout=5)
+
+    with pytest.raises(llm.LlmError) as err:
+        asyncio.run(run())
+
+    # 判因仍走 classify，收尾路径不变
+    assert "未付账单" in str(err.value)
+    assert err.value.retryable is False
+    # 连 CLI 派生的子进程一起收，不是只 kill 它本身
+    assert killed.get("pg") == 4242424
+
+
+def test_fatal_stderr_is_matched_across_chunk_boundaries(monkeypatch, tmp_path):
+    """stderr 是分块读的，报错那句被切开也要认出来。
+
+    按单块认的话，切在 "unpaid inv" / "oice" 之间就漏了，于是又回到空转五分钟。
+    """
+    killed: dict = {}
+    blob = _UNPAID.encode("utf-8")
+    _hanging_proc(monkeypatch, tmp_path, [blob[:30], blob[30:]], killed)
+
+    async def run():
+        return await asyncio.wait_for(llm._once("x", "auto", 3600), timeout=5)
+
+    with pytest.raises(llm.LlmError) as err:
+        asyncio.run(run())
+
+    assert "未付账单" in str(err.value)
+    assert killed.get("pg") == 4242424
+
+
+def test_warnings_on_stderr_do_not_kill_a_healthy_run(monkeypatch, tmp_path):
+    """CLI 把警告也写 stderr，写了警告照样正常出结果，不能一见 stderr 就杀。
+
+    所以提前收进程只认高置信度的关键字：401 / 403 / forbidden 这类宽松词留到收尾时
+    判因，那时已经知道有没有正文了。
+    """
+    warn = "\x1b[33m! sandbox preflight failed (403 landlock), continuing\x1b[0m"
+    _stub_subprocess(monkeypatch, tmp_path,
+                     '{"type":"result","result":"分析好了"}', stderr=warn)
+
+    text, _sid, _usage = asyncio.run(llm._once("x", "auto", 60))
+
+    assert text == "分析好了"
 
 
 # ---------------- 工作目录与 skill ----------------

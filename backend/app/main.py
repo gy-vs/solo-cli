@@ -15,7 +15,7 @@ from app.routers import host as host_router
 from app.routers import settings as settings_router
 from app.routers import system as system_router
 from app.routers import tasks as tasks_router
-from app.services import pool, pool_bank, prompt_bank, settings_store, watchdog
+from app.services import gsb_precheck, pool, pool_bank, prompt_bank, settings_store, watchdog
 from app.services.scheduler import scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -48,6 +48,9 @@ async def lifespan(_: FastAPI):
             log.warning("题库文件不存在：%s", config.prompt_file())
     except Exception:  # noqa: BLE001
         log.exception("题库导入失败")
+    # 结论已出的题按录屏齐不齐在「待录屏」和「质检」之间对一次账。质检这一步是后加的，
+    # 不补这一次，此前录屏齐了的题会挂在待录屏栏里，提交按钮还是灰的。
+    gsb_precheck.sync_all()
     await scheduler.start()
     await watchdog.start()
     log.info("=" * 60)
@@ -69,6 +72,10 @@ async def lifespan(_: FastAPI):
              "（自动重跑已暂停）" if settings_store.get_bool("watchdog.paused", False) else "")
     log.info("并发    : 最多 %s 个容器，按容器排队（A、B 各排各的，跑完再配对）",
              scheduler.max_parallel)
+    # 页面上没有这个入口（nginx 也挡了发起路由），所以把命令印在启动日志里，
+    # 免得下次想跑质检时先去翻代码找它在哪
+    log.info("质检    : 提交前质检只能在这里发起 → "
+             "docker compose exec backend python -m app.cli precheck")
     log.info("=" * 60)
     yield
     await scheduler.stop()

@@ -157,6 +157,17 @@ _FATAL_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
      "Cursor 账号无权调用该模型"),
 )
 
+# 这几类在 CLI 起来的头几秒就写进 stderr，但进程不会跟着退：账单被拦时它还会空转到
+# 五分钟才带退出码 1 结束，日志里只剩一串「空闲 xxx 秒」，看着像在分析，其实第一秒
+# 就被拒了。认出来就立刻收掉，省下的全是纯等待——这几类重试也没用，判因照旧走
+# classify，收尾路径不变。
+# 只认高置信度的关键字。_FATAL_PATTERNS 里 401 / 403 / forbidden 这种宽松词可能出现在
+# 无关的警告行里，而 CLI 打了警告仍然正常返回正文是常态，按它们提前杀会把本来能成的
+# 调用弄失败；那几个词留给收尾时判因，那时已经知道有没有正文了。
+_FATAL_EARLY = re.compile(
+    r"unpaid invoice|ActionRequiredError|Authentication required"
+    r"|invalid api ?key|api ?key\b[^.\n]{0,40}\binvalid|Available models:", re.I)
+
 # 这些是真·临时故障，值得再试。HTTP/2 长流在容器里被掐掉时，CLI 打的是
 # ConnectError / aborted / stream ended，不进 5xx 那组关键字就会被当成「未知错误」
 # ——虽然未知也是可重试，但日志里那句原文太长，这里认出来方便对照。
@@ -199,11 +210,18 @@ def _parse_envelope(stdout: str) -> tuple[str, str, dict]:
 
     stream-json 前面会铺一串 system / assistant 事件，真正的话在 type=result
     那一行的 result 字段。只看最后一行会把半截增量或空行当成正文。
+
+    事件流里没有 result 时不能拿原文顶上。CLI 启动即被拒（账单拦截、Key 失效、
+    TLS 没连上）时 stdout 正好是 init 加一条 user 回显，真正的原因只在 stderr。
+    把这两行 NDJSON 当正文交出去，「启动即失败」就会冒充成功，上层拿 NDJSON 去解
+    业务 JSON，最后报一句格式错误，真因再也看不到。纯文本输出仍然兜底：那是 CLI
+    不按 NDJSON 说话的老行为，原文就是正文。
     """
     text = (stdout or "").strip()
     if not text:
         return "", "", {}
     last: dict | None = None
+    saw_event = False
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -212,10 +230,13 @@ def _parse_envelope(stdout: str) -> tuple[str, str, dict]:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and "result" in obj:
+        if not isinstance(obj, dict):
+            continue
+        saw_event = True
+        if "result" in obj:
             last = obj
     if last is None:
-        return text, "", {}
+        return ("", "", {}) if saw_event else (text, "", {})
     if last.get("is_error"):
         raise error_from(str(last.get("result") or ""))
     return str(last.get("result") or ""), str(last.get("session_id") or ""), last.get("usage") or {}
@@ -275,7 +296,14 @@ async def _read_stdout(proc: asyncio.subprocess.Process, buf: list[bytes],
                      time.time() - float(tick.get("started") or time.time()))
 
 
-async def _read_stderr(proc: asyncio.subprocess.Process, buf: list[bytes]) -> None:
+async def _read_stderr(proc: asyncio.subprocess.Process, buf: list[bytes],
+                       fatal: dict, purpose: str = "") -> None:
+    """读 stderr，认出致命报错就立刻收掉进程，不等它自己退。
+
+    分块读进来的，报错那句话可能被切在两块之间，所以按累积的全文认，不按单块认。
+    认出来之后就不再读了：判因需要的关键字已经在 buf 里，而进程刚被杀，继续读只是
+    等一个不会再来的 chunk。
+    """
     if proc.stderr is None:
         return
     while True:
@@ -283,6 +311,11 @@ async def _read_stderr(proc: asyncio.subprocess.Process, buf: list[bytes]) -> No
         if not chunk:
             break
         buf.append(chunk)
+        if _FATAL_EARLY.search(_ANSI.sub("", _decode(buf))):
+            fatal["yes"] = True
+            log.error("%s CLI 报了致命错误，提前收掉进程，不等它自己退", purpose or "llm")
+            kill_group(proc)
+            return
 
 
 async def _heartbeat(proc: asyncio.subprocess.Process, tick: dict, stalled: dict) -> None:
@@ -342,6 +375,7 @@ async def _once(prompt: str, model: str, timeout_s: int,
     out_buf: list[bytes] = []
     err_buf: list[bytes] = []
     stalled = {"yes": False}
+    fatal = {"yes": False}
     tick = {"n": 0, "kind": "start", "at": time.time(), "started": time.time(),
             "purpose": purpose or "llm"}
     log.info("%s CLI 启动 pid=%s model=%s prompt=%d 字符 timeout=%ds",
@@ -353,7 +387,7 @@ async def _once(prompt: str, model: str, timeout_s: int,
         try:
             await asyncio.gather(
                 _read_stdout(proc, out_buf, tick),
-                _read_stderr(proc, err_buf),
+                _read_stderr(proc, err_buf, fatal, purpose),
                 proc.wait(),
             )
         finally:
@@ -380,10 +414,18 @@ async def _once(prompt: str, model: str, timeout_s: int,
             log.warning("%s CLI 退出码 %s，但已经拿到结果，按成功处理",
                         purpose or "llm", proc.returncode)
         return text, sid, usage
-    if stalled["yes"]:
+    # 先看 fatal：进程是我们按 stderr 主动杀的，这时说「没有新输出」会把真因换成一句
+    # 可重试的假话，白等一轮重试。
+    if stalled["yes"] and not fatal["yes"]:
         raise LlmError(f"模型 {STALL_S // 60} 分钟没有新输出", retryable=True)
-    if proc.returncode not in (0, None):
-        # 真正的原因通常在 stderr，stdout 这时多半只有一条 init 事件
+    # 没拿到正文时一律按 stderr 判因，不看退出码：CLI 被账单或鉴权拦下时会打完
+    # 报错再以 0 退出，只认退出码就把这句话丢了，最后只剩一个「返回空内容」。
+    if stderr.strip() or proc.returncode not in (0, None):
+        # 真正的原因通常在 stderr，stdout 这时多半只有一条 init 事件。
+        # 原文一并记下来：classify 会把它归成一句给人看的话，归错了（比如把账单
+        # 问题说成模型名问题）就只能靠这条日志对照，否则只能靠手工复现去猜。
+        log.error("%s CLI 没有正文 · 退出码 %s · stderr 原文：%s",
+                  purpose or "llm", proc.returncode, _ANSI.sub("", stderr.strip())[:600])
         raise error_from(stderr or stdout)
     return text, sid, usage
 

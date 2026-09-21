@@ -207,11 +207,18 @@ async def test_claim_remote_is_reentrant_for_the_same_device(pooled, offline):
 
 
 @pytest.mark.asyncio
-async def test_claim_is_skipped_when_the_pool_is_off(pooled, offline):
-    """单设备模式下没有第二台机器，独占无从谈起，不能因此拦住领取。"""
+async def test_claim_refuses_when_the_pool_is_unusable(pooled, offline):
+    """池不可用时不能放行领取。
+
+    走到 claim_remote 的题一定带着 pool_entry_id，也就是一定是从远端题库同步下来的，
+    另一台设备同样看得见、同样能领。放行等于把独占整个关掉。线上真撞过一次：另一台
+    设备在这个状态下做了同一道题，两边的产物推去同一个仓库的同一个分支，后推的那一方
+    被 GitHub 以 non-fast-forward 拒掉，一整跑的结果再也交不上去。
+    """
     settings_store.set_many({"pool.enabled": "0"})
     res = await pool.claim_remote("e1", task_no="01")
-    assert res["ok"] and res["skipped"]
+    assert not res["ok"] and not res.get("taken_by")
+    assert pool.load_claims() == []
 
 
 @pytest.mark.asyncio

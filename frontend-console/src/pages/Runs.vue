@@ -13,10 +13,12 @@ const router = useRouter()
 const msg = useMessage()
 const active = computed(() => liveTasks.value.filter((t) => t.status === 'RUNNING' || t.status === 'QUEUED'))
 const ended = computed(() => liveTasks.value
-  .filter((t) => ['RUN_DONE', 'ANALYZING', 'ANALYZED', 'UPLOADED', 'NEEDS_ATTENTION'].includes(t.status))
+  .filter((t) => ['RUN_DONE', 'ANALYZING', 'ANALYZED', 'QC', 'UPLOADED', 'NEEDS_ATTENTION'].includes(t.status))
   .sort((a, b) => (b.finished_at || '').localeCompare(a.finished_at || '')))
-const uploadable = computed(() => ended.value.filter((t) => t.status === 'ANALYZED'
-  && t.verify_overall !== 'block' && SIDES.every((s) => t.screencast?.[s])))
+/** 能不能上传只认后端算的 precheck_block（空串表示能）：状态、提交前质检、结论有没有
+ *  在质检之后被改过，三件事都在它里面判过了 */
+const uploadable = computed(() => ended.value.filter(
+  (t) => !t.precheck_block && t.verify_overall !== 'block'))
 
 const batching = ref(false)
 async function uploadAll() {
@@ -40,8 +42,12 @@ function stage(t: TaskBrief): { text: string; cls: string } {
   if (t.status === 'ANALYZED') {
     const missing = SIDES.filter((s) => !t.screencast?.[s])
     if (missing.length) return { text: `等 ${missing.join('、')} 侧录屏`, cls: 'text-warn' }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 等进质检`, cls: 'text-fg1' }
+  }
+  if (t.status === 'QC') {
     if (t.verify_overall === 'block') return { text: '自检有红项', cls: 'text-err' }
-    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 可上传`, cls: 'text-ok' }
+    if (t.precheck_block) return { text: t.precheck_block, cls: 'text-warn' }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 质检已过，可上传`, cls: 'text-ok' }
   }
   if (t.analysis_status === 'RUNNING') return { text: '对比分析中', cls: 'text-run' }
   if (t.analysis_status === 'FAILED') return { text: '分析失败', cls: 'text-err' }

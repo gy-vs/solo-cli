@@ -59,6 +59,24 @@ def ready_task(tmp_db, tmp_path, monkeypatch):
         return t.id, ids
 
 
+def _ready_to_submit(task_id, urls=("https://v.example/a", "https://v.example/b")):
+    """把题推到「录屏齐、提交前质检通过」，也就是允许提交的那个状态。
+
+    单设录屏链接已经不够了：提交前质检是提交的必经一步（见 services/gsb_precheck），
+    没过质检的题在 upload_task 的第一道门就被回绝，后面的字段校验一条都走不到。
+    """
+    from app.db import session
+    from app.services import gsb_precheck
+
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.screencast = {"A": urls[0], "B": urls[1]}
+        gsb_precheck.sync_stage(db, t)
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "issues": [],
+                      "reason_digest": gsb_precheck.reason_digest((t.gsb or {}).get("reason") or "")}
+
+
 # ---------------- 字段映射 ----------------
 
 def _values(task_id):
@@ -208,11 +226,8 @@ class _FakeClient:
 
 @pytest.fixture()
 def full_flow(ready_task, monkeypatch):
-    from app.db import session
-
     task_id, ids = ready_task
-    with session() as db:
-        db.get(m.Task, task_id).screencast = {"A": "https://v.example/a", "B": "https://v.example/b"}
+    _ready_to_submit(task_id)
 
     schema = _schema("user_prompt", "question_type", "difficulty", "languages", "harness",
                      "harness_version", "os_platform", "repro_level", "env_snapshot",
@@ -270,11 +285,8 @@ def test_upload_blocked_without_screencast(ready_task, monkeypatch):
 
 
 def test_upload_stops_on_unknown_required_field(ready_task, monkeypatch):
-    from app.db import session
-
     task_id, _ = ready_task
-    with session() as db:
-        db.get(m.Task, task_id).screencast = {"A": "u", "B": "u"}
+    _ready_to_submit(task_id, ("u", "u"))
     client = _FakeClient({
         ("GET", "/api/v1/auth/me"): _FakeResponse(200, {"username": "me"}),
         ("GET", "/api/v1/gsb/form-schema"): _FakeResponse(200, _schema("brand_new")),
@@ -316,6 +328,7 @@ def test_upload_refuses_when_verify_blocked(ready_task):
     from app.db import session
 
     task_id, _ = ready_task
+    _ready_to_submit(task_id)
     with session() as db:
         db.get(m.Task, task_id).verify = {"overall": "block"}
     r = asyncio.run(up.upload_task(task_id))
@@ -329,13 +342,28 @@ def test_upload_refuses_before_analysis(ready_task):
     with session() as db:
         db.get(m.Task, task_id).status = m.RUN_DONE
     r = asyncio.run(up.upload_task(task_id))
-    assert r["ok"] is False and "不允许上传" in r["message"]
+    assert r["ok"] is False and "不能提交" in r["message"]
+
+
+def test_upload_refuses_without_precheck(ready_task):
+    """录屏齐了、质检还没跑，也不给提交——质检是提交的必经一步。"""
+    task_id, _ = ready_task
+    _ready_to_submit(task_id)
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.precheck_status = m.PRECHECK_IDLE
+        t.precheck = {}
+    r = asyncio.run(up.upload_task(task_id))
+    assert r["ok"] is False and "质检" in r["message"]
 
 
 def test_upload_refuses_when_a_trace_missing(ready_task):
     from app.db import session
 
     task_id, ids = ready_task
+    _ready_to_submit(task_id)
     with session() as db:
         db.get(m.TaskRun, ids["B"]).trace_file = ""
     r = asyncio.run(up.upload_task(task_id))

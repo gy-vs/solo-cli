@@ -533,7 +533,7 @@ def test_polish_findings_survives_unparsable_output(monkeypatch):
 def test_extract_object_skips_a_leading_example_shell():
     """模型常先吐一个说明用的小对象，取第一个就会拿到那个壳子。"""
     text = '{"note": "下面是结果"}\n{"a_findings": {"good": [], "bad": []}, "b_findings": {}}'
-    assert "a_findings" in ga._extract_object(text, "a_findings", "findings JSON")
+    assert "a_findings" in ga.extract_object(text, "a_findings", "findings JSON")
 
 
 def test_peer_openings_excludes_self_and_unanalyzed(tmp_db):

@@ -66,10 +66,15 @@ export const discardedTasks = computed(() => store.tasks.filter((t) => t.status 
 /** 需要人工处理的题：重跑用尽或推产物失败，首页要能一眼看到 */
 export const stuckTasks = computed(() => store.tasks.filter((t) => t.status === 'NEEDS_ATTENTION'))
 
-/** 分析完、等录屏链接的题。这是流程里唯一卡人工的环节 */
+/** 分析完、等录屏链接的题 */
 export const waitingScreencast = computed(() => store.tasks.filter(
   (t) => t.status === 'ANALYZED' && SIDES.some((s) => !t.screencast?.[s]),
 ))
+
+/** 录屏齐了、停在提交前质检这一步的题 */
+export const inQc = computed(() => store.tasks.filter((t) => t.status === 'QC'))
+/** 其中质检还没放行的：要么没跑过质检，要么模型挑出了问题等人改 */
+export const qcPending = computed(() => inQc.value.filter((t) => !!t.precheck_block))
 
 /** 合并 SSE 高频事件，250ms 内只刷一次 */
 export function scheduleRefresh() {

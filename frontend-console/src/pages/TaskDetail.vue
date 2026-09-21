@@ -7,6 +7,8 @@ import ContainerLive from '../components/ContainerLive.vue'
 import ContainerTerminal from '../components/ContainerTerminal.vue'
 import GateChecks from '../components/GateChecks.vue'
 import GsbEditor from '../components/GsbEditor.vue'
+import PrecheckPanel from '../components/PrecheckPanel.vue'
+import PrecheckPill from '../components/PrecheckPill.vue'
 import ScreencastPanel from '../components/ScreencastPanel.vue'
 import SideStrip from '../components/SideStrip.vue'
 import StatusPill from '../components/StatusPill.vue'
@@ -22,7 +24,7 @@ const msg = useMessage()
 const dialog = useDialog()
 const id = Number(route.params.id)
 
-type Tab = 'runs' | 'gsb' | 'screencast' | 'upload' | 'steps' | 'prompt'
+type Tab = 'runs' | 'gsb' | 'screencast' | 'precheck' | 'upload' | 'steps' | 'prompt'
 const task = ref<TaskDetail | null>(null)
 const loading = ref(true)
 const tab = ref<Tab>('prompt')
@@ -65,9 +67,11 @@ async function load(keepEdits = false) {
   }
   verifyReport.value = t.verify && 'overall' in t.verify ? (t.verify as VerifyReport) : null
   loading.value = false
-  // 跑完就看两侧判定；分析出结论后直接进 GSB；等录屏时停在录屏页
+  // 跑完就看两侧判定；分析出结论后直接进 GSB；等录屏时停在录屏页；
+  // 质检有话说的时候先去质检页，那是这一步唯一要人动手的地方
   if (!tabPinned.value && !dirty.value) {
     if (!pairEnded(t)) tab.value = t.runs?.length ? 'runs' : 'prompt'
+    else if (t.status === 'QC') tab.value = t.precheck_block ? 'precheck' : 'gsb'
     else if (t.status === 'ANALYZED' || t.status === 'UPLOADED' || t.status === 'DONE') {
       tab.value = SIDES.every((s) => t.screencast?.[s]) ? 'gsb' : 'screencast'
     } else tab.value = 'runs'
@@ -85,8 +89,10 @@ const anyRunning = computed(() => !!task.value?.runs?.some((r) => r.status === '
 const ended = computed(() => !!task.value && pairEnded(task.value))
 const locked = computed(() => task.value?.status === 'UPLOADED' || task.value?.status === 'DONE')
 const screencastReady = computed(() => SIDES.every((s) => !!task.value?.screencast?.[s]))
-const canUpload = computed(() => task.value?.status === 'ANALYZED' && verifyReport.value?.overall !== 'block'
-  && !dirty.value && screencastReady.value)
+/** 能不能上传只认后端算的 precheck_block（空串表示能）：状态、提交前质检、结论有没有在
+ *  质检之后被改过，三件事都在它里面判过了。前端只额外要求编辑框里没有未保存的改动 */
+const canUpload = computed(() => !!task.value && !task.value.precheck_block
+  && verifyReport.value?.overall !== 'block' && !dirty.value)
 const canComplete = computed(() => ended.value && task.value?.status !== 'DONE')
 const discarded = computed(() => task.value?.status === 'DISCARDED')
 const claimable = computed(() => task.value?.status === 'AVAILABLE' || task.value?.status === 'CLAIMED')
@@ -100,7 +106,8 @@ const badSides = computed(() => SIDES.filter((s) => {
 }))
 
 const tabs = computed<[Tab, string][]>(() => (task.value?.runs?.length
-  ? [['runs', '两侧运行'], ['gsb', 'GSB 结论'], ['screencast', '录屏'], ['upload', '上传'], ['steps', '轨迹步骤'], ['prompt', '题目信息']]
+  ? [['runs', '两侧运行'], ['gsb', 'GSB 结论'], ['screencast', '录屏'], ['precheck', '提交前质检'],
+    ['upload', '上传'], ['steps', '轨迹步骤'], ['prompt', '题目信息']]
   : [['prompt', '题目信息']]))
 /** 分析状态和录屏缺口在标签上点个色，不用翻页找 */
 const gsbDot = computed(() => {
@@ -110,6 +117,15 @@ const gsbDot = computed(() => {
   if (t.analysis_status === 'FAILED') return 'bg-err'
   if (t.gsb_verdict) return 'bg-ok'
   return ''
+})
+/** 质检那个 tab 上的小点：跑着的时候呼吸，挑出问题等人改的时候亮橙 */
+const precheckDot = computed(() => {
+  const t = task.value
+  if (!t || t.status !== 'QC') return ''
+  if (t.precheck_status === 'RUNNING') return 'bg-run animate-breathe'
+  if (t.precheck_status === 'ERROR') return 'bg-err'
+  if (t.precheck_block) return 'bg-warn'
+  return 'bg-ok'
 })
 
 /** 容器终端。事件流断掉时，只有容器自己的 stdout 还能说明它在不在动 */
@@ -219,6 +235,15 @@ function complete() {
 const destroyOnly = () => act('destroy', () => api.destroyContainer(id), '容器已销毁')
 
 function onGsb(g: Gsb) { gsb.value = g; dirty.value = true }
+/** 把质检给的整段改写稿填进理由编辑框。只改编辑框，存不存由人点「保存结论并自检」定 —— 
+ *  一段五六百字的话被自动换掉，人下次打开看到的已经不是自己确认过的那份，而差异翻不出来 */
+function applyRewrite(text: string) {
+  gsb.value = { ...gsb.value, reason: text }
+  dirty.value = true
+  tab.value = 'gsb'
+  tabPinned.value = true
+  msg.info('已填进 GSB 结论的理由框，核对后点「保存结论并自检」')
+}
 async function jump(p: { side?: string; step: number }) {
   if (p.side === 'A' || p.side === 'B') viewSide.value = p.side
   tab.value = 'steps'
@@ -292,6 +317,8 @@ const payloadPreview = computed<[string, string][]>(() => {
         <StatusPill :status="task.status" />
         <span v-if="task.analysis_status === 'RUNNING'" class="pill text-run border-run/50"><span class="dot bg-run animate-breathe" />对比分析中</span>
         <span v-else-if="task.analysis_status === 'FAILED'" class="pill text-err border-err/50">分析失败</span>
+        <PrecheckPill v-if="task.status === 'QC'" :status="task.precheck_status" :issues="task.precheck_issues"
+          :stale="task.precheck_stale" small />
         <span v-if="task.gsb_verdict" class="pill" :style="{ color: SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1, borderColor: (SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1) + '55' }">
           {{ VERDICT_LABEL[task.gsb_verdict] }}
         </span>
@@ -318,7 +345,9 @@ const payloadPreview = computed<[string, string][]>(() => {
           {{ dirty ? '保存结论并自检' : '重新自检' }}
         </NButton>
         <NButton v-if="ended && !locked" size="small" type="info" :secondary="!canUpload" :disabled="!canUpload"
-          :loading="busy === 'upload'" @click="upload">上传 GSB</NButton>
+          :loading="busy === 'upload'"
+          :title="canUpload ? '提交到 solo2' : (dirty ? '先保存结论' : task.precheck_block || '自检有红项')"
+          @click="upload">上传 GSB</NButton>
         <span class="ml-auto" />
         <NButton v-if="containersLeft && ended && task.status !== 'DONE'" size="small" tertiary :loading="busy === 'destroy'" @click="destroyOnly">仅销毁容器</NButton>
         <NButton v-if="canComplete" size="small" :type="task.status === 'UPLOADED' ? 'success' : 'warning'"
@@ -343,12 +372,16 @@ const payloadPreview = computed<[string, string][]>(() => {
       </div>
       <div v-if="task.status === 'ANALYZED' && !screencastReady" class="mt-3 text-xs text-warn flex items-start gap-1.5">
         <span class="dot mt-1.5 shrink-0 bg-warn" />
-        <span>结论已经出了，就等录屏。按录屏页给的步骤把两侧项目分别跑起来录完，把链接贴回来就能上传。</span>
+        <span>结论已经出了，就等录屏。按录屏页给的步骤把两侧项目分别跑起来录完，把链接贴回来这道题就进质检。</span>
+      </div>
+      <div v-if="task.status === 'QC' && task.precheck_block" class="mt-3 text-xs text-warn flex items-start gap-1.5">
+        <span class="dot mt-1.5 shrink-0 bg-warn" />
+        <span>{{ task.precheck_block }}。质检看的是理由读起来像不像一个人写的，去「提交前质检」页逐条看。</span>
       </div>
       <div v-if="discarded" class="mt-3 text-xs text-fg1">
         该题已于 {{ fmtTime(task.discarded_at) }} 废弃，不再出现在题库与运行舱列表中。
       </div>
-      <div v-if="!canUpload && task.status === 'ANALYZED' && verifyReport?.overall === 'block'" class="mt-3 text-xs text-err">
+      <div v-if="!canUpload && task.status === 'QC' && verifyReport?.overall === 'block'" class="mt-3 text-xs text-err">
         自检存在红项，上传按钮已禁用。
       </div>
     </div>
@@ -398,6 +431,7 @@ const payloadPreview = computed<[string, string][]>(() => {
             {{ t[1] }}
             <span v-if="t[0] === 'gsb' && gsbDot" class="dot" :class="gsbDot" />
             <span v-else-if="t[0] === 'screencast' && task.status === 'ANALYZED' && !screencastReady" class="dot bg-warn animate-breathe" />
+            <span v-else-if="t[0] === 'precheck' && precheckDot" class="dot" :class="precheckDot" />
           </button>
         </div>
 
@@ -487,6 +521,13 @@ const payloadPreview = computed<[string, string][]>(() => {
           <ScreencastPanel v-else :task="task" :gsb="gsb" @saved="load(true)" />
         </template>
 
+        <!-- 提交前质检 -->
+        <template v-if="tab === 'precheck'">
+          <div v-if="!task.gsb_verdict" class="card empty">还没有理由正文，质检没有可读的东西</div>
+          <PrecheckPanel v-else :task="task" :report="task.precheck" :dirty="dirty" :readonly="locked"
+            @confirmed="load()" @apply="applyRewrite" />
+        </template>
+
         <!-- 上传 -->
         <template v-if="tab === 'upload'">
           <div class="card p-4">
@@ -502,7 +543,7 @@ const payloadPreview = computed<[string, string][]>(() => {
               </div>
             </div>
             <div class="text-[12px] text-fg2 mt-3">
-              除了两条录屏链接，其余字段都是自动带出来的。状态需为「待录屏上传」且自检无红项。
+              除了两条录屏链接，其余字段都是自动带出来的。还要过两道门：自检无红项，提交前质检放行。
             </div>
           </div>
           <div v-if="task.upload && Object.keys(task.upload).length" class="card p-4 space-y-2">

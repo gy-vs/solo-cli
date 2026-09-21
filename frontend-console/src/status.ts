@@ -1,4 +1,4 @@
-import type { RunStatus, Side, Status, Verdict } from './api'
+import type { PrecheckStatus, RunStatus, Side, Status, Verdict } from './api'
 
 export const STATUS_LABEL: Record<Status, string> = {
   AVAILABLE: '待领取',
@@ -7,7 +7,8 @@ export const STATUS_LABEL: Record<Status, string> = {
   RUNNING: '运行中',
   RUN_DONE: '两侧跑完',
   ANALYZING: '对比中',
-  ANALYZED: '待录屏上传',
+  ANALYZED: '待录屏',
+  QC: '质检',
   UPLOADED: '已上传',
   DONE: '已完成',
   NEEDS_ATTENTION: '需人工',
@@ -23,10 +24,24 @@ export const STATUS_COLOR: Record<Status, string> = {
   RUN_DONE: 'info',
   ANALYZING: 'run',
   ANALYZED: 'ok',
+  QC: 'accent',
   UPLOADED: 'info',
   DONE: 'fg2',
   NEEDS_ATTENTION: 'err',
   DISCARDED: 'fg2',
+}
+
+/** 提交前质检。题级状态 QC 只说「在质检这一步」，走到哪一档看这里 */
+export const PRECHECK_LABEL: Record<PrecheckStatus, string> = {
+  IDLE: '待质检',
+  RUNNING: '质检中',
+  PASS: '通过',
+  FAIL: '待人工改',
+  CONFIRMED: '已人工确认',
+  ERROR: '质检没跑完',
+}
+export const PRECHECK_COLOR: Record<PrecheckStatus, string> = {
+  IDLE: 'fg1', RUNNING: 'run', PASS: 'ok', FAIL: 'warn', CONFIRMED: 'info', ERROR: 'err',
 }
 
 /** 单侧运行状态 */

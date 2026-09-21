@@ -529,11 +529,16 @@ async def claim_remote(entry_id: str, *, task_no: str = "") -> dict:
     第 3 步是这套机制里唯一不能省的：少了它，两台设备会各自看到自己 push 成功，然后
     双双开始做同一道题，而远端文件里明明白白写着只有一个赢家。
 
-    池没启用（单设备）时直接放行 —— 这时候不存在第二台设备，独占无从谈起。
+    池不可用时一律拒绝，不放行。走到这里的题一定带着 pool_entry_id（纯本机题在
+    `tasks._take_remote` 就返回了），也就是一定是从远端题库同步下来的 —— 这种题在另一台
+    设备上同样看得见、同样能领。这时候放行等于把跨设备独占整个关掉：池被临时关掉，或者
+    仓库、本机标识、Token 缺了任意一项，本机就绕过登记直接开跑，而另一台设备按远端记录
+    认为这道题没人做。两边各跑一遍，产物推到同一个仓库的同一个分支上，后推的那一方被
+    GitHub 以 non-fast-forward 拒掉，做完的一跑再也交不上去。
     """
     ok, why = available()
     if not ok:
-        return {"ok": True, "skipped": True, "message": why}
+        return {"ok": False, "message": f"这道题来自远端题库，领取必须先在远端登记，但{why}"}
 
     synced = await sync()
     if not synced["ok"] or synced.get("stale"):

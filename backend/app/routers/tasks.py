@@ -17,16 +17,16 @@ from app import config
 from app.db import session
 from app.events import bus, sse_format
 from app.models import (
-    ANALYSIS_RUNNING, ANALYZED, AVAILABLE, CLAIMED, DISCARDED, DONE, NEEDS_ATTENTION,
+    ANALYSIS_RUNNING, ANALYZED, AVAILABLE, CLAIMED, DISCARDED, DONE, NEEDS_ATTENTION, QC,
     QUEUED, RUN_DONE, RUN_RUNNING, RUNNING, UPLOADED, RunEvent, Task, TaskRun, utc_now,
 )
 from app.schemas import (
-    GsbUpdate, IdList, QueueMove, RerunBatch, RerunRequest, ScreencastUpdate, task_brief,
-    task_detail,
+    GsbUpdate, IdList, PrecheckConfirm, QueueMove, RerunBatch, RerunRequest,
+    ScreencastUpdate, task_brief, task_detail,
 )
 from app.services import (
-    dockerx, gate, gsb_analyzer, gsb_repo, gsb_uploader, gsb_verifier, pool, pool_bank,
-    prompt_bank, runner, scheduler, settings_store, trace, watchdog,
+    dockerx, gate, gsb_analyzer, gsb_precheck, gsb_repo, gsb_uploader, gsb_verifier, pool,
+    pool_bank, prompt_bank, runner, scheduler, settings_store, trace, watchdog,
 )
 
 log = logging.getLogger("tasks")
@@ -151,6 +151,37 @@ async def batch_upload(body: IdList) -> dict:
     return {"results": results}
 
 
+# ---------------- 提交前质检 ----------------
+# 发起质检的两个口子（下面这个和 /{task_id}/precheck）只给 app.cli 用，浏览器到不了：
+# nginx 把 /api/tasks/*/precheck 与 /api/tasks/batch/precheck 一律挡在外面，前端的
+# api.ts 里也没有对应封装。为什么要这么关，见 services/gsb_precheck 的模块说明。
+#
+# 挡在 nginx 而不是只靠「前端不放按钮」：这条流程要在人已经看过录屏、准备整批提交的
+# 那一刻跑，跑早了理由还会改、结论当场过期。一个点了就浪费一次模型调用的按钮，摆在
+# 页面上迟早会被点。
+
+@router.get("/precheck/ready")
+async def precheck_ready() -> dict:
+    """该做质检的题：录屏已齐、还没拿到有效结论。CLI 默认按这个口径挑。"""
+    ids = gsb_precheck.ready_ids()
+    with session() as db:
+        items = [task_brief(_get(db, tid), _runs(db, tid)) for tid in ids]
+    return {"ids": ids, "items": items}
+
+
+@router.post("/batch/precheck")
+async def batch_precheck(body: IdList) -> dict:
+    """逐道串行跑质检。一道失败不影响后面的，各自带原因回来。
+
+    串行是因为每道题都是一次模型调用，并发发出去只会一起撞限流，而这一步本来就是
+    收尾动作，快十分钟慢十分钟都不影响什么。
+    """
+    results = []
+    for tid in body.ids:
+        results.append({"id": tid, **await gsb_precheck.run_precheck(tid)})
+    return {"results": results}
+
+
 @router.post("/batch/claim")
 async def batch_claim(body: IdList) -> dict:
     """界面上的「全部领取并启动」。
@@ -216,7 +247,7 @@ async def batch_advance(body: IdList) -> dict:
             if t is None:
                 results.append({"id": tid, "ok": False, "message": "题目不存在"})
                 continue
-            if t.status not in (RUN_DONE, NEEDS_ATTENTION, ANALYZED):
+            if t.status not in (RUN_DONE, NEEDS_ATTENTION, ANALYZED, QC):
                 results.append({"id": tid, "ok": False,
                                 "message": f"状态 {t.status} 不能推进"})
                 continue
@@ -778,7 +809,7 @@ async def advance(task_id: int) -> dict:
     """手动走一遍「推产物 + 开分析」。正常由巡检自动触发，这里给推送失败后重试用。"""
     with session() as db:
         t = _get(db, task_id)
-        if t.status not in (RUN_DONE, NEEDS_ATTENTION, ANALYZED):
+        if t.status not in (RUN_DONE, NEEDS_ATTENTION, ANALYZED, QC):
             raise HTTPException(409, f"状态 {t.status} 不能推进")
     return await watchdog.advance_pair(task_id)
 
@@ -819,7 +850,12 @@ async def verify(task_id: int) -> dict:
 
 @router.put("/{task_id}/screencast")
 async def save_screencast(task_id: int, body: ScreencastUpdate) -> dict:
-    """填两侧录屏链接。这是上传前唯一必须人工给的东西。"""
+    """填两侧录屏链接。这是上传前唯一必须人工给的东西。
+
+    两条链接齐了这道题就从待录屏进到质检（gsb_precheck.sync_stage），链接被清掉又退
+    回去。状态不在这里各写各的，否则「录屏齐了却还挂在待录屏栏」这种账迟早对不上，
+    而人正是照着栏目决定下一步做什么。
+    """
     with session() as db:
         t = _get(db, task_id)
         if t.status in (UPLOADED, DONE):
@@ -829,6 +865,7 @@ async def save_screencast(task_id: int, body: ScreencastUpdate) -> dict:
             if url is not None:
                 sc[side] = url.strip()
         t.screencast = sc
+        gsb_precheck.sync_stage(db, t)
     report = await gsb_verifier.run_verify(task_id)
     with session() as db:
         return {"verify": report, "task": task_brief(_get(db, task_id), _runs(db, task_id))}
@@ -845,6 +882,31 @@ async def upload_screencast(task_id: int, side: str = Query(...),
     if not res["ok"]:
         raise HTTPException(400, res["message"])
     return res
+
+
+# ---------------- 提交前质检：单题与人工确认 ----------------
+
+@router.post("/{task_id}/precheck")
+async def precheck(task_id: int) -> dict:
+    """对一道题跑提交前质检。同 batch/precheck，只给 CLI 用，nginx 挡住浏览器。"""
+    with session() as db:
+        _get(db, task_id)
+    res = await gsb_precheck.run_precheck(task_id)
+    if not res.get("ok"):
+        raise HTTPException(409, res["message"])
+    return res
+
+
+@router.post("/{task_id}/precheck/confirm")
+async def precheck_confirm(task_id: int, body: PrecheckConfirm) -> dict:
+    """人工放行质检。这是这条流程里唯一允许在界面上做的动作，理由见 gsb_precheck.confirm。"""
+    with session() as db:
+        _get(db, task_id)
+    res = gsb_precheck.confirm(task_id, body.note)
+    if not res["ok"]:
+        raise HTTPException(409, res["message"])
+    with session() as db:
+        return {**res, "task": task_brief(_get(db, task_id), _runs(db, task_id))}
 
 
 # ---------------- 队列顺序 ----------------
@@ -897,7 +959,7 @@ async def complete(task_id: int, force: bool = Query(default=False)) -> dict:
         runs = _runs(db, task_id)
         if any(r.status == RUN_RUNNING for r in runs):
             raise HTTPException(409, "还有容器在跑，请先停止")
-        if t.status not in (RUN_DONE, ANALYZED, UPLOADED, NEEDS_ATTENTION):
+        if t.status not in (RUN_DONE, ANALYZED, QC, UPLOADED, NEEDS_ATTENTION):
             raise HTTPException(409, f"状态 {t.status} 不能标记完成")
         if not force and t.status != UPLOADED:
             raise HTTPException(409, "尚未上传，若确认放弃该题请带 force=true")

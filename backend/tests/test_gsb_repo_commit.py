@@ -278,6 +278,50 @@ def test_push_failure_is_explained_without_leaking_the_token(err, expect):
     assert "ghp_" not in msg and "credential" not in msg
 
 
+def test_a_push_rejected_by_someone_elses_commit_names_that_commit(cloned, tmp_path):
+    """远端这一侧被另一方推过时，报错要指出远端那个提交是什么。
+
+    只说「远端已经领先本地了」，人对着自己干净的工作区无从查起：这一侧从初始快照起
+    只提交过一次，本地既没有可拉的东西，也看不到远端多出来的是谁的。产物提交的标题
+    带着题号和侧别，把它读出来就一眼看得出是另一台设备在做同一道题。
+    """
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "--branch", "A", "--single-branch",
+                    str(cloned["url"]), str(other)], check=True, capture_output=True)
+    (other / "theirs.py").write_text("另一台设备跑出来的\n", encoding="utf-8")
+    _git(other, "add", "-A")
+    _git(other, "-c", f"user.name={gsb_repo.COMMIT_USER}",
+         "-c", f"user.email={gsb_repo.COMMIT_EMAIL}", "commit", "-m", "solo 07-mac-air · A")
+    _git(other, "push", "origin", "HEAD:refs/heads/A")
+
+    (cloned["ws"] / "mine.py").write_text("本机跑出来的\n", encoding="utf-8")
+    r = asyncio.run(gsb_repo.commit_and_push(
+        "07", cloned["repo"], "A", cloned["sha"], message="m"))
+
+    assert r["ok"] is False
+    assert "solo 07-mac-air · A" in r["message"]
+    # 远端那份不许被这次失败动到
+    assert _git(cloned["url"], "rev-parse", "refs/heads/A") == _git(other, "rev-parse", "HEAD")
+
+
+def test_a_push_rejection_that_reveals_nothing_falls_back_to_the_plain_wording(cloned, monkeypatch):
+    """读不到远端那个提交时退回原来的说法，不能因为读不到就没有错误信息。"""
+    async def unreadable(*a, **kw):
+        return ""
+
+    monkeypatch.setattr(gsb_repo, "diverged_detail", unreadable)
+    other = _git(cloned["url"], "-c", "user.name=t", "-c", "user.email=t@t",
+                 "commit-tree", f"{cloned['sha']}^{{tree}}", "-p", cloned["sha"], "-m", "别人的")
+    _git(cloned["url"], "update-ref", "refs/heads/A", other)
+
+    (cloned["ws"] / "mine.py").write_text("本机跑出来的\n", encoding="utf-8")
+    r = asyncio.run(gsb_repo.commit_and_push(
+        "07", cloned["repo"], "A", cloned["sha"], message="m"))
+
+    assert r["ok"] is False
+    assert "领先" in r["message"]
+
+
 def test_an_unrecognised_push_failure_still_says_nothing_secret():
     msg = gsb_repo.push_failure(gsb_repo.dockerx.CmdResult(1, "", "password=ghp_SECRET boom"))
     assert "ghp_" not in msg

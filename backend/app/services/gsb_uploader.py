@@ -16,8 +16,8 @@ import httpx
 from app import config
 from app.db import session
 from app.events import bus
-from app.models import UPLOADABLE, UPLOADED, Task, TaskRun, utc_now
-from app.services import dockerx, gate, gsb_repo, settings_store
+from app.models import UPLOADED, Task, TaskRun, utc_now
+from app.services import dockerx, gate, gsb_precheck, gsb_repo, settings_store
 from app.services.gsb_analyzer import VERDICT_LABEL
 
 log = logging.getLogger("gsb_uploader")
@@ -210,6 +210,8 @@ async def upload_screencast(task_id: int, side: str, path: Path) -> dict:
         sc = dict(task.screencast)
         sc[side.upper()] = url
         task.screencast = sc
+        # 和界面上手填链接走同一条路：第二侧代传完成，这道题就该进质检栏
+        gsb_precheck.sync_stage(db, task)
     bus.publish("tasks", {"type": "task", "id": task_id})
     return {"ok": True, "url": url, "message": f"{side} 侧录屏已上传"}
 
@@ -233,8 +235,11 @@ async def upload_task(task_id: int) -> dict:
         task = db.get(Task, task_id)
         if task is None:
             return {"ok": False, "message": "题目不存在"}
-        if task.status not in UPLOADABLE:
-            return {"ok": False, "message": f"当前状态 {task.status} 不允许上传，需先完成 GSB 分析"}
+        # 状态、提交前质检与结论新鲜度三件事合在 submit_block 里判，界面上按钮灰不灰
+        # 照的是同一个函数。两边各写一套的下场是按钮亮着、点下去被回绝，而回绝的理由
+        # 跟按钮的提示还不一样。
+        if blocked := gsb_precheck.submit_block(task):
+            return {"ok": False, "message": blocked}
         if (task.verify or {}).get("overall") == "block":
             return {"ok": False, "message": "核验存在红项，先处理后再上传"}
         runs = {r.side: r for r in db.query(TaskRun).filter(TaskRun.task_id == task_id).all()}

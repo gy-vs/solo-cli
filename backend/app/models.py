@@ -40,18 +40,22 @@ QUEUED = "QUEUED"                    # 两个 run 都在等槽位
 RUNNING = "RUNNING"                  # 至少一个 run 在跑
 RUN_DONE = "RUN_DONE"                # 两个 run 都结束，等 push 与分析
 ANALYZING = "ANALYZING"              # GSB 对比进行中
-ANALYZED = "ANALYZED"                # 有结论，等录屏与上传
+ANALYZED = "ANALYZED"                # 有结论，等录屏
+QC = "QC"                            # 两侧录屏已齐，走提交前质检
 UPLOADED = "UPLOADED"                # 已提交 solo2
 DONE = "DONE"                        # 人工确认完成
 NEEDS_ATTENTION = "NEEDS_ATTENTION"  # 重跑用尽或准备失败，等人工
 DISCARDED = "DISCARDED"              # 人工废弃
 
 ALL_STATUSES = (
-    AVAILABLE, CLAIMED, QUEUED, RUNNING, RUN_DONE, ANALYZING, ANALYZED,
+    AVAILABLE, CLAIMED, QUEUED, RUNNING, RUN_DONE, ANALYZING, ANALYZED, QC,
     UPLOADED, DONE, NEEDS_ATTENTION, DISCARDED,
 )
-# 允许上传的状态
-UPLOADABLE = frozenset({ANALYZED})
+# 允许上传的状态。只有 QC —— 提交前质检是提交的必经一步，而 ANALYZED 表示录屏还没齐，
+# 那时连质检都还没轮到。把 ANALYZED 留在这里等于给绕过质检开一条路。
+UPLOADABLE = frozenset({QC})
+# 结论已经出来、还在人工手上的两个状态。录屏齐不齐决定题落在哪一个，见 gsb_precheck.sync_stage。
+SETTLING = frozenset({ANALYZED, QC})
 
 # 还可以往外发容器的题。RUNNING 必须在内：槽位按容器算，一道题的两侧各排各的队，
 # A 先出闸把题带成 RUNNING 之后，B 仍然在队列里等自己那个槽。只认 QUEUED 的话，
@@ -81,6 +85,20 @@ ANALYSIS_IDLE = "IDLE"
 ANALYSIS_RUNNING = "RUNNING"
 ANALYSIS_DONE = "DONE"
 ANALYSIS_FAILED = "FAILED"
+
+# ---------------- 提交前质检 ----------------
+# 题级状态 QC 只说「这道题在质检这一步」，质检本身走到哪一档由这里承担。
+# ERROR 和 FAIL 必须分开：FAIL 是模型判理由写得像机器，该做的是改文字；ERROR 是质检
+# 自己没跑成（模型超时、输出解不开），该做的是重跑。混成一档会让人跑去改一段没问题的话。
+PRECHECK_IDLE = "IDLE"              # 还没质检过
+PRECHECK_RUNNING = "RUNNING"
+PRECHECK_PASS = "PASS"              # 模型判读起来像人写的
+PRECHECK_FAIL = "FAIL"              # 模型挑出了机械化表达，改完要人工确认
+PRECHECK_CONFIRMED = "CONFIRMED"    # 人工看过并放行
+PRECHECK_ERROR = "ERROR"            # 质检没跑完
+
+# 放行提交的两档。是否真能提交还要看理由有没有在质检之后被改过，见 gsb_precheck.submit_block。
+PRECHECK_OK = frozenset({PRECHECK_PASS, PRECHECK_CONFIRMED})
 
 ORIGIN_BANK = "bank"        # 本机题面文件解析而来
 ORIGIN_DESIGNED = "designed"  # 本机 /solo-prompt 刚出的
@@ -174,6 +192,11 @@ class Task(Base, JsonMixin):
     gsb_qc_json: Mapped[str] = mapped_column(Text, default="{}")
     # 两侧录屏链接 {"A": url, "B": url}，平台上传必填，由人工录完后填入
     screencast_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 提交前质检：理由读起来像不像人写的。与上面两个都不重复 —— verify_json 判确定性
+    # 规则（字数、步号、markdown），gsb_qc_json 是平台口径的质检，这里判的是措辞和句子，
+    # 正则和平台规则都碰不到那一类毛病（见 gsb_precheck 模块说明）。
+    precheck_status: Mapped[str] = mapped_column(String(16), default=PRECHECK_IDLE)
+    precheck_json: Mapped[str] = mapped_column(Text, default="{}")
     upload_json: Mapped[str] = mapped_column(Text, default="{}")
 
     # ---- 队列与来源 ----
@@ -244,6 +267,14 @@ class Task(Base, JsonMixin):
     @screencast.setter
     def screencast(self, v: dict) -> None:
         self.screencast_json = self._dump(v)
+
+    @property
+    def precheck(self) -> dict:
+        return self._load(self.precheck_json, {})
+
+    @precheck.setter
+    def precheck(self, v: dict) -> None:
+        self.precheck_json = self._dump(v)
 
     @property
     def upload(self) -> dict:

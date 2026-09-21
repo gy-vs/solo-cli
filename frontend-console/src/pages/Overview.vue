@@ -7,7 +7,7 @@ import Metric from '../components/Metric.vue'
 import RunCard from '../components/RunCard.vue'
 import StatusPill from '../components/StatusPill.vue'
 import { fmtTime, HEX, SIDE_HEX, STATUS_COLOR, STATUS_LABEL, VERDICT_LABEL } from '../status'
-import { liveTasks, refreshStatus, refreshTasks, store, stuckTasks, waitingScreencast } from '../store'
+import { inQc, liveTasks, qcPending, refreshStatus, refreshTasks, store, stuckTasks, waitingScreencast } from '../store'
 
 const router = useRouter()
 const msg = useMessage()
@@ -15,7 +15,9 @@ const s = computed(() => store.status)
 const counts = computed(() => s.value?.counts)
 const running = computed(() => liveTasks.value.filter((t) => t.status === 'RUNNING' || t.status === 'QUEUED'))
 /** 需要我动手的题：等录屏、需人工，其余全自动 */
-const attention = computed(() => [...waitingScreencast.value, ...stuckTasks.value])
+// 质检没放行的题也归在「等我处理」里：那一步和录屏一样要人动手，模型挑出来的句子
+// 得人自己改，不改就一直卡在质检栏，而总览是唯一会主动提醒的地方
+const attention = computed(() => [...waitingScreencast.value, ...qcPending.value, ...stuckTasks.value])
 const recent = computed(() => [...liveTasks.value]
   .filter((t) => t.status !== 'AVAILABLE')
   .sort((a, b) => (b.finished_at || b.claimed_at || '').localeCompare(a.finished_at || a.claimed_at || ''))
@@ -30,7 +32,7 @@ async function doSync() {
     await Promise.all([refreshTasks(), refreshStatus()])
   } catch (e: any) { msg.error(e.message) } finally { syncing.value = false }
 }
-const pipeline: Status[] = ['AVAILABLE', 'QUEUED', 'RUNNING', 'RUN_DONE', 'ANALYZED', 'UPLOADED', 'DONE']
+const pipeline: Status[] = ['AVAILABLE', 'QUEUED', 'RUNNING', 'RUN_DONE', 'ANALYZED', 'QC', 'UPLOADED', 'DONE']
 const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => !t.screencast?.[x])
 </script>
 
@@ -39,7 +41,7 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
     <div class="flex items-center gap-3">
       <div>
         <div class="h1">总览</div>
-        <div class="text-fg1 text-xs mt-0.5">设计题目 → 题库 → A/B 双容器同时跑 → 自动提交产物 → 自动对比出 GSB → 补录屏链接 → 上传</div>
+        <div class="text-fg1 text-xs mt-0.5">设计题目 → 题库 → A/B 双容器同时跑 → 自动提交产物 → 自动对比出 GSB → 补录屏链接 → 提交前质检 → 上传</div>
       </div>
       <div class="ml-auto flex gap-2">
         <NButton size="small" secondary :loading="syncing" @click="doSync">
@@ -54,7 +56,8 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
       <Metric label="待领取" :value="counts?.AVAILABLE ?? '—'" />
       <Metric label="容器占用" :value="`${s?.scheduler.running ?? 0}/${s?.scheduler.max_parallel ?? '-'}`" :tone="HEX.run"
         :sub="`${s?.scheduler.queued ?? 0} 个容器在排队`" />
-      <Metric label="等我录屏" :value="waitingScreencast.length" :tone="HEX.ok" sub="结论已出，只差链接" />
+      <Metric label="等我录屏" :value="waitingScreencast.length" :tone="HEX.ok"
+        :sub="inQc.length ? `另有 ${inQc.length} 道在质检` : '结论已出，只差链接'" />
       <Metric label="今日上传" :value="s?.totals.uploaded ?? '—'" :tone="HEX.info" :sub="s?.totals.date" />
       <Metric label="需人工" :value="counts?.NEEDS_ATTENTION ?? 0" :tone="HEX.err" sub="推产物或质检没过" />
       <Metric label="已完成" :value="counts?.DONE ?? '—'" :tone="HEX.fg2"
@@ -122,7 +125,7 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
     <div v-if="attention.length" class="card">
       <div class="px-4 pt-4 pb-2 flex items-center gap-3">
         <div class="h2">等我处理</div><span class="text-xs text-fg2">{{ attention.length }}</span>
-        <span class="text-[12px] text-fg2 ml-2">除了录屏和这些卡住的，其余环节都是自动的</span>
+        <span class="text-[12px] text-fg2 ml-2">除了录屏、质检改文字和这些卡住的，其余环节都是自动的</span>
       </div>
       <div v-for="t in attention" :key="t.id"
         class="px-4 py-3 border-t border-line flex items-center gap-3 hover:bg-bg3/40 cursor-pointer"
@@ -135,6 +138,7 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
         </span>
         <span class="text-xs truncate flex-1" :class="t.status === 'NEEDS_ATTENTION' ? 'text-err' : 'text-warn'">
           <template v-if="t.status === 'NEEDS_ATTENTION'">{{ t.auto_error || '自动重跑已放弃，需人工介入' }}</template>
+          <template v-else-if="t.status === 'QC'">{{ t.precheck_block }}</template>
           <template v-else>等 {{ missingSides(t).join('、') }} 侧录屏链接</template>
         </span>
         <span class="mono text-[12px] text-fg2 nums">{{ fmtTime(t.finished_at) }}</span>

@@ -6,13 +6,14 @@
  * 卡片墙干不了这个，所以另开一页而不是把 tab 塞回题库。
  *
  * 状态到栏的归并口径只在这里定义一次（TABS.statuses），别处要改也只改这一处：
- * 题级状态有十一个，人脑子里的步骤只有五个，两者对不上的地方全在这张表里。
+ * 题级状态有十二个，人脑子里的步骤只有六个，两者对不上的地方全在这张表里。
  */
 import { NButton, NCheckbox, NPagination, useDialog, useMessage } from 'naive-ui'
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, SIDES, type BatchResult, type Side, type Status, type TaskBrief } from '../api'
 import LaunchModal from '../components/LaunchModal.vue'
+import PrecheckPill from '../components/PrecheckPill.vue'
 import SideStats from '../components/SideStats.vue'
 import StatusPill from '../components/StatusPill.vue'
 import { fmtTime, RUN_END, VERDICT_LABEL } from '../status'
@@ -22,7 +23,7 @@ const router = useRouter()
 const msg = useMessage()
 const dialog = useDialog()
 
-type TabKey = 'running' | 'failed' | 'pending' | 'screencast' | 'submitted'
+type TabKey = 'running' | 'failed' | 'pending' | 'screencast' | 'qc' | 'submitted'
 
 const TABS: {
   key: TabKey; label: string; statuses: Status[]; desc: string; empty: string
@@ -48,8 +49,15 @@ const TABS: {
   },
   {
     key: 'screencast', label: '待录屏', statuses: ['ANALYZED'],
-    desc: '结论已出，补齐两侧录屏链接就能提交。这是整条流水线唯一必须人来做的一步',
+    desc: '结论已出，还差录屏。两条链接齐了这道题自己就进质检栏',
     empty: '没有等着录屏的题',
+  },
+  {
+    key: 'qc', label: '质检', statuses: ['QC'],
+    desc: '录屏齐了，等提交前质检。质检看的是理由读起来像不像人写的，'
+      + '发起只能在对话里（app.cli precheck），这里只看结果；判了「待人工改」的题去详情页改完再确认',
+    empty: '没有在质检这一步的题',
+    pick: true,
   },
   {
     key: 'submitted', label: '已提交', statuses: ['UPLOADED', 'DONE'],
@@ -143,8 +151,14 @@ function stage(t: TaskBrief): { text: string; cls: string } {
   if (t.status === 'ANALYZED') {
     const missing = SIDES.filter((s) => !t.screencast?.[s])
     if (missing.length) return { text: `等 ${missing.join('、')} 侧录屏`, cls: 'text-warn' }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 等进质检`, cls: 'text-fg1' }
+  }
+  if (t.status === 'QC') {
     if (t.verify_overall === 'block') return { text: t.auto_error || '自检有红项，改完才能提交', cls: 'text-err' }
-    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 可提交`, cls: 'text-ok' }
+    // precheck_block 是后端算的同一句话，提交按钮灰不灰也照它。这里直接把原话显出来，
+    // 别在前端翻译一遍 —— 翻译的版本和点下去被回绝的理由对不上，人会以为是两个问题
+    if (t.precheck_block) return { text: t.precheck_block, cls: 'text-warn' }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 质检已过，可提交`, cls: 'text-ok' }
   }
   if (t.status === 'UPLOADED') return { text: `已提交 #${t.submission_id ?? ''}`, cls: 'text-info' }
   if (t.status === 'DONE') return { text: '已完成并清理', cls: 'text-fg2' }
@@ -173,8 +187,9 @@ function badSides(t: TaskBrief): Side[] {
 const liveSides = (t: TaskBrief) => t.runs.filter((r) => r.status === 'RUNNING').map((r) => r.side)
 /** 分析中的题按钮要按灰：那一步已经在后台跑着，再点一次只会被后端挡回来 */
 const analyzable = (t: TaskBrief) => t.status !== 'ANALYZING' && t.analysis_status !== 'RUNNING'
-const uploadable = (t: TaskBrief) => t.status === 'ANALYZED'
-  && t.verify_overall !== 'block' && SIDES.every((s) => t.screencast?.[s])
+/** 能不能提交只认后端那一句 precheck_block（空串表示能）。状态、质检结论、结论有没有
+ *  过期都在它里面算过了，前端再凑一套条件只会让按钮和回绝的理由对不上。 */
+const uploadable = (t: TaskBrief) => !t.precheck_block && t.verify_overall !== 'block'
 
 // ---------------- 单题动作 ----------------
 /** 正在忙的那个按钮，key 是「题 id:动作」，同一行的几个按钮各转各的圈 */
@@ -299,6 +314,33 @@ function batchAnalyze() {
     })
 }
 
+/** 批量提交。只发质检放行的那些，挡下的照原话说清为什么没发。
+ *
+ * 不做「先帮你跳过、回头再说」：一批二十道里挡下三道，人必须当场知道是哪三道、
+ * 因为什么，否则他会以为整批都交了，而那三道要等到对账时才发现还躺在质检栏里。
+ */
+const taskNos = (list: TaskBrief[], cap = 6) =>
+  list.slice(0, cap).map((t) => '#' + t.task_no).join('、') + (list.length > cap ? ' 等' : '')
+
+function batchUpload() {
+  const chosen = all.value.filter((t) => picked.value.has(t.id))
+  const ready = chosen.filter((t) => uploadable(t))
+  const blocked = chosen.filter((t) => !uploadable(t))
+  if (!ready.length) {
+    msg.warning(`选中的 ${chosen.length} 道都不能提交：`
+      + blocked.slice(0, 3).map((t) => `#${t.task_no} ${t.precheck_block || '自检有红项'}`).join('；'),
+      { duration: 8000 })
+    return
+  }
+  runBatch(`批量提交 ${ready.length} 道题`,
+    `这 ${ready.length} 道已经质检放行：${taskNos(ready)}。`
+    + '提交会把两份轨迹传到平台并落一条 GSB 记录，成功之后本机不再允许改结论。'
+    + (blocked.length
+      ? `\n\n另外 ${blocked.length} 道（${taskNos(blocked, 5)}）不会提交，要先在详情页按质检意见改完再确认。`
+      : ''),
+    async () => summarize((await api.batchUpload(ready.map((t) => t.id))).results, '已提交'))
+}
+
 // 时间列给足 112px：「09-20 23:07:59」在等宽字体下正好放不进 96px，会折成两行，
 // 于是整张表的行高被这一列撑高一截。
 const cols = computed(() => (current.value.pick
@@ -340,6 +382,9 @@ const cols = computed(() => (current.value.pick
       <NButton v-if="tab === 'pending'" size="small" type="primary" :loading="batching" @click="batchAnalyze">
         批量分析并提交产物（{{ pickedCount }}）
       </NButton>
+      <NButton v-if="tab === 'qc'" size="small" type="info" :loading="batching" @click="batchUpload">
+        批量提交（{{ pickedCount }}）
+      </NButton>
       <NButton v-if="pickedCount < counts[tab]" size="small" tertiary @click="pickAll">
         选中全部 {{ counts[tab] }} 道
       </NButton>
@@ -354,8 +399,9 @@ const cols = computed(() => (current.value.pick
         <span>题号</span>
         <span>状态</span>
         <span>题目 · 当前卡在哪</span>
-        <!-- 这一列是拿来横着比的：两侧用时和步数差得远，那份对比结论就得先当它可疑 -->
-        <span>A / B 用时 · 工具步数</span>
+        <!-- 这一列是拿来横着比的：两侧用时和步数差得远，那份对比结论就得先当它可疑。
+             到了质检这一栏，对比结论早就写完了，该横着比的换成质检结果 -->
+        <span>{{ tab === 'qc' ? '提交前质检' : 'A / B 用时 · 工具步数' }}</span>
         <span>{{ tab === 'running' ? '领取时间' : tab === 'submitted' ? '提交时间' : '结束时间' }}</span>
         <span class="text-right">操作</span>
       </div>
@@ -383,7 +429,9 @@ const cols = computed(() => (current.value.pick
           <div class="text-[12px] truncate" :class="stage(t).cls" :title="stage(t).text">{{ stage(t).text }}</div>
         </div>
 
-        <SideStats :runs="t.runs" />
+        <PrecheckPill v-if="tab === 'qc'" :status="t.precheck_status" :issues="t.precheck_issues"
+          :stale="t.precheck_stale" small />
+        <SideStats v-else :runs="t.runs" />
 
         <span class="mono text-[12px] text-fg2 nums whitespace-nowrap">{{ fmtTime(stamp(t)) }}</span>
 
@@ -414,10 +462,20 @@ const cols = computed(() => (current.value.pick
             {{ analyzable(t) ? '分析产物并提交' : '分析中' }}
           </NButton>
 
-          <template v-if="tab === 'screencast'">
-            <NButton size="tiny" type="primary" secondary @click="launch(t)">启动 / 录屏</NButton>
-            <NButton size="tiny" tertiary :disabled="!uploadable(t)" :loading="busy === `${t.id}:upload`"
-              :title="uploadable(t) ? '提交到 solo2' : '两侧录屏链接齐了、自检没有红项才能提交'"
+          <NButton v-if="tab === 'screencast'" size="tiny" type="primary" secondary @click="launch(t)">
+            启动 / 录屏
+          </NButton>
+
+          <template v-if="tab === 'qc'">
+            <!-- 判了「待人工改」的题要逐条看 issues 才知道改哪句，所以给的动作是进详情页，
+                 不是在这一行里塞一个编辑框 -->
+            <NButton v-if="t.precheck_block" size="tiny" type="primary" secondary
+              @click="router.push(`/tasks/${t.id}`)">
+              去处理
+            </NButton>
+            <NButton size="tiny" :type="uploadable(t) ? 'info' : 'default'" :tertiary="!uploadable(t)"
+              :disabled="!uploadable(t)" :loading="busy === `${t.id}:upload`"
+              :title="uploadable(t) ? '提交到 solo2' : t.precheck_block || '自检有红项，改完才能提交'"
               @click="upload(t)">
               提交
             </NButton>

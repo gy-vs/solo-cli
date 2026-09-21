@@ -20,7 +20,7 @@ const TABS = [
   { key: 'claimed', label: '已领取未跑', match: (s: Status) => s === 'CLAIMED' },
   { key: 'active', label: '排队/运行中', match: (s: Status) => s === 'QUEUED' || s === 'RUNNING' },
   { key: 'ended', label: '待分析', match: (s: Status) => s === 'RUN_DONE' || s === 'ANALYZING' },
-  { key: 'analyzed', label: '待录屏上传', match: (s: Status) => s === 'ANALYZED' },
+  { key: 'analyzed', label: '待录屏 / 质检', match: (s: Status) => s === 'ANALYZED' || s === 'QC' },
   { key: 'delivered', label: '已上传/已完成', match: (s: Status) => s === 'UPLOADED' || s === 'DONE' },
   { key: 'attention', label: '需人工', match: (s: Status) => s === 'NEEDS_ATTENTION' },
   { key: 'discarded', label: '已废弃', match: (s: Status) => s === 'DISCARDED' },

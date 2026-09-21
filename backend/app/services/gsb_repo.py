@@ -85,10 +85,13 @@ def authed_url(repo_url: str, token: str) -> str:
     return url.replace("https://", f"https://x-access-token:{token}@", 1)
 
 
+# 本地与远端分叉被拒。单拎出来是因为这一类要额外去远端看一眼那边到底是什么，
+# 见 diverged_detail
+_DIVERGED = ("non-fast-forward", "fetch first")
+
 _PUSH_FAILURES = (
     ("timeout after", "推送超时，多半是网络不通，稍后会自动重试"),
-    ("non-fast-forward", "远端这个分支已经领先本地了，先看看是不是推过一次"),
-    ("fetch first", "远端这个分支已经领先本地了，先看看是不是推过一次"),
+    *((n, "远端这个分支已经领先本地了，先看看是不是推过一次") for n in _DIVERGED),
     # 两次推送撞在同一个分支上时远端会锁住 ref 拒掉后来的那条。以前这类失败落到最后的
     # 兜底文案上，报成「检查 Token 的 repo 写权限」，而权限根本没问题
     ("cannot lock ref", "远端这个分支正被另一次推送占用，稍后重试即可"),
@@ -114,6 +117,12 @@ def push_failure(res: dockerx.CmdResult) -> str:
         if needle in blob:
             return human
     return "原因不明，检查网络与 Token 的 repo 写权限"
+
+
+def diverged(res: dockerx.CmdResult) -> bool:
+    """push 是不是因为本地与远端分叉而被拒。"""
+    blob = f"{res.out}\n{res.err}".lower()
+    return any(n in blob for n in _DIVERGED)
 
 
 def credential_args(repo_url: str) -> list[str]:
@@ -364,6 +373,31 @@ async def rebuild_side(task_no: str, repo_url: str, side: str, snapshot: str) ->
     return {"ok": True, "archived": archived, "message": msg}
 
 
+async def diverged_detail(ws: Path, repo_url: str, side: str, *, known: set[str]) -> str:
+    """远端这一侧分支上现在是什么，说成一句话；读不出来或读到的正是 known 里的就返回空串。
+
+    分叉是所有 push 失败里唯一一种光看本地想不明白的：这一侧从初始快照起只提交过一次，
+    远端却比本地多出东西，只可能是另一方往同一个分支推过。真出过一次 —— 另一台设备没在
+    远端题库登记就做了同一道题，把它那份产物推了上来，而这边只说一句「远端已经领先本地
+    了」，人对着自己干净的工作区完全无从查起。所以这里多跑一次 fetch 去读对方那个提交的
+    标题：产物提交的标题带着题号和侧别（见 commit_message），一眼就知道是谁推的。
+
+    按 ref 名 fetch 而不是按 sha：裸仓库默认不接受 want 一个没被 ref 指着的 sha，
+    而这条路径在测试里走的就是本地裸仓库。
+    """
+    fetched = await dockerx.run(
+        ["git", "-C", str(ws), *credential_args(repo_url), "fetch", "--quiet", "origin",
+         f"refs/heads/{side}"], timeout=120)
+    if not fetched.ok:
+        return ""
+    r = await _git(ws, "log", "-1", "--format=%H %s", "FETCH_HEAD", timeout=30)
+    sha, _, subject = r.out.strip().partition(" ")
+    if not r.ok or not sha or sha.lower() in known:
+        return ""
+    subject = subject.strip()[:80]
+    return f"{sha[:12]}（{subject}）" if subject else sha[:12]
+
+
 def commit_message(task_no: str, side: str, session_id: str) -> str:
     return (f"solo {task_no} · {side}\n\n"
             f"SessionID: {session_id or '-'}\n")
@@ -450,7 +484,14 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
          f"HEAD:refs/heads/{side}"], timeout=300,
     )
     if not push.ok:
-        return {"ok": False, "message": f"{side} 侧 push 失败：{push_failure(push)}"}
+        why = push_failure(push)
+        if diverged(push):
+            tip = await diverged_detail(ws, repo_url, side,
+                                        known={head.lower(), (snapshot or "").lower()})
+            if tip:
+                why = (f"远端 {side} 分支上是 {tip}，既不是初始快照，也不是本机这一跑的产物，"
+                       f"多半是另一台设备推上去的；确认那一份不要了再强推覆盖")
+        return {"ok": False, "message": f"{side} 侧 push 失败：{why}"}
 
     url = commit_url(repo_url, head)
     log.info("题 %s %s 侧产物 %s 已推到分支 %s（%d 个文件）", task_no, side, head[:12], side, changed)
