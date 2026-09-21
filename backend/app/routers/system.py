@@ -14,7 +14,8 @@ from app.db import session
 from app.events import bus, sse_format
 from app.models import ALL_STATUSES, RUN_RUNNING, Task, TaskRun
 from app.services import (
-    designer, dockerx, gsb_uploader, llm, pool, qa_bridge, settings_store, watchdog,
+    designer, dockerx, gsb_precheck, gsb_uploader, llm, pool, qa_bridge, settings_store,
+    watchdog,
 )
 from app.services.scheduler import scheduler
 
@@ -63,6 +64,9 @@ async def system_status() -> dict:
                   "image": settings_store.get("qc.image")},
         "pool": pool.snapshot(),
         "design": {"running": sorted(designer.running)},
+        # 批量质检要跑几个小时，进度搭这趟车：页面每次 SSE 刷新本来就会拉一次状态，
+        # 单给这个数字再开一条轮询不值当
+        "precheck": gsb_precheck.job(),
         "counts": counts,
         "running_sides": running_sides,
         "totals": {"finished": finished_today, "uploaded": uploaded_today, "date": today},

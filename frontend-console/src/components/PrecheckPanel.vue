@@ -1,8 +1,8 @@
 <script setup lang="ts">
 /** 提交前质检的结果。挑出来的每一处都给原句和改法，人照着改完点确认才能提交。
  *
- * 界面上没有「发起质检」：那一步只能在对话里跑（后端 app/cli.py），nginx 把发起路由
- * 一并挡了。这里做的是另外两件事——把模型挑出的问题摊开，和让人拍板放行。
+ * 三件事：发起质检、把模型挑出的问题摊开、让人拍板放行。发起会真的花一次模型调用，
+ * 所以已经有有效结论、理由又没改过的题，按钮是灰的。
  */
 import { NButton, NInput, useDialog, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
@@ -19,6 +19,8 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   (e: 'confirmed'): void
+  /** 质检刚跑完，报告变了，让详情页重新拉一次 */
+  (e: 'ran'): void
   /** 把整段改写稿填进理由编辑框，存不存由人决定 */
   (e: 'apply', text: string): void
 }>()
@@ -26,6 +28,7 @@ const emit = defineEmits<{
 const msg = useMessage()
 const dialog = useDialog()
 const busy = ref(false)
+const running = ref(false)
 const note = ref('')
 
 const r = computed(() => props.report as PrecheckReport)
@@ -35,6 +38,29 @@ const hasReport = computed(() => status.value !== 'IDLE' && !!Object.keys(props.
 /** 跑过质检、且此刻确实被挡着，才需要人拍板。已经放行又没过期的题按这个按钮什么都不变。 */
 const canConfirm = computed(() => !props.readonly && !props.dirty
   && !['IDLE', 'RUNNING'].includes(status.value) && !!props.task.precheck_block)
+
+/** 再跑一次值不值一次模型调用。理由一个字没改就再问一遍，答案一样，钱白花 —— 判了
+ *  待改的也一样，得先按意见改完。没跑成（ERROR）不在此列，重跑正是该做的事。
+ *  编辑框里有没存的改动也不让跑：跑的得是落库那一稿，不然指纹一对就是「已过期」。 */
+const canRun = computed(() => !props.readonly && !props.dirty && status.value !== 'RUNNING'
+  && (props.task.precheck_stale || !['PASS', 'CONFIRMED', 'FAIL'].includes(status.value)))
+
+const runHint = computed(() => {
+  if (props.dirty) return '先保存理由，质检的得是落库那一稿'
+  if (status.value === 'RUNNING') return '这道题的质检正在跑'
+  if (status.value === 'FAIL') return '先按上面的意见改理由，改完这里才值得再跑一次'
+  if (!canRun.value) return '已经有有效结论，理由没再改过，再跑一次答案一样'
+  return '花一次模型调用，约一分半'
+})
+
+async function run() {
+  running.value = true
+  try {
+    const res = await api.precheck(props.task.id)
+    msg.success(res.message)
+    emit('ran')
+  } catch (e: any) { msg.error(e.message) } finally { running.value = false }
+}
 
 function confirm() {
   dialog.info({
@@ -67,18 +93,20 @@ function confirm() {
       <span v-if="r.model" class="mono text-[12px] text-fg2">{{ r.model }}</span>
       <span v-if="r.duration_s" class="mono text-[12px] text-fg2 nums">{{ r.duration_s }}s</span>
       <span class="mono text-[12px] text-fg2 nums ml-auto">{{ fmtTime(r.confirmed_at || r.finished_at) }}</span>
+      <NButton size="tiny" :type="canRun ? 'primary' : 'default'" :secondary="canRun" :tertiary="!canRun"
+        :disabled="!canRun" :loading="running" :title="runHint" @click="run">
+        {{ hasReport ? '重跑质检' : '跑质检' }}
+      </NButton>
     </div>
 
-    <!-- 还没跑过：说清它为什么不在这儿点，不然人会找那个不存在的按钮 -->
+    <!-- 还没跑过：说清这一步在判什么、要花什么，人才知道这个按钮该不该点 -->
     <div v-if="!hasReport" class="inner p-3 text-xs text-fg1 leading-6">
       这道题还没做提交前质检。质检看的是理由读起来像不像一个人写的——那类毛病正则查不出来，
-      得让模型逐句读一遍，所以要花一次模型调用。
+      得让模型逐句读一遍，所以要花一次模型调用，一道一分半左右。
       <div class="mt-1.5 text-fg2">
-        发起的口子只在对话里，页面上没有按钮：它得在录屏看完、准备整批提交的那一刻跑，
-        跑早了理由还会改、结论当场就过期。
-      </div>
-      <div class="mt-1.5 mono text-[12px] text-accent break-all">
-        docker compose exec backend python -m app.cli precheck {{ task.task_no }}
+        录屏之前跑最划算：措辞要改的话这时候改还来得及，录完再改就得重录。
+        整批发起去「题目列表 · 待录屏」勾选，或者在对话里
+        <span class="mono text-accent break-all">app.cli precheck {{ task.task_no }}</span>。
       </div>
     </div>
 

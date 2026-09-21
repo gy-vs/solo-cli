@@ -152,13 +152,15 @@ async def batch_upload(body: IdList) -> dict:
 
 
 # ---------------- 提交前质检 ----------------
-# 发起质检的两个口子（下面这个和 /{task_id}/precheck）只给 app.cli 用，浏览器到不了：
-# nginx 把 /api/tasks/*/precheck 与 /api/tasks/batch/precheck 一律挡在外面，前端的
-# api.ts 里也没有对应封装。为什么要这么关，见 services/gsb_precheck 的模块说明。
+# 三个发起口，按「谁在等结果」分：
+#   batch/precheck        串行跑完才返回，给 app.cli —— 人在终端里守着，要的就是那份汇总
+#   batch/precheck/start  立刻返回，给页面上的批量质检 —— 一百多道要跑几个小时，
+#                         浏览器挂不住这么长的连接，进度改从 /api/system/status 上看
+#   {task_id}/precheck    单道，跑完返回，页面和 CLI 都能用（一道一分半，等得起）
 #
-# 挡在 nginx 而不是只靠「前端不放按钮」：这条流程要在人已经看过录屏、准备整批提交的
-# 那一刻跑，跑早了理由还会改、结论当场过期。一个点了就浪费一次模型调用的按钮，摆在
-# 页面上迟早会被点。
+# 早先这几个口都被 nginx 挡着不让浏览器碰，理由是质检该等到看完录屏、准备提交那一刻
+# 再跑。后来改成录屏之前先质检：措辞在录屏前改完，省一次重录。「点一下烧一次模型调用」
+# 那层顾虑没消失，改由 gsb_precheck.skip_reason 兜——已经有有效结论的题根本发不出去。
 
 @router.get("/precheck/ready")
 async def precheck_ready() -> dict:
@@ -180,6 +182,22 @@ async def batch_precheck(body: IdList) -> dict:
     for tid in body.ids:
         results.append({"id": tid, **await gsb_precheck.run_precheck(tid)})
     return {"results": results}
+
+
+@router.post("/batch/precheck/start")
+async def batch_precheck_start(body: IdList) -> dict:
+    """把勾中的题排进后台质检，不等结果。页面上的「批量质检」走这里。
+
+    已经有有效结论、正在跑、还没有理由正文的题会被剔掉并在返回里说清是哪几道 ——
+    一批二十道里挡下三道，人必须当场知道是哪三道，否则他会以为整批都发了。
+    """
+    return gsb_precheck.start_batch(body.ids)
+
+
+@router.post("/batch/precheck/stop")
+async def batch_precheck_stop() -> dict:
+    """叫停后台质检。手上那道跑完才停，理由见 gsb_precheck.stop_batch。"""
+    return gsb_precheck.stop_batch()
 
 
 @router.post("/batch/claim")
@@ -888,7 +906,7 @@ async def upload_screencast(task_id: int, side: str = Query(...),
 
 @router.post("/{task_id}/precheck")
 async def precheck(task_id: int) -> dict:
-    """对一道题跑提交前质检。同 batch/precheck，只给 CLI 用，nginx 挡住浏览器。"""
+    """对一道题跑提交前质检，跑完才返回（一道一分半，页面上转个圈等得起）。"""
     with session() as db:
         _get(db, task_id)
     res = await gsb_precheck.run_precheck(task_id)

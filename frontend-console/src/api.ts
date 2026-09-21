@@ -172,7 +172,30 @@ export interface PrecheckIssue {
   suggest: string
 }
 
-/** 提交前质检报告。发起只能在对话里（见后端 app/cli.py），界面只读它 */
+/** 批量质检时被剔掉的题。剔除发生在发出去之前，所以这些题一次模型调用都没花 */
+export interface PrecheckSkip {
+  id: number
+  task_no: string
+  message: string
+}
+
+/** 后台批量质检的进度。running 为假时其余字段是上一批跑完留下的账 */
+export interface PrecheckJob {
+  running: boolean
+  total: number
+  done: number
+  passed: number
+  revise: number
+  failed: number
+  /** 手上正在跑的那道题号 */
+  current: string
+  started_at: string
+  finished_at: string
+  /** 已经叫停，跑完手上这道就收工 */
+  stopping: boolean
+}
+
+/** 提交前质检报告 */
 export interface PrecheckReport {
   passed?: boolean
   summary?: string
@@ -305,6 +328,8 @@ export interface SystemStatus {
     draftless: number
   }
   design: { running: number[] }
+  /** 后台批量质检的进度。整批要跑几个小时，进度搭状态接口这趟车 */
+  precheck: PrecheckJob
   counts: Record<Status, number>
   running_sides: number
   totals: { finished: number; uploaded: number; date: string }
@@ -473,9 +498,17 @@ export const api = {
     post<{ ok: boolean; file: string; host_file: string; size: number; seconds: number; message: string }>(`/api/host/tasks/${id}/record/stop?side=${side}`),
 
   // ---- 提交前质检 ----
-  /** 这里只有「人工确认放行」。发起质检故意没有封装：它只能由对话里的
-   *  `docker compose exec backend python -m app.cli precheck` 发起，nginx 也把那两条
-   *  路由挡在外面。为什么这么关，见 backend/app/services/gsb_precheck.py 的说明。 */
+  /** 单道，跑完才回（一道一分半，按钮转着圈等）。状态不对时后端回 409 */
+  precheck: (id: number) =>
+    post<{ ok: boolean; passed: boolean; issues: number; summary: string; message: string }>(
+      `/api/tasks/${id}/precheck`),
+  /** 整批，立刻返回。一百多道要跑几个小时，浏览器挂不住这么长的连接，所以后端起后台
+   *  任务：每道题跑完发 SSE 刷新那一行，整批进度看 status().precheck。
+   *  skipped 是被剔掉的题（已有有效结论、正在跑、没有理由正文），要原样说给人听。 */
+  startBatchPrecheck: (ids: number[]) =>
+    post<{ ok: boolean; started: number; message: string; skipped: PrecheckSkip[] }>(
+      '/api/tasks/batch/precheck/start', { ids }),
+  stopBatchPrecheck: () => post<{ ok: boolean; message: string }>('/api/tasks/batch/precheck/stop'),
   confirmPrecheck: (id: number, note = '') =>
     post<{ ok: boolean; message: string; submittable: boolean; task: TaskBrief }>(
       `/api/tasks/${id}/precheck/confirm`, { note }),

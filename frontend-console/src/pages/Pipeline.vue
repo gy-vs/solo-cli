@@ -17,7 +17,7 @@ import PrecheckPill from '../components/PrecheckPill.vue'
 import SideStats from '../components/SideStats.vue'
 import StatusPill from '../components/StatusPill.vue'
 import { fmtTime, RUN_END, VERDICT_LABEL } from '../status'
-import { liveTasks, refreshTasks, store } from '../store'
+import { liveTasks, refreshStatus, refreshTasks, store } from '../store'
 
 const router = useRouter()
 const msg = useMessage()
@@ -49,13 +49,15 @@ const TABS: {
   },
   {
     key: 'screencast', label: '待录屏', statuses: ['ANALYZED'],
-    desc: '结论已出，还差录屏。两条链接齐了这道题自己就进质检栏',
+    desc: '结论已出，还差录屏。录之前先把理由过一遍质检——措辞要改的话，这时候改还来得及，'
+      + '录完再改就得重录。两条链接齐了这道题自己就进质检栏',
     empty: '没有等着录屏的题',
+    pick: true,
   },
   {
     key: 'qc', label: '质检', statuses: ['QC'],
-    desc: '录屏齐了，等提交前质检。质检看的是理由读起来像不像人写的，'
-      + '发起只能在对话里（app.cli precheck），这里只看结果；判了「待人工改」的题去详情页改完再确认',
+    desc: '录屏齐了，等提交。质检看的是理由读起来像不像人写的；'
+      + '判了「待人工改」的题去详情页改完再确认',
     empty: '没有在质检这一步的题',
     pick: true,
   },
@@ -185,6 +187,16 @@ function badSides(t: TaskBrief): Side[] {
   })
 }
 const liveSides = (t: TaskBrief) => t.runs.filter((r) => r.status === 'RUNNING').map((r) => r.side)
+/** 待录屏和质检两栏都把「A/B 用时」那列换成质检结果：结论早写完了，这时候该横着比的
+ *  是哪几道理由还要改 */
+const showPrecheck = computed(() => tab.value === 'screencast' || tab.value === 'qc')
+/** 这一稿还没问过模型才值得再跑一次。判了待改的也算「已有结论」—— 理由没改就再问一遍，
+ *  挑出来的还是那几处。ERROR 例外，那是没跑成，重跑正是该做的事。
+ *
+ *  口径和后端 gsb_precheck.skip_reason 是同一套，真正的剔除在那边做，这里只负责把按钮
+ *  和提示说准；前端这套判断漏了哪一条也不会多花钱。 */
+const needsPrecheck = (t: TaskBrief) => t.gsb_reason_chars > 0 && t.precheck_status !== 'RUNNING'
+  && (t.precheck_stale || !['PASS', 'CONFIRMED', 'FAIL'].includes(t.precheck_status))
 /** 分析中的题按钮要按灰：那一步已经在后台跑着，再点一次只会被后端挡回来 */
 const analyzable = (t: TaskBrief) => t.status !== 'ANALYZING' && t.analysis_status !== 'RUNNING'
 /** 能不能提交只认后端那一句 precheck_block（空串表示能）。状态、质检结论、结论有没有
@@ -234,6 +246,11 @@ const analyze = (t: TaskBrief) => act(`${t.id}:analyze`, async () => {
 
 const upload = (t: TaskBrief) => act(`${t.id}:upload`, async () =>
   (await api.upload(t.id)).message || `#${t.task_no} 已提交`)
+
+/** 单道质检。跑完才返回，一分半左右，按钮一直转圈 —— 中途关页面也不影响，
+ *  后端那一道照跑完，回来看列表就是结果 */
+const precheck = (t: TaskBrief) => act(`${t.id}:precheck`, async () =>
+  `#${t.task_no}：${(await api.precheck(t.id)).message}`)
 
 function discard(t: TaskBrief) {
   const submitted = t.status === 'UPLOADED' || t.status === 'DONE'
@@ -322,6 +339,51 @@ function batchAnalyze() {
 const taskNos = (list: TaskBrief[], cap = 6) =>
   list.slice(0, cap).map((t) => '#' + t.task_no).join('、') + (list.length > cap ? ' 等' : '')
 
+// ---------------- 批量质检 ----------------
+/** 后台那一批的进度。搭在系统状态上，SSE 每次刷新顺带就到了，不另开轮询 */
+const precheckJob = computed(() => store.status?.precheck)
+
+/** 整批发起。后端串行跑，一道一分半，所以这里只负责把它交出去，不等结果。
+ *
+ * 已经跑过的题会被后端剔掉，但要在弹窗里先把数目说清楚 —— 人勾了三十道、实际只发出去
+ * 八道，他得当场知道，而不是等进度条走完才发现「怎么这么快」。
+ */
+function batchPrecheck() {
+  const chosen = all.value.filter((t) => picked.value.has(t.id))
+  const todo = chosen.filter((t) => needsPrecheck(t))
+  const skip = chosen.length - todo.length
+  if (!todo.length) {
+    msg.warning(`选中的 ${chosen.length} 道都不用再跑质检：要么已经有有效结论，要么还没有理由正文`,
+      { duration: 8000 })
+    return
+  }
+  const mins = Math.max(1, Math.round(todo.length * 1.5))
+  runBatch(`批量质检 ${todo.length} 道题`,
+    `质检看的是理由读起来像不像一个人写的，一道题一次模型调用，串行跑，`
+    + `${todo.length} 道大约要 ${mins} 分钟。发起之后不用守着这个页面，`
+    + '每道题跑完这一行自己会刷新，进度在上面那条里看。'
+    + (skip ? `\n\n另外 ${skip} 道不会发：已经有有效结论，或者还没有理由正文。` : ''),
+    async () => {
+      const r = await api.startBatchPrecheck(todo.map((t) => t.id))
+      await refreshStatus()
+      return r.message
+    })
+}
+
+function stopPrecheck() {
+  dialog.warning({
+    title: '停掉后台质检',
+    content: '手上那道会跑完再停——模型调用已经发出去了，半路丢掉反而浪费，'
+      + '而且中途取消会把那道题留在「质检中」上。已经跑完的结论都留着，之后可以接着勾没跑的。',
+    positiveText: '停掉',
+    negativeText: '继续跑',
+    onPositiveClick: async () => {
+      try { msg.info((await api.stopBatchPrecheck()).message) } catch (e: any) { msg.error(e.message) }
+      await refreshStatus()
+    },
+  })
+}
+
 function batchUpload() {
   const chosen = all.value.filter((t) => picked.value.has(t.id))
   const ready = chosen.filter((t) => uploadable(t))
@@ -372,6 +434,29 @@ const cols = computed(() => (current.value.pick
       </button>
     </div>
 
+    <!-- 后台质检的进度条。跑几个小时是常事，所以不跟着勾选走，也不限在哪一栏：
+         人从别的页面回来第一眼就得看见它还在跑，否则会以为自己没点上又发一批 -->
+    <div v-if="precheckJob?.running" class="card px-4 py-2.5 flex items-center gap-3 text-xs border-run/40">
+      <span class="dot bg-run animate-breathe shrink-0" />
+      <span class="text-fg0">
+        后台质检
+        <span class="mono nums font-semibold">{{ precheckJob.done }}</span>
+        /<span class="mono nums">{{ precheckJob.total }}</span>
+      </span>
+      <span v-if="precheckJob.current" class="mono text-fg1">在跑 #{{ precheckJob.current }}</span>
+      <span class="text-fg1">
+        通过 <span class="mono nums text-ok">{{ precheckJob.passed }}</span>
+        · 待改 <span class="mono nums text-warn">{{ precheckJob.revise }}</span>
+        <template v-if="precheckJob.failed">
+          · 没跑成 <span class="mono nums text-err">{{ precheckJob.failed }}</span>
+        </template>
+      </span>
+      <span v-if="precheckJob.stopping" class="text-warn">跑完这道就停</span>
+      <NButton v-else size="small" quaternary type="error" class="ml-auto" @click="stopPrecheck">
+        停掉
+      </NButton>
+    </div>
+
     <!-- 批量条只在能勾的栏出现，且勾了才亮起来：空着占一条高度会让人以为按钮坏了 -->
     <div v-if="current.pick && pickedCount"
       class="card px-4 py-2.5 flex items-center gap-3 text-xs border-accent/40">
@@ -381,6 +466,11 @@ const cols = computed(() => (current.value.pick
       </NButton>
       <NButton v-if="tab === 'pending'" size="small" type="primary" :loading="batching" @click="batchAnalyze">
         批量分析并提交产物（{{ pickedCount }}）
+      </NButton>
+      <NButton v-if="showPrecheck" size="small" type="primary" :loading="batching"
+        :disabled="precheckJob?.running" :title="precheckJob?.running ? '已经有一批在跑，等它跑完或先停掉' : ''"
+        @click="batchPrecheck">
+        批量质检（{{ pickedCount }}）
       </NButton>
       <NButton v-if="tab === 'qc'" size="small" type="info" :loading="batching" @click="batchUpload">
         批量提交（{{ pickedCount }}）
@@ -400,8 +490,8 @@ const cols = computed(() => (current.value.pick
         <span>状态</span>
         <span>题目 · 当前卡在哪</span>
         <!-- 这一列是拿来横着比的：两侧用时和步数差得远，那份对比结论就得先当它可疑。
-             到了质检这一栏，对比结论早就写完了，该横着比的换成质检结果 -->
-        <span>{{ tab === 'qc' ? '提交前质检' : 'A / B 用时 · 工具步数' }}</span>
+             到了待录屏和质检这两栏，对比结论早就写完了，该横着比的换成质检结果 -->
+        <span>{{ showPrecheck ? '提交前质检' : 'A / B 用时 · 工具步数' }}</span>
         <span>{{ tab === 'running' ? '领取时间' : tab === 'submitted' ? '提交时间' : '结束时间' }}</span>
         <span class="text-right">操作</span>
       </div>
@@ -429,7 +519,7 @@ const cols = computed(() => (current.value.pick
           <div class="text-[12px] truncate" :class="stage(t).cls" :title="stage(t).text">{{ stage(t).text }}</div>
         </div>
 
-        <PrecheckPill v-if="tab === 'qc'" :status="t.precheck_status" :issues="t.precheck_issues"
+        <PrecheckPill v-if="showPrecheck" :status="t.precheck_status" :issues="t.precheck_issues"
           :stale="t.precheck_stale" small />
         <SideStats v-else :runs="t.runs" />
 
@@ -462,9 +552,23 @@ const cols = computed(() => (current.value.pick
             {{ analyzable(t) ? '分析产物并提交' : '分析中' }}
           </NButton>
 
-          <NButton v-if="tab === 'screencast'" size="tiny" type="primary" secondary @click="launch(t)">
-            启动 / 录屏
-          </NButton>
+          <template v-if="tab === 'screencast'">
+            <!-- 录之前先过质检：措辞这时候改还来得及，录完再改就得重录。
+                 已经有有效结论的题按灰，再点一次只是白烧一次模型调用 -->
+            <NButton size="tiny" tertiary :loading="busy === `${t.id}:precheck`"
+              :disabled="!needsPrecheck(t)"
+              :title="needsPrecheck(t) ? '跑一次提交前质检，约一分半' : '已经有有效结论，理由没再改过'"
+              @click="precheck(t)">
+              质检
+            </NButton>
+            <NButton v-if="t.precheck_block && t.precheck_status === 'FAIL'" size="tiny" type="primary" secondary
+              @click="router.push(`/tasks/${t.id}`)">
+              去改
+            </NButton>
+            <NButton size="tiny" type="primary" secondary @click="launch(t)">
+              启动 / 录屏
+            </NButton>
+          </template>
 
           <template v-if="tab === 'qc'">
             <!-- 判了「待人工改」的题要逐条看 issues 才知道改哪句，所以给的动作是进详情页，

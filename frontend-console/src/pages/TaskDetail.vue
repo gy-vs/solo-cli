@@ -72,6 +72,8 @@ async function load(keepEdits = false) {
   if (!tabPinned.value && !dirty.value) {
     if (!pairEnded(t)) tab.value = t.runs?.length ? 'runs' : 'prompt'
     else if (t.status === 'QC') tab.value = t.precheck_block ? 'precheck' : 'gsb'
+    // 待录屏而质检有话说：该动手的是改措辞，不是去录屏页
+    else if (t.status === 'ANALYZED' && t.precheck_status === 'FAIL') tab.value = 'precheck'
     else if (t.status === 'ANALYZED' || t.status === 'UPLOADED' || t.status === 'DONE') {
       tab.value = SIDES.every((s) => t.screencast?.[s]) ? 'gsb' : 'screencast'
     } else tab.value = 'runs'
@@ -118,13 +120,19 @@ const gsbDot = computed(() => {
   if (t.gsb_verdict) return 'bg-ok'
   return ''
 })
-/** 质检那个 tab 上的小点：跑着的时候呼吸，挑出问题等人改的时候亮橙 */
+/** 质检那个 tab 上的小点：跑着的时候呼吸，挑出问题等人改的时候亮橙。
+ *
+ * 待录屏的题也点：质检现在赶在录屏之前跑，那时题还是 ANALYZED，只认 QC 的话
+ * 刚跑出一堆问题的题在标签上看不出任何动静。没跑过的不点，那不是「有事要做」。 */
 const precheckDot = computed(() => {
   const t = task.value
-  if (!t || t.status !== 'QC') return ''
+  if (!t || (t.status !== 'QC' && t.status !== 'ANALYZED')) return ''
   if (t.precheck_status === 'RUNNING') return 'bg-run animate-breathe'
+  if (t.precheck_status === 'IDLE') return ''
   if (t.precheck_status === 'ERROR') return 'bg-err'
-  if (t.precheck_block) return 'bg-warn'
+  // 不看 precheck_block：待录屏的题那句话永远非空（说的是「录屏没齐不能提交」），
+  // 拿它点灯会让每一道待录屏的题都亮着橙点
+  if (t.precheck_status === 'FAIL' || t.precheck_stale) return 'bg-warn'
   return 'bg-ok'
 })
 
@@ -317,7 +325,8 @@ const payloadPreview = computed<[string, string][]>(() => {
         <StatusPill :status="task.status" />
         <span v-if="task.analysis_status === 'RUNNING'" class="pill text-run border-run/50"><span class="dot bg-run animate-breathe" />对比分析中</span>
         <span v-else-if="task.analysis_status === 'FAILED'" class="pill text-err border-err/50">分析失败</span>
-        <PrecheckPill v-if="task.status === 'QC'" :status="task.precheck_status" :issues="task.precheck_issues"
+        <PrecheckPill v-if="task.status === 'QC' || task.status === 'ANALYZED'"
+          :status="task.precheck_status" :issues="task.precheck_issues"
           :stale="task.precheck_stale" small />
         <span v-if="task.gsb_verdict" class="pill" :style="{ color: SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1, borderColor: (SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1) + '55' }">
           {{ VERDICT_LABEL[task.gsb_verdict] }}
@@ -377,6 +386,16 @@ const payloadPreview = computed<[string, string][]>(() => {
       <div v-if="task.status === 'QC' && task.precheck_block" class="mt-3 text-xs text-warn flex items-start gap-1.5">
         <span class="dot mt-1.5 shrink-0 bg-warn" />
         <span>{{ task.precheck_block }}。质检看的是理由读起来像不像一个人写的，去「提交前质检」页逐条看。</span>
+      </div>
+      <!-- 待录屏的题不提「不能提交」——那是明摆着的，录屏还没录。这里要说的是另一件事：
+           趁还没录，先把质检挑出来的措辞改掉，改完再录就不用重录 -->
+      <div v-if="task.status === 'ANALYZED' && task.precheck_status === 'FAIL'"
+        class="mt-3 text-xs text-warn flex items-start gap-1.5">
+        <span class="dot mt-1.5 shrink-0 bg-warn" />
+        <span>
+          质检挑出 {{ task.precheck_issues }} 处机械化表达。趁还没录屏，去「提交前质检」页逐条改完再录，
+          录完再改理由就得重录一遍。
+        </span>
       </div>
       <div v-if="discarded" class="mt-3 text-xs text-fg1">
         该题已于 {{ fmtTime(task.discarded_at) }} 废弃，不再出现在题库与运行舱列表中。
@@ -525,7 +544,7 @@ const payloadPreview = computed<[string, string][]>(() => {
         <template v-if="tab === 'precheck'">
           <div v-if="!task.gsb_verdict" class="card empty">还没有理由正文，质检没有可读的东西</div>
           <PrecheckPanel v-else :task="task" :report="task.precheck" :dirty="dirty" :readonly="locked"
-            @confirmed="load()" @apply="applyRewrite" />
+            @confirmed="load()" @ran="load()" @apply="applyRewrite" />
         </template>
 
         <!-- 上传 -->
