@@ -207,7 +207,7 @@ PROMPT>>>
 2. 对着两侧的代码改动逐条核验，看功能点是不是真的实现了、约束有没有被破坏。
 3. 再看两侧的过程，判断各自哪里顺、哪里卡、哪里绕了远路或者反复试错。
 4. 逐项对比，给出哪一侧更好，或者确实等价。核验做得细是对的，但写的时候只挑
-   一到两个真正决定胜负的点展开，别把核验清单原样交出去。
+   一到两个真正影响结论的点展开，别把核验清单原样交出去。
 5. 另外分别给出两侧产物的启动方式，要让人照着就能把项目跑起来录屏；
    材料不足以给出完整步骤时，在对应的 note 里写清缺什么。
 
@@ -488,6 +488,10 @@ def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
     篇幅超了就把要砍掉多少字算出来一起给。只说「超过上限」它往往只削掉一两句，
     给出确切的字数缺口才会真的去掉一整个次要论点。
 
+    没超限也要说，而且这一档更容易翻车。贴着上限的那批余量只有几个字，不给预算
+    它就只管换说法，562 字换完成 588 字，措辞那条修掉了、超篇幅那条冒出来，分数
+    没变好，整版被丢弃，四轮下来原文一个字没动。
+
     缺口按窗口中位算，不按上限算。照上限要它会压到刚好擦线，实测一段九百多字的
     改三轮仍停在六百三十字，离上限只差十几个字；瞄中位留出余量，略微收不够也还
     落在区间里。
@@ -498,13 +502,25 @@ def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
     """
     listed = "\n".join(f"{i}. {d}" for i, d in enumerate(defects, 1))
     n = gsb_rules.visible_chars(reason)
-    if n > gsb_rules.REASON_SOFT_MAX_CHARS:
-        aim = (gsb_rules.REASON_TARGET_MIN + gsb_rules.REASON_TARGET_MAX) // 2
+    aim = (gsb_rules.REASON_TARGET_MIN + gsb_rules.REASON_TARGET_MAX) // 2
+    if n <= gsb_rules.REASON_SOFT_MAX_CHARS:
+        # 没超限也要把预算说出来。不说它就只管换说法，一段 562 字的换完就是 588 字，
+        # 措辞那条警告是修掉了，超篇幅那条又冒出来，分数没变好，整版被丢弃——四轮
+        # 下来原文一个字没动。这批题本来就贴着上限，余量只有几个字。
+        listed += (f"\n\n这一段现在 {n} 字，改完不要超过 {gsb_rules.REASON_TARGET_MAX} 字，"
+                   f"落在 {aim} 字左右最好。换说法的时候顺手把最弱的那个论点删掉，"
+                   f"别一边改措辞一边把篇幅撑上去。")
+    else:
         listed += (f"\n\n这一段现在 {n} 字，要收到 {gsb_rules.REASON_TARGET_MIN} 到 "
                    f"{gsb_rules.REASON_TARGET_MAX} 字，最好落在 {aim} 字左右，也就是去掉大约 "
                    f"{n - aim} 字。")
-        if n > aim * 1.5:
-            listed += ("这一步不是修剪，是重写：先定下哪一到两个点决定了胜负，"
+        # 阈值挂在上限上，不挂在中位上。挂中位的写法在旧窗口里（中位 525、上限 570）
+        # 恰好等于上限的一点四倍，留出五百多到七百多这一段「删减」带；篇幅窗口收到
+        # 三到四百之后，中位掉到 350，一点五倍是 525，和 500 的上限几乎贴在一起，
+        # 删减带只剩二十几个字，等于凡是超限一律按重写走 —— 而超出几十字的那种，
+        # 重写会把已经写好的论证整个推翻，换回来的往往是一段更泛的话。
+        if n > gsb_rules.REASON_SOFT_MAX_CHARS * 1.4:
+            listed += ("这一步不是修剪，是重写：先定下哪一到两个点真正影响了结论，"
                        "只把这一两个点讲透，其余的最多各一句带过，剩下的整段不要。"
                        "在原文上逐句删改收不到这个篇幅。")
         else:
@@ -525,23 +541,41 @@ REASON>>>
 【改写约束】
 1. 只在现有正文的事实范围内删减和改写。不要新增正文里没有的事实，不要换结论，
    哪一侧更好必须和现在一致。
-2. 篇幅超了就砍内容，不要靠压缩句子硬凑：只留一到两个决定胜负的点展开，其余的
+2. 篇幅超了就砍内容，不要靠压缩句子硬凑：只留一到两个真正影响结论的点展开，其余的
    最多一句带过，够不上的一句都不写。
 3. 开头句式被指出雷同时，换一个按这道题自己的矛盾来起头的写法，不要只改几个字。
 4. 只输出改写后的正文。不要 JSON，不要代码块围栏，不要任何说明或前言。"""
 
 
+# 规则拦得住篇幅和措辞，拦不住颗粒度。原本就写在上限以内的那批因此一次都没被
+# 重写过，读起来仍然是每个点都交代一句的核对清单——查得出毛病的反而都被收拾干净了，
+# 没毛病的原样留着，一份文档里两种笔法。点名强制时用这条当由头让它重写。
+GRANULARITY_DEFECT = (
+    "这一段是按核对清单写的：两侧的每个点都交代一句，颗粒度细到真人评审观察不到。"
+    "重写成只讲一到两个真正影响结论的点，把它们讲透，其余的最多一句带过，"
+    f"够不上的一句都不写，收到 {gsb_rules.REASON_TARGET_MIN} 到 "
+    f"{gsb_rules.REASON_TARGET_MAX} 字。"
+)
+
+
 async def polish_reason(reason: str, *, verdict: str, peer_openings: dict | None = None,
                         repos: dict[str, Path] | None = None, purpose: str = "",
-                        rounds: int = REASON_FIX_ROUNDS) -> tuple[str, list[str]]:
+                        rounds: int = REASON_FIX_ROUNDS,
+                        forced: bool = False) -> tuple[str, list[str]]:
     """把理由改到符合写作规范。返回 (最终正文, 还没修掉的毛病)。
 
     只在确有改善时才采信改写稿。模型偶尔会把一处毛病换成两处，无条件采用就会
     越改越差；改不动就把原文留着，剩下的毛病回报给调用方记录下来，让人能看见，
     而不是静悄悄地交一段不合规的话。好坏的比法见 _reason_score。
+
+    forced 用来重写那些查不出毛病、但笔法还停在核对清单上的。这时基准分要故意
+    记差一档，否则原文是满分，任何改写都「没有变好」，四轮全被丢弃，等于没跑。
+    记差一档之后，只有改完自身挑不出毛病的那一版才会被采信。
     """
     text = reason
     defects, score = _reason_score(text, verdict=verdict, peer_openings=peer_openings)
+    if not defects and forced:
+        defects, score = [GRANULARITY_DEFECT], (0, 1, 0)
     if not defects:
         return text, []
 

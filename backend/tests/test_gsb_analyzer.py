@@ -253,7 +253,7 @@ def test_prompt_carries_writing_rules_that_ban_machine_metrics(tmp_db):
     assert "数字密度" in text
     # 反过来，书面语是允许的，不能在 prompt 里禁掉；要收的是篇幅、颗粒度和端着的措辞
     assert "不必为了像人而刻意堆口语" in text
-    assert "只挑一到两个真正决定胜负的点展开" in text
+    assert "只挑一到两个真正影响你结论的点展开" in text
     assert "不要用「判」字" in text
 
 
@@ -388,7 +388,7 @@ def test_polish_reason_prompt_names_the_actual_defects(monkeypatch):
     prompt = calls[0]
     assert "分水岭" in prompt
     # 规范原文要一起给，否则模型只知道哪里错、不知道该写成什么样
-    assert "只挑一到两个真正决定胜负的点展开" in prompt
+    assert "只挑一到两个真正影响你结论的点展开" in prompt
     # 这一轮不给材料，必须明确禁止补新事实，否则会补出没核对过的论点
     assert "不要新增正文里没有的事实" in prompt
     assert "不要换结论" in prompt
@@ -416,6 +416,42 @@ def test_polish_reason_refuses_to_trade_too_long_for_too_short(monkeypatch):
     assert left
 
 
+def test_polish_reason_leaves_a_clean_reason_alone(monkeypatch):
+    """没毛病又没点名，就别白花一次调用。"""
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON, verdict="A"))
+    assert (text, left, calls) == (CLEAN_REASON, [], [])
+
+
+def test_forced_polish_rewrites_a_reason_that_breaks_no_rule(monkeypatch):
+    """规则拦不住颗粒度，所以点名的那些即便查不出毛病也要重写一遍。"""
+    calls: list[str] = []
+    rewritten = CLEAN_REASON.replace("所以选 A", "综合来看 A 更好")
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([rewritten], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON, verdict="A", forced=True))
+    assert text == rewritten and left == []
+    assert "核对清单" in calls[0]
+
+
+def test_forced_polish_keeps_the_original_when_the_rewrite_breaks_a_rule(monkeypatch):
+    """基准分记差一档是为了让改写能被采信，不是为了让不合规的也能进来。"""
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON + "所以判 A 更好，B 的毛病更大"],
+                                                 calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON, verdict="A",
+                                              forced=True, rounds=1))
+    assert text == CLEAN_REASON and left
+
+
+def test_fix_prompt_states_the_budget_even_when_the_reason_fits():
+    """贴着上限的那批余量只有几个字，不给预算它换个说法就把篇幅撑过去了。"""
+    short = "A 侧改好了，B 侧没改好，这道题的胜负就在这里。"
+    prompt = ga.build_reason_fix_prompt(short, ["理由里有「胜负」这类说法"])
+    assert f"不要超过 {ga.gsb_rules.REASON_TARGET_MAX} 字" in prompt
+    assert "去掉大约" not in prompt
+
+
 def test_polish_reason_prompt_aims_at_the_middle_of_the_window(monkeypatch):
     """按上限要它会压到刚好擦线，瞄中位才留出余量。"""
     calls: list[str] = []
@@ -434,8 +470,13 @@ def test_polish_reason_asks_for_a_rewrite_when_the_gap_is_large(monkeypatch):
     asyncio.run(ga.polish_reason(CLEAN_REASON * 12, verdict="A"))
     assert "这一步不是修剪，是重写" in calls[0]
     calls.clear()
-    # 只超出一点点时还是按删减说，重写反而会把已经写好的论证推翻
-    asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A"))
+    # 只超出一点点时还是按删减说，重写反而会把已经写好的论证推翻。
+    # 倍数按篇幅窗口算，不写死：窗口收窄过一次，写死的倍数会悄悄滑进另一条分支。
+    mild = CLEAN_REASON * 5
+    assert (ga.gsb_rules.REASON_SOFT_MAX_CHARS
+            < ga.gsb_rules.visible_chars(mild)
+            <= ga.gsb_rules.REASON_SOFT_MAX_CHARS * 1.4)
+    asyncio.run(ga.polish_reason(mild, verdict="A"))
     assert "这一步不是修剪" not in calls[0]
     assert "删掉整个次要论点" in calls[0]
 

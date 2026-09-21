@@ -298,6 +298,43 @@ def test_stiff_official_wording_is_flagged(bad):
     assert "reason_wording" in _names(gv.verify(_data(reason=GOOD_REASON + bad)), "warn")
 
 
+@pytest.mark.parametrize("bad", [
+    "这道题的胜负就在日期解析上",
+    "真正拉开差距的是测试怎么写",
+    "字素切分的来源也拉开了差距",
+    "这一处就能分出高下",
+    "真正分开高下的是捕获语义",
+    "两边的改法也分不出高下",
+    "决定这次高下的是 B 动了一条注释",
+])
+def test_contest_framing_is_flagged(bad):
+    """把两份产物说成在比赛，和「判 A 更好」是一路货。
+
+    这几个词是写作规范自己带出来的：早先正文反复写「决定胜负的点」，模型原样搬进
+    理由，一百多道里有二十几道开头都是「这道题的胜负就在……」。子串表拦不住它，
+    写死「分出高下」它就写「分开高下」「分不出高下」，所以这条用正则。
+    """
+    assert "reason_contest_framing" in _names(gv.verify(_data(reason=GOOD_REASON + bad)), "warn")
+
+
+@pytest.mark.parametrize("ok", ["选定胜出策略会把方案置空",
+                                "按胜出、被覆盖、已过期、无效四种状态排序"])
+def test_domain_uses_of_winning_are_not_flagged(ok):
+    """业务里的「胜出策略」说的是另一回事，别一起拦掉。"""
+    assert "reason_contest_framing" not in _names(gv.verify(_data(reason=GOOD_REASON + ok)), "warn")
+
+
+def test_colloquial_idiom_in_the_opening_is_flagged():
+    assert "reason_wording" in _names(
+        gv.verify(_data(reason=GOOD_REASON + "最容易看走眼的是引用逃逸那一条")), "warn")
+
+
+def test_writing_rules_do_not_seed_the_contest_words():
+    """规范正文自己不能出现这些词，否则模型照抄，拦了也白拦。"""
+    for word in ("胜负", "拉开差距", "看走眼"):
+        assert word not in gv.gsb_rules.WRITING_RULES
+
+
 def test_a_longer_phrase_that_merely_contains_a_banned_word_is_not_flagged():
     """「反复跑探针」是正常说法，不能因为里面有「复跑」就拦，否则下一轮会被改坏。"""
     ok = "它反复跑只有导入、不核对结果的探针"
