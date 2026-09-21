@@ -433,7 +433,7 @@ def normalize(obj: dict, repos: dict[str, Path] | None = None) -> dict:
 #
 # 这一轮不给材料，只给正文。要的是收篇幅、换措辞、换开场，不是重新判断；给了材料
 # 模型就会去补新论点，补出来的东西没有经过第一轮的核对。
-REASON_FIX_ROUNDS = 3
+REASON_FIX_ROUNDS = 4
 # 改写的 prompt 只有一两千字，正常一分钟内就回。给死上限是为了不让一次卡顿把
 # 整道题的分析拖到和主调用一样长。
 REASON_FIX_TIMEOUT_S = 600
@@ -467,6 +467,10 @@ def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
     缺口按窗口中位算，不按上限算。照上限要它会压到刚好擦线，实测一段九百多字的
     改三轮仍停在六百三十字，离上限只差十几个字；瞄中位留出余量，略微收不够也还
     落在区间里。
+
+    差得太多时改口说「重写」。按删减说，它每轮只肯砍掉四分之一左右——一千零四十五
+    字的那段三轮下来还有七百八十字。要收掉将近一半就不是修剪，得让它照着一两个
+    决定胜负的点重新写一段。
     """
     listed = "\n".join(f"{i}. {d}" for i, d in enumerate(defects, 1))
     n = gsb_rules.visible_chars(reason)
@@ -474,7 +478,13 @@ def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
         aim = (gsb_rules.REASON_TARGET_MIN + gsb_rules.REASON_TARGET_MAX) // 2
         listed += (f"\n\n这一段现在 {n} 字，要收到 {gsb_rules.REASON_TARGET_MIN} 到 "
                    f"{gsb_rules.REASON_TARGET_MAX} 字，最好落在 {aim} 字左右，也就是去掉大约 "
-                   f"{n - aim} 字。删掉整个次要论点，不要靠压缩句子硬凑。")
+                   f"{n - aim} 字。")
+        if n > aim * 1.5:
+            listed += ("这一步不是修剪，是重写：先定下哪一到两个点决定了胜负，"
+                       "只把这一两个点讲透，其余的最多各一句带过，剩下的整段不要。"
+                       "在原文上逐句删改收不到这个篇幅。")
+        else:
+            listed += "删掉整个次要论点，不要靠压缩句子硬凑。"
     return f"""下面这段是一份双跑对比的评审理由，它违反了写作规范，需要你改写。
 
 【当前正文】

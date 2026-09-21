@@ -399,6 +399,19 @@ def test_polish_reason_prompt_aims_at_the_middle_of_the_window(monkeypatch):
     assert f"去掉大约 {ga.gsb_rules.visible_chars(long) - aim} 字" in calls[0]
 
 
+def test_polish_reason_asks_for_a_rewrite_when_the_gap_is_large(monkeypatch):
+    """按删减说它每轮只砍四分之一，要收掉将近一半就得让它重新写一段。"""
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON], calls))
+    asyncio.run(ga.polish_reason(CLEAN_REASON * 12, verdict="A"))
+    assert "这一步不是修剪，是重写" in calls[0]
+    calls.clear()
+    # 只超出一点点时还是按删减说，重写反而会把已经写好的论证推翻
+    asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A"))
+    assert "这一步不是修剪" not in calls[0]
+    assert "删掉整个次要论点" in calls[0]
+
+
 def test_polish_reason_keeps_the_better_version_when_a_rewrite_is_worse(monkeypatch):
     """模型偶尔把一处毛病换成两处，无条件采用就会越改越差。"""
     calls: list[str] = []

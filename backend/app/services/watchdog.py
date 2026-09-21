@@ -38,7 +38,7 @@ from app.models import (
     ANALYSIS_FAILED, ANALYSIS_IDLE, ANALYSIS_RUNNING, ANALYZING, DISCARDED, NEEDS_ATTENTION,
     QUEUED, RUN_DONE,
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
-    RUN_TIMEOUT, SCHEDULABLE, WATCHED, RunEvent, Task, TaskRun, utc_now,
+    RUN_TIMEOUT, SCHEDULABLE, WATCHED, RunEvent, Task, TaskRun, as_utc, utc_now,
 )
 from app.services import dockerx, gsb_repo, settings_store
 
@@ -816,6 +816,41 @@ async def _scan_abnormal() -> dict:
     return stats
 
 
+def _settle_finished() -> int:
+    """两侧都正常跑完的题，从「运行中」挪到「两侧跑完」。返回挪了几道。
+
+    题级状态是从两侧 run 推出来的，而两侧都结束时推不出值（见 derive_task_status），
+    于是在这一步之前，只有 advance_pair 会把题写成 RUN_DONE —— 而它排在分析并发额度
+    后面。额度就是设置里那个「分析/质检并发」（默认 2），一道题的分析加质检十几二十
+    分钟是常态，跑完的题一多，后面那些只能在队里等额度。等的这一路上，题级状态没人
+    动过：容器早就 Exited、产物也齐了，界面上却一直是「运行中」。
+
+    而巡检每轮都看见它们，只是既开不了推进（没额度）、又不管题级状态，于是看上去像是
+    连看门狗都刷不过来。所以状态不跟着额度走：两侧一正常结束就落 RUN_DONE，推进照旧
+    排队等额度，界面上显示的是「等提交产物与分析」—— 它确实在等的就是这个。
+
+    题级 finished_at 也在这里补。整条正常路径上从没人写过它，而列表按它排序、今日统计
+    也数它，于是跑完的题一律排在最后、当天产出永远是 0。取两侧较晚的那个结束时刻，
+    而不是此刻：巡检可能隔了几分钟甚至跨了一次重启才扫到。
+    """
+    moved: list[int] = []
+    with session() as db:
+        for task in db.execute(select(Task).where(Task.status.in_(SCHEDULABLE))).scalars():
+            runs = db.query(TaskRun).filter(TaskRun.task_id == task.id).all()
+            if len(runs) != 2 or any(r.status != RUN_FINISHED for r in runs):
+                continue
+            if any(abnormal_reason(r) for r in runs):
+                continue  # 异常扫描会把它退回重跑，别让它先顶着「跑完了」的名义
+            task.status = RUN_DONE
+            task.finished_at = task.finished_at or max(
+                (as_utc(r.finished_at) for r in runs if r.finished_at), default=utc_now())
+            log.info("题 %s 两侧都正常跑完，转两侧跑完，等额度推进", task.task_no)
+            moved.append(task.id)
+    for tid in moved:
+        bus.publish("tasks", {"type": "task", "id": tid})
+    return len(moved)
+
+
 def _settle_stopped() -> int:
     """人按了停止、两侧都停下来的题，从「运行中」挪到「需人工」。返回挪了几道。
 
@@ -837,7 +872,7 @@ def _settle_stopped() -> int:
             if len(runs) != 2 or any(r.status not in RUN_END_STATUSES for r in runs):
                 continue
             if all(r.status == RUN_FINISHED for r in runs):
-                continue  # 两侧都跑完了，那是配对扫描的活
+                continue  # 两侧都正常跑完，_settle_finished 已经收过了
             if any(abnormal_reason(r) for r in runs):
                 continue  # 真异常，异常扫描已经处理过或正挂起等着
             stopped = sorted(r.side for r in runs if r.status != RUN_FINISHED)
@@ -947,9 +982,10 @@ async def tick() -> dict:
     """跑一轮定时任务。三步的先后都不能换，理由见上面那段注释。"""
     adopted = await _scan_orphans()
     stats = await _scan_abnormal()
-    # 异常扫描放行了的、又配不上对的，只剩人工停掉的那种。放在异常之后是因为
-    # 它靠「不算异常」这个结论做排除；放在配对之前是因为两者互斥，先后无所谓，
-    # 但转成需人工之后配对扫描本就不看它，顺序这样更省一次白扫。
+    # 收题级状态的两步都排在异常扫描之后：它们靠「这一侧不算异常」这个结论做排除，
+    # 抢在前面会把一道马上要被退回重跑的题先说成跑完了。
+    # 也都排在配对之前：推进是按额度慢慢来的，状态不能跟着它一起等。
+    stats["run_done"] = _settle_finished()
     stats["settled"] = _settle_stopped()
     advanced = await _scan_pairs()
     # 台账校正放最后：上面几步可能刚销毁过容器，这时对齐一次正好
@@ -986,10 +1022,10 @@ async def _loop() -> None:
             _last_tick_at, _last_error, _last_stats = utc_now(), "", stats
             # 每轮都留一行。巡检绝大多数时候什么都不做，一声不吭的话，「它到底还在不在
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
-            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 转人工 %s · 起推进 %s"
-                     "（在跑 %s） · 耗时 %.1fs",
+            log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 转待分析 %s · 转人工 %s"
+                     " · 起推进 %s（在跑 %s） · 耗时 %.1fs",
                      stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
-                     stats["settled"], stats["advanced"], len(_advance_tasks),
+                     stats["run_done"], stats["settled"], stats["advanced"], len(_advance_tasks),
                      (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise

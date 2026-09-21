@@ -251,7 +251,10 @@ export interface SystemStatus {
     /** 开着就是只记异常不动手：不自动重跑、不自动废弃。模型停机时用 */
     paused: boolean
     alive: boolean; last_tick_at: string | null; last_error: string
-    last_stats: { adopted?: number; requeued?: number; discarded?: number; held?: number; advanced?: number }
+    last_stats: {
+      adopted?: number; requeued?: number; discarded?: number; held?: number
+      run_done?: number; settled?: number; advanced?: number
+    }
   }
   dedup: { ok: boolean; message: string; image: string }
   /** 远端题库。enabled 为假就是单设备模式，题目来自本机题面文件 */
