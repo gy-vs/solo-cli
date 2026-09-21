@@ -302,6 +302,162 @@ def opening_signature(text: str) -> str:
     return head[:OPENING_SIGNATURE_CHARS]
 
 
+# ---------------- 只看理由文本的那些规则 ----------------
+# 这一组的判定只需要理由本身（外加结论和别的题的开头），所以生成时就能自查，
+# 不必等到上传前核验。两个地方共用这一个函数：分析生成完先拿它挑毛病、让模型
+# 照着改；上传前核验再拿它出红黄项。写成两份的下场是 prompt 里没禁、核验却拦，
+# 人在界面上改到第五遍也过不了。
+#
+# 要对照两侧材料才能判的规则（理由提到的文件是否真实存在）不在这里，留在核验里。
+
+ABS_PATH = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/)+")
+
+
+def reason_checks(text: str, *, verdict: str = "",
+                  peer_openings: dict | None = None) -> list[tuple[str, str, str]]:
+    """查理由文本，返回 (核验项名, 轻重, 给人看的说法)。
+
+    轻重只对核验界面有意义：block 对应平台会打回的东西，warn 对应篇幅、措辞、
+    开头句式这类平台不管但读起来不像人写的毛病。生成时自查不分轻重，列出来的
+    都要改。
+    """
+    out: list[tuple[str, str, str]] = []
+    reason = text or ""
+
+    n = visible_chars(reason)
+    floor = MIN_SAME_REASON_CHARS if verdict == "Same" else MIN_REASON_CHARS
+    if n < floor:
+        extra = "，Same 要论证两边确实等价，比选边更费笔墨" if verdict == "Same" else ""
+        out.append(("reason_length", "block", f"理由去掉空白只有 {n} 字，不足 {floor} 字{extra}"))
+    if not re.search(r"\bA\b|A\s*侧", reason) or not re.search(r"\bB\b|B\s*侧", reason):
+        out.append(("reason_both_sides", "block", "理由里没有分别写到 A 和 B 两侧"))
+
+    # ---- 只有程序数得出来的量 ----
+    for name, label, pattern in MACHINE_METRICS:
+        if m := pattern.search(reason):
+            out.append((name, "block",
+                        f"理由里有{label}（{m.group(0).strip()[:40]}），"
+                        f"这是 AI 化评分里权重最高的一类证据，位置该用文件名和函数名来指"))
+    count, density = number_density(reason)
+    if density > NUMBER_PER_100_LIMIT:
+        out.append(("reason_number_density", "block",
+                    f"理由里有 {count} 个精确数字，每百字 {density} 个，"
+                    f"超过每百字 {NUMBER_PER_100_LIMIT} 个的线"))
+    if chunk := symbol_run(reason):
+        out.append(("reason_symbol_dump", "block",
+                    f"理由里连着罗列了一串符号名（{chunk}），这是在搬运工具输出"))
+    if m := TERMINAL_DUMP.search(reason):
+        out.append(("reason_terminal_dump", "block",
+                    f"理由里有终端输出原文（{m.group(0).strip()[:40]}）"))
+    if m := SECTION_LABEL.search(reason):
+        out.append(("reason_section_label", "block",
+                    f"理由里有固定分栏（{m.group(0).strip()[:20]}），平台的理由框是纯文本"))
+    if MD_ANY.search(reason):
+        out.append(("reason_markdown", "block",
+                    "理由里有 markdown 记号（标题、列表符号、加粗或反引号），平台的理由框不渲染"))
+    if EMOJI.search(reason):
+        out.append(("reason_emoji", "block", "理由里有表情符号"))
+
+    # ---- E1 硬指纹与空洞套话 ----
+    hits = cliche_hits(reason)
+    if len(hits) >= DELIVERY_CLICHE_MIN:
+        out.append(("reason_cliche", "block",
+                    f"理由里有 {len(hits)} 个交付套话（{'、'.join(hits[:5])}），"
+                    f"凑够两个就会被判成模板"))
+    if ordinal_template(reason):
+        out.append(("reason_template", "block",
+                    "理由是「首先／其次／最后」加栏目标签的模板骨架"))
+    if hit := next((p for p in SELF_REFERENCE if p in reason), ""):
+        out.append(("reason_self_reference", "block", f"理由里有 AI 自指（{hit}）"))
+    if hit := next((p for p in CHAT_SCAFFOLD if p in reason), ""):
+        out.append(("reason_chat_scaffold", "block", f"理由里有对话腔（{hit}）"))
+    ratio = substance_ratio(reason)
+    if ratio < SUBSTANCE_RATIO:
+        out.append(("reason_hollow", "block",
+                    f"删掉「各有优劣」「表现良好」这类空话后只剩 {int(ratio * 100)}% 的内容，"
+                    f"不足一半，整段没有落到具体事实上"))
+
+    # 理由会原样交给评审方，绝对路径写进去等于把本机目录结构一起交出去
+    if m := ABS_PATH.search(reason):
+        out.append(("reason_abs_path", "block",
+                    f"理由里有绝对路径（{m.group(0)[:40]}），会把本机目录结构一起交出去"))
+
+    # ---- 篇幅、措辞、开头句式 ----
+    if n > REASON_SOFT_MAX_CHARS:
+        out.append(("reason_too_long", "warn",
+                    f"理由 {n} 字，超过 {REASON_TARGET_MAX} 字的上限；"
+                    f"挑一两个决定胜负的点展开，其余一句带过"))
+    if swaps := word_swap_hits(reason):
+        word, suggest = swaps[0]
+        more = f"，另有 {'、'.join(w for w, _ in swaps[1:4])}" if len(swaps) > 1 else ""
+        out.append(("reason_wording", "warn",
+                    f"理由里有「{word}」这类比喻或口语说法{more}，改成{suggest}"))
+    sig = opening_signature(reason)
+    if sig:
+        same = sorted(no for no, s in (peer_openings or {}).items()
+                      if s and (s == sig or s.startswith(sig) or sig.startswith(s)))
+        if same:
+            out.append(("reason_opening_repeat", "warn",
+                        f"开头的句式和第 {'、'.join(same[:3])} 题一样（{sig}），"
+                        f"按这道题自己的矛盾换一个写法"))
+    return out
+
+
+def findings_checks(findings: dict, *, label: str = "") -> list[str]:
+    """查一侧 findings 的每一条，返回要改的地方。
+
+    规范说的是「reason 与 findings 里每一条都按这个来」，所以这里共用同一批表。
+    不分红黄：findings 不上传给平台（只有 reason 会），核验那边管的是会被打回的
+    东西，这些条目进不了核验，列出来的都是生成时该改掉的。
+
+    有三类不能照搬理由的口径：
+
+    - 篇幅、是否写到两侧、开头句式：findings 是一条条短句，这几条不适用。
+    - 数字密度：不查。这条线是按五六百字的成段散文校准的，它防的是「靠数字堆出
+      对比」。findings 是一条条十几二十个字的短句，「改了两处判定，补了三条用例」
+      这种正常表述就已经超线，照搬只会逼人把该写的数字删掉。
+    - 空洞套话与交付套话：按这一侧所有条目拼起来算，规范说的本来就是「整段」。
+    """
+    items = [(kind, i, str(t)) for kind in ("good", "bad")
+             for i, t in enumerate((findings or {}).get(kind) or []) if str(t).strip()]
+    out: list[str] = []
+
+    for kind, i, text in items:
+        where = f"{label}{kind}[{i}]"
+        for name, desc, pattern in MACHINE_METRICS:
+            if m := pattern.search(text):
+                out.append(f"{where} 有{desc}（{m.group(0).strip()[:40]}）")
+        if chunk := symbol_run(text):
+            out.append(f"{where} 连着罗列了一串符号名（{chunk}）")
+        if m := TERMINAL_DUMP.search(text):
+            out.append(f"{where} 有终端输出原文（{m.group(0).strip()[:40]}）")
+        if m := SECTION_LABEL.search(text):
+            out.append(f"{where} 有固定分栏（{m.group(0).strip()[:20]}）")
+        if MD_ANY.search(text):
+            out.append(f"{where} 有 markdown 记号（标题、列表符号、加粗或反引号）")
+        if EMOJI.search(text):
+            out.append(f"{where} 有表情符号")
+        if hit := next((p for p in SELF_REFERENCE if p in text), ""):
+            out.append(f"{where} 有 AI 自指（{hit}）")
+        if hit := next((p for p in CHAT_SCAFFOLD if p in text), ""):
+            out.append(f"{where} 有对话腔（{hit}）")
+        if swaps := word_swap_hits(text):
+            word, suggest = swaps[0]
+            out.append(f"{where} 有「{word}」这类比喻或口语说法，改成{suggest}")
+        if m := ABS_PATH.search(text):
+            out.append(f"{where} 有绝对路径（{m.group(0)[:40]}）")
+
+    joined = "".join(t for _, _, t in items)
+    if joined:
+        hits = cliche_hits(joined)
+        if len(hits) >= DELIVERY_CLICHE_MIN:
+            out.append(f"{label}整段有 {len(hits)} 个交付套话（{'、'.join(hits[:5])}）")
+        ratio = substance_ratio(joined)
+        if ratio < SUBSTANCE_RATIO:
+            out.append(f"{label}整段删掉空话后只剩 {int(ratio * 100)}% 的内容，没有落到具体事实上")
+    return out
+
+
 # ---------------- 写进 prompt 的规范 ----------------
 # 只讲怎么写，不讲我们内部怎么核验。
 

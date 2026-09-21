@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -309,3 +311,229 @@ def test_condensed_steps_preserve_original_order():
     index = {"steps": [{"tool": "Read", "summary": "一"}, {"tool": "Edit", "summary": "二"},
                        {"tool": "Bash", "summary": "三"}]}
     assert ga._condense_steps(index) == ["Read 一", "Edit 二", "Bash 三"]
+
+
+# ---------------- 生成时收口 ----------------
+# 写作规范进 prompt 不等于模型会照做：规范收到五六百字之后，交回来的理由仍然普遍
+# 一千多字，而核验里篇幅只是黄项拦不住入库。所以生成完要自查并让模型改，改完再查。
+
+CLEAN_REASON = (
+    "A 侧 lib/dumper.js 的 writeNode 改成返回对象，标签在嵌套映射里透传下去了；"
+    "B 侧只改了 writeNode，锚点用例里 tag 变成 undefined。两边的约束我逐条对过，"
+    "A 侧三条都落到了代码里，B 侧漏了保留注释那一条，所以选 A。"
+)
+
+
+def _fake_ask(replies, calls):
+    """按顺序吐出 replies 里的回答，并把收到的 prompt 记进 calls。"""
+
+    async def ask(prompt, **kw):
+        calls.append(prompt)
+        from app.services.llm import LlmResult
+
+        return LlmResult(text=replies[min(len(calls) - 1, len(replies) - 1)])
+
+    return ask
+
+
+def test_polish_reason_skips_the_model_when_already_compliant(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask(["不该被调用"], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON, verdict="A"))
+    assert (text, left) == (CLEAN_REASON, [])
+    assert calls == []
+
+
+def test_polish_reason_rewrites_until_compliant(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A"))
+    assert left == []
+    assert text == CLEAN_REASON
+    assert len(calls) == 1
+
+
+def test_polish_reason_prompt_names_the_actual_defects(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON], calls))
+    asyncio.run(ga.polish_reason(CLEAN_REASON + "真正的分水岭在测试上。", verdict="A"))
+    prompt = calls[0]
+    assert "分水岭" in prompt
+    # 规范原文要一起给，否则模型只知道哪里错、不知道该写成什么样
+    assert "只挑一到两个真正决定胜负的点展开" in prompt
+    # 这一轮不给材料，必须明确禁止补新事实，否则会补出没核对过的论点
+    assert "不要新增正文里没有的事实" in prompt
+    assert "不要换结论" in prompt
+
+
+def test_polish_reason_accepts_partial_shortening(monkeypatch):
+    """超篇幅只算一条毛病，只按条数比好坏会把「一千字砍到七百字」整个丢掉。"""
+    calls: list[str] = []
+    half = CLEAN_REASON * 6          # 仍然超上限，但比原来短
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([half, CLEAN_REASON], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON * 12, verdict="A"))
+    assert left == []
+    assert text == CLEAN_REASON
+    # 第一轮收拢被采信了，第二轮才从更短的那一版接着改
+    assert len(calls) == 2
+
+
+def test_polish_reason_refuses_to_trade_too_long_for_too_short(monkeypatch):
+    """太短是核验会拦的红项，太长只是黄项，不能当成等价的一条毛病换过去。"""
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask(["A 侧和 B 侧的差别在 lib/dumper.js。"], calls))
+    long = CLEAN_REASON * 6
+    text, left = asyncio.run(ga.polish_reason(long, verdict="A", rounds=1))
+    assert text == long
+    assert left
+
+
+def test_polish_reason_prompt_says_how_many_characters_to_cut(monkeypatch):
+    """只说「超过上限」模型往往只削掉一两句，给出确切缺口才会去掉整个次要论点。"""
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON], calls))
+    long = CLEAN_REASON * 6
+    asyncio.run(ga.polish_reason(long, verdict="A"))
+    over = ga.gsb_rules.visible_chars(long) - ga.gsb_rules.REASON_TARGET_MAX
+    assert f"至少去掉 {over} 字" in calls[0]
+
+
+def test_polish_reason_keeps_the_better_version_when_a_rewrite_is_worse(monkeypatch):
+    """模型偶尔把一处毛病换成两处，无条件采用就会越改越差。"""
+    calls: list[str] = []
+    worse = CLEAN_REASON + "## 结论\n作为大语言模型我倾向 A。"
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([worse], calls))
+    bad = CLEAN_REASON + "真正的分水岭在测试上。"
+    text, left = asyncio.run(ga.polish_reason(bad, verdict="A"))
+    assert text == bad
+    assert [m for m in left if "分水岭" in m]
+
+
+def test_polish_reason_survives_a_model_failure(monkeypatch):
+    """改写调用失败不能让整道题的分析炸掉，原文留着、毛病回报出去。"""
+
+    async def boom(prompt, **kw):
+        from app.services.llm import LlmError
+
+        raise LlmError("网关 504", retryable=True)
+
+    monkeypatch.setattr(ga.llm, "ask", boom)
+    bad = CLEAN_REASON + "真正的分水岭在测试上。"
+    text, left = asyncio.run(ga.polish_reason(bad, verdict="A"))
+    assert text == bad
+    assert left
+
+
+def test_polish_reason_cleans_the_rewrite_like_the_first_pass(monkeypatch):
+    """改写稿也要过一遍清洗，模型在这一轮照样会写 markdown 和绝对路径。"""
+    calls: list[str] = []
+    dirty = "**" + CLEAN_REASON.replace("lib/dumper.js", "/workspace/lib/dumper.js") + "**"
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([dirty], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A"))
+    assert "**" not in text and "/workspace" not in text
+    assert "lib/dumper.js" in text
+    assert left == []
+
+
+def test_polish_reason_gives_up_after_the_round_limit(monkeypatch):
+    """改不动就别无限打模型，剩下的毛病交出去让人看见。"""
+    calls: list[str] = []
+    stuck = CLEAN_REASON * 6 + "真正的分水岭在测试上。"
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([stuck], calls))
+    text, left = asyncio.run(ga.polish_reason(stuck, verdict="A", rounds=2))
+    assert text == stuck
+    assert left and len(calls) == 2
+
+
+def test_findings_checks_flag_machine_metrics_per_item():
+    got = ga.gsb_rules.findings_checks(
+        {"good": ["按规范补了严格类型"], "bad": ["它在第 12 步才发现 lib/a.js:30-40 的问题"]},
+        label="a_findings.")
+    assert any("a_findings.bad[0]" in m and "步数" in m for m in got)
+    assert any("行号" in m for m in got)
+    assert not any("good[0]" in m for m in got)
+
+
+def test_findings_do_not_inherit_the_number_density_line():
+    """那条线按五六百字的成段散文校准，套到短句上会逼人删掉该写的数字。"""
+    dense = {"good": ["改了 2 处 3 项 4 条 5 个 6 次"], "bad": ["漏了 7 条 8 项 9 处"]}
+    assert not any("数字" in m for m in ga.gsb_rules.findings_checks(dense))
+
+
+def test_findings_hollow_wording_is_counted_over_the_whole_block():
+    hollow = {"good": ["表现良好", "基本可用"], "bad": ["各有优劣", "看不出差别"]}
+    assert any("空话" in m for m in ga.gsb_rules.findings_checks(hollow))
+
+
+def test_findings_checks_skip_rules_that_only_fit_the_reason():
+    """篇幅、是否写到两侧、开头句式对一条条短句不适用。"""
+    got = ga.gsb_rules.findings_checks({"good": ["透传了标签"], "bad": []})
+    assert got == []
+
+
+def test_polish_findings_rewrites_until_compliant(monkeypatch):
+    calls: list[str] = []
+    fixed = {"a_findings": {"good": ["标签在嵌套映射里透传下去了"], "bad": []},
+             "b_findings": {"good": [], "bad": ["锚点用例里标签变成了 undefined"]}}
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([json.dumps(fixed, ensure_ascii=False)], calls))
+    a = {"good": ["它在第 12 步透传了标签"], "bad": []}
+    b = {"good": [], "bad": ["lib/dumper.js:30-40 的标签丢了"]}
+    got_a, got_b, left = asyncio.run(ga.polish_findings(a, b))
+    assert left == []
+    assert got_a == fixed["a_findings"] and got_b == fixed["b_findings"]
+    assert len(calls) == 1
+
+
+def test_polish_findings_rejects_a_rewrite_that_changes_item_counts(monkeypatch):
+    """拆条并条会让 findings 和 evidence 对不上。"""
+    calls: list[str] = []
+    merged = {"a_findings": {"good": ["透传了标签", "多出来的一条"], "bad": []},
+              "b_findings": {"good": [], "bad": ["标签丢了"]}}
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([json.dumps(merged, ensure_ascii=False)], calls))
+    a = {"good": ["它在第 12 步透传了标签"], "bad": []}
+    b = {"good": [], "bad": ["标签丢了"]}
+    got_a, _, left = asyncio.run(ga.polish_findings(a, b, rounds=1))
+    assert got_a == a
+    assert left
+
+
+def test_polish_findings_skips_the_model_when_already_compliant(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask(["不该被调用"], calls))
+    a = {"good": ["透传了标签"], "bad": []}
+    b = {"good": [], "bad": ["标签丢了"]}
+    assert asyncio.run(ga.polish_findings(a, b)) == (a, b, [])
+    assert calls == []
+
+
+def test_polish_findings_survives_unparsable_output(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask(["我改好了，见上文"], calls))
+    a = {"good": ["它在第 12 步透传了标签"], "bad": []}
+    b = {"good": [], "bad": ["标签丢了"]}
+    got_a, got_b, left = asyncio.run(ga.polish_findings(a, b))
+    assert (got_a, got_b) == (a, b)
+    assert left
+
+
+def test_extract_object_skips_a_leading_example_shell():
+    """模型常先吐一个说明用的小对象，取第一个就会拿到那个壳子。"""
+    text = '{"note": "下面是结果"}\n{"a_findings": {"good": [], "bad": []}, "b_findings": {}}'
+    assert "a_findings" in ga._extract_object(text, "a_findings", "findings JSON")
+
+
+def test_peer_openings_excludes_self_and_unanalyzed(tmp_db):
+    from app.db import session
+    from app.models import ANALYSIS_DONE, Task
+
+    with session() as db:
+        me = _task(db, task_no="07")
+        done = _task(db, task_no="08", prompt_hash="h8")
+        done.analysis_status = ANALYSIS_DONE
+        done.gsb = {"reason": "两侧对根因的判断一致。" + CLEAN_REASON}
+        pending = _task(db, task_no="09", prompt_hash="h9")
+        pending.gsb = {"reason": "这道题我比较在意两点。" + CLEAN_REASON}
+        db.flush()
+        got = ga.peer_openings(db, me.id)
+    assert set(got) == {"08"}
+    assert got["08"] == ga.gsb_rules.opening_signature("两侧对根因的判断一致。")

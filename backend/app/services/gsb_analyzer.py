@@ -264,8 +264,12 @@ def _repair_truncated(text: str) -> str:
     return out + "".join("}" if ch == "{" else "]" for ch in reversed(stack))
 
 
-def extract_json(text: str) -> dict:
-    """从模型最终文本里提取 JSON：容忍前置说明、代码围栏、以及结尾少括号。"""
+def _extract_object(text: str, key: str, what: str) -> dict:
+    """从模型最终文本里提取含 key 的 JSON 对象：容忍前置说明、代码围栏、结尾少括号。
+
+    按 key 认而不是取第一个对象：模型经常先吐一个小对象当示例或说明，取第一个
+    就会拿到那个壳子。
+    """
     text = re.sub(r"```(?:json)?", "", text or "").strip()
     decoder = json.JSONDecoder()
     last_err: Exception | None = None
@@ -277,9 +281,13 @@ def extract_json(text: str) -> dict:
             except json.JSONDecodeError as exc:
                 last_err = exc
                 continue
-            if isinstance(obj, dict) and "verdict" in obj:
+            if isinstance(obj, dict) and key in obj:
                 return obj
-    raise ValueError(f"输出中没有可解析的 GSB JSON：{last_err}")
+    raise ValueError(f"输出中没有可解析的{what}：{last_err}")
+
+
+def extract_json(text: str) -> dict:
+    return _extract_object(text, "verdict", "GSB JSON")
 
 
 _ABS_PATH = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/)+[A-Za-z0-9_.\-\u4e00-\u9fff]*")
@@ -417,6 +425,198 @@ def normalize(obj: dict, repos: dict[str, Path] | None = None) -> dict:
     }
 
 
+# ---------------- 生成时收口 ----------------
+# 写作规范进 prompt 并不等于模型会照做。规范改成五六百字之后，交回来的理由仍然
+# 普遍是一千多字，而核验里篇幅只是黄项，拦不住入库，结果每批题都得人工回头重写
+# 一遍。所以在这里加一道自查：用 gsb_rules 那份表挑出毛病，把毛病原样念给模型让
+# 它改，改完再查。规则只有一份，因此不会出现「自查放过、核验却拦」。
+#
+# 这一轮不给材料，只给正文。要的是收篇幅、换措辞、换开场，不是重新判断；给了材料
+# 模型就会去补新论点，补出来的东西没有经过第一轮的核对。
+REASON_FIX_ROUNDS = 3
+# 改写的 prompt 只有一两千字，正常一分钟内就回。给死上限是为了不让一次卡顿把
+# 整道题的分析拖到和主调用一样长。
+REASON_FIX_TIMEOUT_S = 600
+
+
+def _reason_score(text: str, *, verdict: str, peer_openings: dict | None
+                  ) -> tuple[list[str], tuple[int, int, int]]:
+    """返回 (毛病清单, 用来比好坏的分数)。分数越小越好，按先后逐项比。
+
+    三项都有用，少一项就会误判：
+
+    - 红项条数排最前。红项是平台会打回的东西，黄项只是读起来像不像人写的。不分
+      轻重的话，一段「太短」会被当成和「太长」等价，于是模型回一句二十几个字的
+      话也算改好了，而太短恰恰是核验会拦的那一档。
+    - 黄项条数其次。
+    - 最后记还超出上限多少字。超篇幅只算一条黄项，一千字砍到七百字在条数上毫无
+      变化，只按条数比就会把这次真实的进展整个丢掉，改三轮也原地不动。
+    """
+    found = gsb_rules.reason_checks(text, verdict=verdict, peer_openings=peer_openings)
+    blocks = sum(1 for _, level, _ in found if level == "block")
+    over = max(0, gsb_rules.visible_chars(text) - gsb_rules.REASON_SOFT_MAX_CHARS)
+    return [m for _, _, m in found], (blocks, len(found) - blocks, over)
+
+
+def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
+    """把毛病念给模型，让它改这一段。
+
+    篇幅超了就把要砍掉多少字算出来一起给。只说「超过上限」它往往只削掉一两句，
+    给出确切的字数缺口才会真的去掉一整个次要论点。
+    """
+    listed = "\n".join(f"{i}. {d}" for i, d in enumerate(defects, 1))
+    n = gsb_rules.visible_chars(reason)
+    if n > gsb_rules.REASON_SOFT_MAX_CHARS:
+        listed += (f"\n\n这一段现在 {n} 字，要收到 {gsb_rules.REASON_TARGET_MIN} 到 "
+                   f"{gsb_rules.REASON_TARGET_MAX} 字，也就是至少去掉 "
+                   f"{n - gsb_rules.REASON_TARGET_MAX} 字。删掉整个次要论点，"
+                   f"不要靠压缩句子硬凑。")
+    return f"""下面这段是一份双跑对比的评审理由，它违反了写作规范，需要你改写。
+
+【当前正文】
+<<<REASON
+{reason}
+REASON>>>
+
+【必须修掉的毛病】
+{listed}
+
+【写法要求】
+{gsb_rules.WRITING_RULES}
+
+【改写约束】
+1. 只在现有正文的事实范围内删减和改写。不要新增正文里没有的事实，不要换结论，
+   哪一侧更好必须和现在一致。
+2. 篇幅超了就砍内容，不要靠压缩句子硬凑：只留一到两个决定胜负的点展开，其余的
+   最多一句带过，够不上的一句都不写。
+3. 开头句式被指出雷同时，换一个按这道题自己的矛盾来起头的写法，不要只改几个字。
+4. 只输出改写后的正文。不要 JSON，不要代码块围栏，不要任何说明或前言。"""
+
+
+async def polish_reason(reason: str, *, verdict: str, peer_openings: dict | None = None,
+                        repos: dict[str, Path] | None = None, purpose: str = "",
+                        rounds: int = REASON_FIX_ROUNDS) -> tuple[str, list[str]]:
+    """把理由改到符合写作规范。返回 (最终正文, 还没修掉的毛病)。
+
+    只在确有改善时才采信改写稿。模型偶尔会把一处毛病换成两处，无条件采用就会
+    越改越差；改不动就把原文留着，剩下的毛病回报给调用方记录下来，让人能看见，
+    而不是静悄悄地交一段不合规的话。好坏的比法见 _reason_score。
+    """
+    text = reason
+    defects, score = _reason_score(text, verdict=verdict, peer_openings=peer_openings)
+    if not defects:
+        return text, []
+
+    for rnd in range(1, rounds + 1):
+        log.info("%s 理由不合规 %d 处（%d 字），第 %d 轮改写：%s",
+                 purpose or "GSB", len(defects), gsb_rules.visible_chars(text),
+                 rnd, "；".join(defects)[:200])
+        try:
+            r = await llm.ask(build_reason_fix_prompt(text, defects),
+                              purpose=f"{purpose} 理由改写", attempts=1,
+                              timeout_s=REASON_FIX_TIMEOUT_S)
+        except llm.LlmError as exc:
+            log.warning("%s 理由改写调用失败，保留上一版：%s", purpose or "GSB", exc)
+            break
+        fixed = _clean(r.text, repos)
+        if not fixed:
+            log.warning("%s 理由改写返回空，保留上一版", purpose or "GSB")
+            break
+        left, new_score = _reason_score(fixed, verdict=verdict, peer_openings=peer_openings)
+        if new_score >= score:
+            log.warning("%s 第 %d 轮改写没有变好（%s %d 字 → %s %d 字），丢弃这一版",
+                        purpose or "GSB", rnd, score, gsb_rules.visible_chars(text),
+                        new_score, gsb_rules.visible_chars(fixed))
+            continue
+        text, defects, score = fixed, left, new_score
+        if not defects:
+            log.info("%s 理由第 %d 轮改写后合规，%d 字",
+                     purpose or "GSB", rnd, gsb_rules.visible_chars(text))
+            return text, []
+    return text, defects
+
+
+def _findings_defects(a: dict, b: dict) -> list[str]:
+    return (gsb_rules.findings_checks(a, label="a_findings.")
+            + gsb_rules.findings_checks(b, label="b_findings."))
+
+
+def build_findings_fix_prompt(a: dict, b: dict, defects: list[str]) -> str:
+    """把 findings 的毛病念给模型，让它逐条改写。"""
+    listed = "\n".join(f"{i}. {d}" for i, d in enumerate(defects, 1))
+    current = json.dumps({"a_findings": a, "b_findings": b}, ensure_ascii=False, indent=1)
+    return f"""下面是一份双跑对比里两侧的长处与不足清单，其中若干条违反了写作规范，需要你改写。
+
+【当前内容】
+{current}
+
+【必须修掉的毛病】
+{listed}
+
+【写法要求】
+{gsb_rules.WRITING_RULES}
+
+【改写约束】
+1. 条目的数量与顺序都不要变，只改写文字。每条仍然只说这一侧的一件事。
+2. 只在现有内容的事实范围内改写，不要新增原本没有的事实，不要把一条拆成两条或
+   把两条并成一条。
+3. 文件名、函数名、命令、报错原文照留，这是定位问题的正常方式，只是不要带行号。
+4. 只输出一个 JSON 对象，结构与上面完全一致（顶层只有 a_findings 与 b_findings，
+   各自只有 good 与 bad 两个字符串数组）。不要代码块围栏，不要任何说明。"""
+
+
+async def polish_findings(a: dict, b: dict, *, repos: dict[str, Path] | None = None,
+                          purpose: str = "", rounds: int = REASON_FIX_ROUNDS
+                          ) -> tuple[dict, dict, list[str]]:
+    """把两侧 findings 改到符合写作规范。返回 (a, b, 还没修掉的毛病)。
+
+    两侧一起改，一次调用就够：分开改要两次，而两侧的措辞本来就该统一。
+    采信规则和理由那边一样，只在毛病确实减少时才换，改不动就留着并回报。
+    """
+    defects = _findings_defects(a, b)
+    if not defects:
+        return a, b, []
+
+    for rnd in range(1, rounds + 1):
+        log.info("%s findings 不合规 %d 处，第 %d 轮改写：%s",
+                 purpose or "GSB", len(defects), rnd, "；".join(defects)[:200])
+        try:
+            r = await llm.ask(build_findings_fix_prompt(a, b, defects),
+                              purpose=f"{purpose} findings 改写", attempts=1,
+                              timeout_s=REASON_FIX_TIMEOUT_S)
+            obj = _extract_object(r.text, "a_findings", "findings JSON")
+        except (llm.LlmError, ValueError) as exc:
+            log.warning("%s findings 改写失败，保留上一版：%s", purpose or "GSB", exc)
+            break
+        fixed_a = _findings(obj.get("a_findings"), repos)
+        fixed_b = _findings(obj.get("b_findings"), repos)
+        # 条目数变了说明它没按约束改，拆条并条会让 findings 和证据对不上
+        if [len(fixed_a[k]) for k in ("good", "bad")] != [len(a[k]) for k in ("good", "bad")] \
+                or [len(fixed_b[k]) for k in ("good", "bad")] != [len(b[k]) for k in ("good", "bad")]:
+            log.warning("%s 第 %d 轮改写改动了条目数量，丢弃这一版", purpose or "GSB", rnd)
+            continue
+        left = _findings_defects(fixed_a, fixed_b)
+        if len(left) >= len(defects):
+            log.warning("%s 第 %d 轮 findings 改写没有减少毛病（%d → %d），丢弃这一版",
+                        purpose or "GSB", rnd, len(defects), len(left))
+            continue
+        a, b, defects = fixed_a, fixed_b, left
+        if not defects:
+            log.info("%s findings 第 %d 轮改写后合规", purpose or "GSB", rnd)
+            return a, b, []
+    return a, b, defects
+
+
+def peer_openings(db, task_id: int) -> dict[str, str]:
+    """别的已分析题目的开头句式，用来发现几道题套同一个开场。
+
+    已分析的题本来就不多，全取出来也就几十条，不值得为此加索引或缓存。
+    """
+    return {other.task_no: gsb_rules.opening_signature((other.gsb or {}).get("reason", ""))
+            for other in db.query(Task).filter(Task.id != task_id,
+                                               Task.analysis_status == ANALYSIS_DONE).all()}
+
+
 # ---------------- 主流程 ----------------
 
 async def analyze_task(task_id: int) -> dict:
@@ -459,6 +659,15 @@ async def analyze_task(task_id: int) -> dict:
             raise RuntimeError(f"分析没给出可识别的结论，原始值：{str(parsed.get('verdict'))[:80]}")
 
         with session() as db:
+            peers = peer_openings(db, task_id)
+        gsb["reason"], left = await polish_reason(
+            gsb["reason"], verdict=gsb["verdict"], peer_openings=peers,
+            repos=workspaces, purpose=f"GSB {task_no}")
+        gsb["a_findings"], gsb["b_findings"], findings_left = await polish_findings(
+            gsb["a_findings"], gsb["b_findings"],
+            repos=workspaces, purpose=f"GSB {task_no}")
+
+        with session() as db:
             t = db.get(Task, task_id)
             assert t is not None
             t.analysis = {
@@ -468,6 +677,10 @@ async def analyze_task(task_id: int) -> dict:
                 "attempts": result.attempts,
                 "duration_s": round(time.time() - started),
                 "finished_at": utc_now().isoformat(),
+                # 改写之后还剩的毛病要留痕。留空说明生成时已经收干净，非空就是
+                # 改了两轮还没改动的地方，界面上的核验会用同一份规则再报一次
+                "reason_defects": left,
+                "findings_defects": findings_left,
                 "raw": parsed,
             }
             t.gsb = gsb

@@ -16,17 +16,13 @@ import re
 from app import config
 from app.db import session
 from app.events import bus
-from app.models import ANALYSIS_DONE, Task, TaskRun
-from app.services import dockerx, gsb_repo, gsb_rules, settings_store, trace
+from app.models import Task, TaskRun
+from app.services import dockerx, gsb_analyzer, gsb_repo, gsb_rules, settings_store, trace
 from app.services.gsb_analyzer import VERDICTS
 
 log = logging.getLogger("gsb_verifier")
 
-MIN_REASON_CHARS = gsb_rules.MIN_REASON_CHARS
-MIN_SAME_REASON_CHARS = gsb_rules.MIN_SAME_REASON_CHARS
-
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
-_ABS_PATH = re.compile(r"(?<![\w.])/(?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/)+")
 # 理由里对文件的引用：带目录的路径，或者带常见扩展名的文件名
 _FILE_REF = re.compile(
     r"\b(?:[\w.\-]+/)+[\w.\-]+\.\w{1,6}\b"
@@ -36,10 +32,6 @@ _FILE_REF = re.compile(
 
 def _item(name: str, level: str, message: str) -> dict:
     return {"name": name, "level": level, "message": message}
-
-
-def _chars(text: str) -> int:
-    return len(re.sub(r"\s+", "", text or ""))
 
 
 def _ver(text: str) -> str:
@@ -56,92 +48,6 @@ def _norm_prompt(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
-def _ai_trace_items(reason: str) -> list[dict]:
-    """按 solo-qa 的 GSB 口径查 AI 痕迹。
-
-    它的 AI 化判定是一次 0～10 分的模型评分，4 分就打回，而分数主要来自「只有程序
-    数得出来的量」：步号、工具调用次数、增删行数、耗时、file.js:120-136 的行号，
-    以及由这些堆出来的数字密度。这些在本地是能确定性查出来的，所以先在这里拦掉，
-    别等交上去才被判。
-
-    反过来，书面语、术语、长句、长篇幅、段落对称、通篇没有「我」都不算 AI 痕迹，
-    它的评分提示词里逐条写明不扣分，所以这里一个都不查——查了只会逼人把话改烂。
-    """
-    items: list[dict] = []
-    for name, label, pattern in gsb_rules.MACHINE_METRICS:
-        if m := pattern.search(reason):
-            items.append(_item(name, "block",
-                               f"理由里有{label}（{m.group(0).strip()[:40]}），"
-                               f"这是 AI 化评分里权重最高的一类证据，位置该用文件名和函数名来指"))
-    count, density = gsb_rules.number_density(reason)
-    if density > gsb_rules.NUMBER_PER_100_LIMIT:
-        items.append(_item("reason_number_density", "block",
-                           f"理由里有 {count} 个精确数字，每百字 {density} 个，"
-                           f"超过每百字 {gsb_rules.NUMBER_PER_100_LIMIT} 个的线"))
-    if chunk := gsb_rules.symbol_run(reason):
-        items.append(_item("reason_symbol_dump", "block",
-                           f"理由里连着罗列了一串符号名（{chunk}），这是在搬运工具输出"))
-    if m := gsb_rules.TERMINAL_DUMP.search(reason):
-        items.append(_item("reason_terminal_dump", "block",
-                           f"理由里有终端输出原文（{m.group(0).strip()[:40]}）"))
-    if m := gsb_rules.SECTION_LABEL.search(reason):
-        items.append(_item("reason_section_label", "block",
-                           f"理由里有固定分栏（{m.group(0).strip()[:20]}），平台的理由框是纯文本"))
-    if gsb_rules.MD_ANY.search(reason):
-        items.append(_item("reason_markdown", "block",
-                           "理由里有 markdown 记号（标题、列表符号、加粗或反引号），平台的理由框不渲染"))
-    if gsb_rules.EMOJI.search(reason):
-        items.append(_item("reason_emoji", "block", "理由里有表情符号"))
-    if hits := gsb_rules.cliche_hits(reason):
-        # 单独一个过渡词不算，凑够两个才是拿套话当骨架
-        if len(hits) >= gsb_rules.DELIVERY_CLICHE_MIN:
-            items.append(_item("reason_cliche", "block",
-                               f"理由里有 {len(hits)} 个交付套话（{'、'.join(hits[:5])}），"
-                               f"凑够两个就会被判成模板"))
-    if gsb_rules.ordinal_template(reason):
-        items.append(_item("reason_template", "block",
-                           "理由是「首先／其次／最后」加栏目标签的模板骨架"))
-    if hit := next((p for p in gsb_rules.SELF_REFERENCE if p in reason), ""):
-        items.append(_item("reason_self_reference", "block", f"理由里有 AI 自指（{hit}）"))
-    if hit := next((p for p in gsb_rules.CHAT_SCAFFOLD if p in reason), ""):
-        items.append(_item("reason_chat_scaffold", "block", f"理由里有对话腔（{hit}）"))
-    ratio = gsb_rules.substance_ratio(reason)
-    if ratio < gsb_rules.SUBSTANCE_RATIO:
-        items.append(_item("reason_hollow", "block",
-                           f"删掉「各有优劣」「表现良好」这类空话后只剩 {int(ratio * 100)}% 的内容，"
-                           f"不足一半，整段没有落到具体事实上"))
-    return items
-
-
-def _style_items(reason: str, peers: dict) -> list[dict]:
-    """查写法，不查合规。
-
-    这里每一条平台都不管：写到两千字不会被打回，每道题用同一个开场也不会被打回。
-    管的是这段话读起来像不像一个人写的——篇幅一长，颗粒度必然细到真人评审观察不到
-    的地步；几道题摆在一起句式雷同，就看得出是照着骨架填的。所以全部只提示。
-    """
-    items: list[dict] = []
-    n = _chars(reason)
-    if n > gsb_rules.REASON_SOFT_MAX_CHARS:
-        items.append(_item("reason_too_long", "warn",
-                           f"理由 {n} 字，超过 {gsb_rules.REASON_TARGET_MAX} 字的上限；"
-                           f"挑一两个决定胜负的点展开，其余一句带过"))
-    if hits := gsb_rules.word_swap_hits(reason):
-        word, suggest = hits[0]
-        more = f"，另有 {'、'.join(w for w, _ in hits[1:4])}" if len(hits) > 1 else ""
-        items.append(_item("reason_wording", "warn",
-                           f"理由里有「{word}」这类比喻或口语说法{more}，改成{suggest}"))
-    sig = gsb_rules.opening_signature(reason)
-    if sig:
-        same = sorted(no for no, s in (peers or {}).items()
-                      if s and (s == sig or s.startswith(sig) or sig.startswith(s)))
-        if same:
-            items.append(_item("reason_opening_repeat", "warn",
-                               f"开头的句式和第 {'、'.join(same[:3])} 题一样（{sig}），"
-                               f"按这道题自己的矛盾换一个写法"))
-    return items
-
-
 def verify(data: dict) -> dict:
     """按平台规则核验。data 的形状见 collect 的返回值。"""
     items: list[dict] = []
@@ -152,20 +58,10 @@ def verify(data: dict) -> dict:
     # ---- 结论与理由 ----
     if verdict not in VERDICTS:
         items.append(_item("verdict", "block", f"结论「{verdict or '空'}」不是 A、B、Same 之一"))
-    n = _chars(reason)
-    floor = MIN_SAME_REASON_CHARS if verdict == "Same" else MIN_REASON_CHARS
-    if n < floor:
-        extra = "，Same 要论证两边确实等价，比选边更费笔墨" if verdict == "Same" else ""
-        items.append(_item("reason_length", "block",
-                           f"理由去掉空白只有 {n} 字，不足 {floor} 字{extra}"))
-    if not re.search(r"\bA\b|A\s*侧", reason) or not re.search(r"\bB\b|B\s*侧", reason):
-        items.append(_item("reason_both_sides", "block", "理由里没有分别写到 A 和 B 两侧"))
-
-    items.extend(_ai_trace_items(reason))
-    items.extend(_style_items(reason, data.get("peer_openings") or {}))
-    if m := _ABS_PATH.search(reason):
-        items.append(_item("reason_abs_path", "block",
-                           f"理由里有绝对路径（{m.group(0)[:40]}），会把本机目录结构一起交出去"))
+    # 只看理由文本的那些规则由 gsb_rules 统一给，分析生成时自查用的是同一个函数
+    items.extend(_item(name, level, message) for name, level, message in
+                 gsb_rules.reason_checks(reason, verdict=verdict,
+                                         peer_openings=data.get("peer_openings") or {}))
 
     # ---- 理由提到的文件必须真实存在（G6）----
     known = set()
@@ -270,13 +166,7 @@ async def collect(task_id: int) -> dict:
             "user_prompt": task.user_prompt,
             "env_snapshot_sha": gsb_repo.snapshot_sha(task.env_snapshot),
             "harness_version": task.harness_version,
-            # 别的题的开头句式，用来发现几道题套同一个开场。已分析的题目本来就不多，
-            # 全取出来也就几条，不值得为此加索引或缓存
-            "peer_openings": {
-                other.task_no: gsb_rules.opening_signature((other.gsb or {}).get("reason", ""))
-                for other in db.query(Task).filter(Task.id != task_id,
-                                                   Task.analysis_status == ANALYSIS_DONE).all()
-            },
+            "peer_openings": gsb_analyzer.peer_openings(db, task_id),
             "sides": {},
         }
         task_no = task.task_no
