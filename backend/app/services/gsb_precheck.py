@@ -11,17 +11,31 @@ markdown，核验一路放行，可是没有人会这么说话。所以只能让
 少了这段基准，模型会把「机械化」理解成「太正式」，转头往里加语气词和口语，交回来
 的东西更不像评审意见。
 
+这一步不只是挑毛病，它直接改。模型交回来的是改好并收进篇幅的整段正文，校验通过就
+盖掉 gsb.reason，改前那一稿存进 reason_before。改成这样是因为只给意见的代价是实打实
+的：一道题挑出十条，人要逐条回正文里对位置再逐条替换，几十道题就是几百次手工替换，
+而这件事模型做得比人准。把关全压在 _vet_rewrite 和 local_defects 上——稿子只要篇幅
+出界、或者引入了原文没有的核验红项，就整份丢掉，宁可留着待改让人自己动手。
+
+判的东西有两层。措辞那层只能靠模型逐句读；篇幅和词表那层程序自己就数得出来
+（local_defects），不必花一次模型调用去问，而且模型对篇幅没有概念——一段六百字的
+理由它逐句读完觉得句句通顺就回 pass，可篇幅恰恰是这一步要压的。两层都干净才算通过。
+
 质检结论只对当时那一段话负责，所以要连着理由正文的指纹一起存。人在界面上又改了
 一稿，旧结论就不再代表这一稿，提交门禁得把它当成没质检过。指纹去掉空白再算——
-只动了换行和缩进不算改内容。
+只动了换行和缩进不算改内容。自动改写走的是同一套：换正文和换指纹在同一个事务里
+做完，否则中间那一瞬间是「新正文 + 旧指纹」，恰好会被 stale() 判成人又改过。
 
-这条流程不接受浏览器发起，入口只有 app.cli（见该模块头部说明）。原因不是怕误点，
-而是它得在人已经看过录屏、准备整批提交的那个时刻跑：跑早了理由还会改，跑完的结论
-当场就过期；摆个按钮在页面上只会让人一遍遍点它。
+发起的口子有三个：GSB 分析跑完之后自动接上一道（watchdog.run_quality_gate 之前，
+所以核验与平台质检看到的都是改过的稿子）、app.cli、以及页面上的批量质检。
+
+「一次点击烧一次模型调用」这件事没有消失，只是换了防法：run_batch 会先把已经有
+有效结论、正在跑、或者压根没有理由正文的题剔掉（skip_reasons），剩下的才真的发出去。
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -181,8 +195,15 @@ def build_prompt(reason: str, *, verdict: str = "", task_no: str = "") -> str:
 {listed}
 """.rstrip() if found else "")
 
-    return f"""你在给一份双跑对比的评审理由做最后一道文字质检。这段话马上要交给评审方，
-需要你判断它读起来像不像一个人写的，把不像的地方逐句挑出来并给出改法。
+    n = gsb_rules.visible_chars(reason)
+    lo, hi = gsb_rules.REASON_TARGET_MIN, gsb_rules.REASON_TARGET_MAX
+    cap = gsb_rules.REASON_SOFT_MAX_CHARS
+    cut = (f"这一段现在 {n} 字，超了，rewrite 要收到 {lo} 到 {hi} 字，也就是去掉大约 {n - hi} 字。"
+           if n > cap else
+           f"这一段现在 {n} 字，rewrite 保持在 {lo} 到 {hi} 字，不要写长。")
+
+    return f"""你在给一份双跑对比的评审理由做最后一道文字质检。这段话马上要交给评审方。
+你要做两件事：把不像人写的地方挑出来，并且直接交出改好之后的整段正文。
 
 【判断基准】
 {JUDGE_BASELINE}
@@ -190,6 +211,13 @@ def build_prompt(reason: str, *, verdict: str = "", task_no: str = "") -> str:
 【逐条规则】
 {TONE_RULES}
 {hint_block}
+
+【篇幅】
+{cut}
+这个篇幅只装得下三件事：做错了什么、导致了什么后果、对方哪里做得好。超出来的部分
+一定是写了别的东西，按这个顺序删：内部机制的分步推演、与结论无关的次要缺陷、
+过程叙事、两边做法相同的部分、证据的枚举明细。
+文件名、函数名、标识符不能丢，那是评审的落点。
 
 【待检正文】
 题号 {task_no or '—'}，结论是 {verdict or '未给出'}。
@@ -202,10 +230,18 @@ REASON>>>
    报不出原文片段的就不要报——人要拿它去正文里对位置。
 2. kind 只能从这十个里选：{'、'.join(KINDS)}。
 3. why 用一句话说清它为什么读起来不像人写的，不要复述规则编号。
-4. suggest 给改写后的句子，直接可以替换 quote，长度相近或更长都行，别压缩掉信息。
-5. 通篇确实没有这类问题就给 pass，issues 留空数组，不要为了凑数报「可以更自然」。
-6. 报了问题就必须给 rewrite：整段改写后的正文，只改被点出来的那几句，其余原样保留，
-   结论和事实一个字都不许变，篇幅和原文相当。没有问题时 rewrite 留空串。
+4. suggest 给改写后的句子，直接可以替换 quote。
+5. 措辞上确实没有问题、篇幅也在范围内，才给 pass，issues 留空、rewrite 留空串。
+   不要为了凑数报「可以更自然」。
+6. 只要报了问题，或者篇幅超了，就必须给 rewrite：改好并收到篇幅之内的整段正文。
+   rewrite 是要直接拿去替换原文的，所以它必须是一段可以照原样交付的完整理由，
+   不是片段、不是说明、不带任何前后缀。
+
+【rewrite 的硬约束】
+- 结论不许变。原文判 A 更好，rewrite 也必须落在 A 更好，反之亦然。
+- 不许新增原文里没有的事实。删可以，编不行。
+- 不要 markdown 记号、不要步号、不要绝对路径、不要表情符号。
+- 分成两到四个自然段，段之间空一行。
 
 【输出格式】
 只输出一个 JSON 对象，不要任何前后说明，不要代码块围栏：
@@ -215,7 +251,7 @@ REASON>>>
   "issues": [
     {{"quote": "原文片段", "kind": "类别", "why": "为什么不像人写的", "suggest": "改写后的句子"}}
   ],
-  "rewrite": "整段改写后的正文，没有问题时留空串"
+  "rewrite": "改好并收到篇幅之内的整段正文，没有问题时留空串"
 }}"""
 
 
@@ -244,18 +280,31 @@ def reason_digest(reason: str) -> str:
 def _vet_rewrite(rewrite: str, original: str, verdict: str) -> tuple[str, str]:
     """决定这份整段改写稿要不要留。返回 (采信的稿子, 丢弃原因)。
 
-    留一手是必须的：这段稿子会被人一键套进理由，而模型「顺手」把一千字压成两百字、
-    或者改写时带进一条 markdown 列表，都出现过。套进去之后核验才报红，人得再回头
-    重写一遍，比没有这份稿子更费事。
+    把关比以前更要紧了：这份稿子不再等人点一下才生效，质检跑完就直接盖掉理由正文。
+    所以凡是「套进去之后核验才报红」的稿子，必须在这里就拦下来。
 
-    两道关：篇幅不能明显缩水（信息被删掉了），也不能引入原文没有的核验红项。
+    以前拦的是缩水——按篇幅不能低于原文六成算。那条线现在是反的：篇幅目标从五百多
+    收到三四百之后，把一段六百字的理由压到三百五正是这一步要做的事，照旧规则会把
+    每一份合格的稿子都判成「删掉了论点」。改成按绝对下限判：低于写作规范的下限才算
+    删过头，中间随便压。
+
+    三道关：
+    - 篇幅落在规范的窗口里（下限防删过头，上限防它只换说法不压篇幅）；
+    - 不能引入原文没有的核验红项；
+    - 两侧都要还在。结论翻没翻这件事程序判不了，但一份只剩单侧的稿子必然是删过头了，
+      而这恰好是 reason_both_sides 这条红项管的事，上一条已经覆盖。
     """
     text = _clean(rewrite)
     if not text:
         return "", ""
-    n, m = gsb_rules.visible_chars(text), gsb_rules.visible_chars(original)
-    if m and n < m * 0.6:
-        return "", f"改写稿只有 {n} 字，原文 {m} 字，缩水太多，多半删掉了论点"
+    n = gsb_rules.visible_chars(text)
+    floor = (gsb_rules.MIN_SAME_REASON_CHARS if verdict == "Same"
+             else gsb_rules.MIN_REASON_CHARS)
+    if n < floor:
+        return "", f"改写稿只有 {n} 字，不足 {floor} 字，删过头了"
+    if n > gsb_rules.REASON_SOFT_MAX_CHARS:
+        return "", (f"改写稿 {n} 字，仍然超过 {gsb_rules.REASON_SOFT_MAX_CHARS} 字的上限，"
+                    f"只换了说法没有压篇幅")
     before = {name for name, level, _ in gsb_rules.reason_checks(original, verdict=verdict)
               if level == "block"}
     after = [msg for name, level, msg in gsb_rules.reason_checks(text, verdict=verdict)
@@ -263,6 +312,17 @@ def _vet_rewrite(rewrite: str, original: str, verdict: str) -> tuple[str, str]:
     if after:
         return "", f"改写稿引入了原文没有的红项：{'；'.join(after[:2])}"
     return text, ""
+
+
+def local_defects(reason: str, verdict: str = "") -> list[str]:
+    """本地规则能直接判出来的毛病。空表示这一段在规则层面是干净的。
+
+    这一层不是给模型兜底，而是给它定调：篇幅有没有超、词表里的说法还在不在，都是
+    程序数得出来的，不必花一次模型调用去问。质检的结论要把它算进去——模型说「读起来
+    没问题」但这段话还有六百字、还带着「题面」「这么看下来」，那就不算通过。
+    """
+    return [msg for name, level, msg in gsb_rules.reason_checks(reason, verdict=verdict)
+            if level == "block" or name in ("reason_too_long", "reason_wording")]
 
 
 def normalize(obj: dict, *, reason: str, verdict: str = "") -> dict:
@@ -294,13 +354,18 @@ def normalize(obj: dict, *, reason: str, verdict: str = "") -> dict:
 
     # 结论按 issues 定，不按模型自报的 verdict 定：它常常一边列出三条问题一边说
     # pass。反过来也有——说 revise 却一条都举不出来，那种就是没话说硬凑个结论。
-    passed = not issues
+    #
+    # 本地规则判出来的毛病也算进去。模型对篇幅没有概念，一段六百字的理由它逐句读完
+    # 觉得每句都通顺，就回一个 pass；而篇幅恰恰是这一步要压的东西。
+    defects = local_defects(reason, verdict)
+    passed = not issues and not defects
     rewrite, why_dropped = ("", "") if passed else _vet_rewrite(
         str(obj.get("rewrite") or ""), reason, verdict)
     return {
         "passed": passed,
         "summary": _clean(obj.get("summary"))[:300],
         "issues": issues,
+        "local_defects": defects,
         "quote_dropped": dropped,
         "rewrite": rewrite,
         "rewrite_dropped": why_dropped,
@@ -366,9 +431,15 @@ def sync_all() -> int:
 # ---------------- 提交门禁 ----------------
 
 def stale(task: Task) -> bool:
-    """质检之后理由又改过。"""
-    if task.precheck_status not in PRECHECK_OK:
-        return False
+    """质检之后理由又改过，这份结论不再代表现在这一稿。
+
+    不看质检走到哪一档，只看指纹对不对得上。提交门禁那边本来就先判过 PRECHECK_OK 才
+    问到这里，所以对它没有影响；而「该不该再跑一次」要的正是不分档的口径 —— 判了待改
+    的题也会被人改完理由，那一稿没问过模型，和放行之后又改过是同一回事。
+
+    没记过指纹的当没改过：那是建表之后补列留下的老行，拿空指纹当「改过」会让整批老题
+    一直显示结论过期。
+    """
     digest = (task.precheck or {}).get("reason_digest") or ""
     return bool(digest) and digest != reason_digest((task.gsb or {}).get("reason") or "")
 
@@ -407,23 +478,42 @@ def submittable(task: Task) -> bool:
 
 # ---------------- 跑一遍 ----------------
 
-def _save(task_id: int, status: str, report: dict) -> None:
+def _save(task_id: int, status: str, report: dict, *, reason: str = "") -> None:
+    """落库。给了 reason 就连理由正文一起换掉。
+
+    两件事必须在同一个事务里做完：换正文、把指纹改成新正文的。分两次写的话，中间
+    那一瞬间库里是「新正文 + 旧指纹」，而 stale() 正是拿这两样比的，这时候读一次就会
+    判成「质检之后理由又改过」，把刚放行的题挡在提交门外。
+    """
     with session() as db:
         task = db.get(Task, task_id)
         if task is None:
             return
+        if reason:
+            gsb = dict(task.gsb or {})
+            gsb["reason"] = reason
+            task.gsb = gsb
+            report = {**report, "reason_digest": reason_digest(reason),
+                      "reason_chars": gsb_rules.visible_chars(reason)}
         task.precheck_status = status
         task.precheck = report
         sync_stage(db, task)
     bus.publish("tasks", {"type": "task", "id": task_id})
 
 
-async def run_precheck(task_id: int) -> dict:
-    """对一道题跑提交前质检。只碰 precheck 那几个字段，理由本身一个字都不改。
+async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
+    """对一道题跑质检。默认直接把改好的正文写回理由。
 
-    不自动套用改写稿：改哪几句、要不要照它改，是人看完 issues 才能定的事。质检自动
-    改文字的话，人下次打开看到的理由已经不是他确认过的那一段，而差异藏在一段五六百
-    字的话里，翻不出来。
+    以前这里只挑毛病不动文字，理由是「人下次打开看到的不是他确认过的那一段」。那个
+    顾虑在流程改成分析完就自动跑之后不成立了：这时候还没有人确认过任何一稿，理由是
+    上一步刚生成的，质检是它的最后一道加工，不是对人工成果的改动。而只给意见不改的
+    代价是实打实的——一道题挑出十条，人要逐条回正文里对位置、逐条替换，六十道就是
+    六百次手工替换，这件事模型做得比人准。
+
+    改前的原文存进 reason_before，界面上要对比看得见。丢了这一份的话，自动改写就成了
+    一次不可追溯的覆盖。
+
+    apply=False 保留下来给「只想看看有什么问题」的场合，走的是同一次模型调用。
     """
     with session() as db:
         task = db.get(Task, task_id)
@@ -456,14 +546,41 @@ async def run_precheck(task_id: int) -> dict:
 
     report = {**base, **normalize(parsed, reason=reason, verdict=verdict),
               "model": r.model, "duration_s": round(time.time() - started)}
-    status = PRECHECK_PASS if report["passed"] else PRECHECK_FAIL
-    _save(task_id, status, report)
-    log.info("题 %s 提交前质检 %s，%d 处、%ds", task_no,
-             "通过" if report["passed"] else "有问题", len(report["issues"]), report["duration_s"])
-    return {"ok": True, "passed": report["passed"], "issues": len(report["issues"]),
-            "summary": report["summary"],
-            "message": ("质检通过" if report["passed"]
-                        else f"挑出 {len(report['issues'])} 处：{report['summary']}")}
+
+    # 有改写稿就直接落到理由上。改完之后本地规则要重新判一遍：模型偶尔只改了被点名的
+    # 那几句，篇幅或者别的说法还留着，那种稿子换上去只是把问题换了个位置，仍然算待改。
+    applied, new_reason = False, ""
+    if apply and report["rewrite"]:
+        left = local_defects(report["rewrite"], verdict)
+        if left:
+            report["apply_skipped"] = "；".join(left[:2])
+        else:
+            applied, new_reason = True, report["rewrite"]
+            report.update({
+                "applied": True,
+                "applied_at": utc_now().isoformat(),
+                "reason_before": reason,
+                "chars_before": gsb_rules.visible_chars(reason),
+                "local_defects": [],
+            })
+    # 改写已经落上去，这一稿在规则层面是干净的，就按通过记。留在待改上等于要人再去
+    # 确认一次一个已经改好的文本，而他手里并没有比这更该做的动作。
+    status = PRECHECK_PASS if (report["passed"] or applied) else PRECHECK_FAIL
+    _save(task_id, status, report, reason=new_reason)
+
+    n_issues = len(report["issues"])
+    if applied:
+        msg = (f"质检改好了 {n_issues} 处，理由已更新为 "
+               f"{gsb_rules.visible_chars(new_reason)} 字（原 {report['chars_before']} 字）")
+    elif report["passed"]:
+        msg = "质检通过"
+    else:
+        why = report.get("rewrite_dropped") or report.get("apply_skipped") or ""
+        msg = f"挑出 {n_issues} 处：{report['summary']}" + (f"（改写稿没采用：{why}）" if why else "")
+    log.info("题 %s 质检 %s", task_no, msg)
+    return {"ok": True, "passed": status == PRECHECK_PASS, "applied": applied,
+            "issues": n_issues, "summary": report["summary"], "message": msg,
+            "reason": new_reason or reason, "verdict": verdict}
 
 
 def confirm(task_id: int, note: str = "") -> dict:
@@ -512,13 +629,10 @@ def ready_ids() -> list[int]:
     with session() as db:
         out = []
         for task in db.query(Task).filter(Task.status.in_((ANALYZED, QC))).all():
-            if not screencast_ready(task) or not (task.gsb or {}).get("reason"):
-                continue
-            if task.precheck_status == PRECHECK_RUNNING:
-                continue
-            if task.precheck_status in PRECHECK_OK and not stale(task):
-                continue
-            out.append((task.task_no, task.id))
+            # 「该不该再跑一次」的口径只写在 skip_reason 里，这边只额外加录屏这一条：
+            # 两处各判一套的话，CLI 挑出来的题和页面勾出来的题会对不上。
+            if screencast_ready(task) and not skip_reason(task):
+                out.append((task.task_no, task.id))
         return [tid for _, tid in sorted(out)]
 
 
@@ -527,3 +641,134 @@ def submittable_ids() -> list[int]:
     with session() as db:
         return [t.id for t in db.query(Task).filter(Task.status == QC).all()
                 if submittable(t)]
+
+
+def skip_reason(task: Task) -> str:
+    """这道题为什么不用再跑一次质检。空串表示该跑。
+
+    剔除必须在发出去之前做，不能等 run_precheck 自己回绝：页面上一次勾一百多道，
+    里面多半有已经跑过的，照单发出去就是照单烧钱。ready_ids 判的是同一件事，
+    只是那边自己挑题、这边按人勾的那批来判，所以口径写在这里给两边共用。
+    """
+    if task.status not in SETTLING:
+        return f"状态 {task.status} 不用做提交前质检"
+    if task.precheck_status == PRECHECK_RUNNING:
+        return "质检正在跑"
+    if not ((task.gsb or {}).get("reason") or "").strip():
+        return "还没有理由正文，先跑 GSB 分析"
+    # 判了待改的也要挡。理由一个字没改就再问一遍，模型挑出来的还是那几处，这次调用纯属
+    # 白花 —— 一百多道题一个按钮发出去，这一条漏掉就是一百多次。改过理由（指纹对不上）
+    # 才放行，那才是真的换了一稿。
+    #
+    # ERROR 不在里面：那是质检自己没跑成（模型超时、账单被拒、输出解不开），重跑正是
+    # 该做的事，挡住它等于让人只能一道一道手点。
+    if task.precheck_status in (PRECHECK_PASS, PRECHECK_CONFIRMED, PRECHECK_FAIL) \
+            and not stale(task):
+        return "已有结论，理由没再改过"
+    return ""
+
+
+# ---------------- 批量质检：后台串行跑 ----------------
+# 页面上一次勾一百多道是常事，而一道题就是一次模型调用、一分半钟，整批下来好几个小时。
+# 同步接口撑不住这么长的连接（nginx 一小时就断开，人也不会守着页面），所以这里起一个
+# 后台任务：接口立刻返回，每道题跑完照常发 SSE 把那一行刷新，整批还剩多少看 job()。
+#
+# 串行和 batch_precheck 路由是同一个理由：并发发出去只会一起撞限流，而这一步不赶时间。
+
+_batch: asyncio.Task | None = None
+
+
+def _blank_job() -> dict:
+    return {"running": False, "total": 0, "done": 0, "passed": 0, "revise": 0, "failed": 0,
+            "current": "", "started_at": "", "finished_at": "", "stopping": False}
+
+
+_job: dict = _blank_job()
+
+
+def job() -> dict:
+    """整批质检的进度。挂在 /api/system/status 上，页面每次 SSE 刷新顺带拿到，
+    不必为这一个数字再开一条轮询。"""
+    return dict(_job)
+
+
+def batch_running() -> bool:
+    return bool(_batch) and not _batch.done()
+
+
+def start_batch(ids: list[int]) -> dict:
+    """把勾中的题排进后台质检，立刻返回。
+
+    同时只允许一批在跑：两批并行等于两条串行队列同时发模型调用，说好的不撞限流就没了，
+    而且 job() 那份进度也说不清是谁的。
+    """
+    if batch_running():
+        return {"ok": False, "message": f"已经有一批在质检（{_job['done']}/{_job['total']}），等它跑完或先停掉",
+                "started": 0, "skipped": []}
+
+    todo: list[tuple[int, str]] = []
+    skipped: list[dict] = []
+    with session() as db:
+        for tid in ids:
+            task = db.get(Task, tid)
+            if task is None:
+                skipped.append({"id": tid, "task_no": str(tid), "message": "题目不存在"})
+                continue
+            why = skip_reason(task)
+            if why:
+                skipped.append({"id": tid, "task_no": task.task_no, "message": why})
+            else:
+                todo.append((tid, task.task_no))
+
+    if not todo:
+        return {"ok": False, "message": "勾中的题都不用再跑质检", "started": 0, "skipped": skipped}
+
+    _job.update(_blank_job())
+    _job.update({"running": True, "total": len(todo), "started_at": utc_now().isoformat()})
+    global _batch
+    _batch = asyncio.create_task(_run_batch(todo), name="precheck-batch")
+    log.info("批量质检开跑：%d 道（跳过 %d 道）", len(todo), len(skipped))
+    return {"ok": True, "started": len(todo), "skipped": skipped,
+            "message": f"已排队质检 {len(todo)} 道"
+                       + (f"，跳过 {len(skipped)} 道" if skipped else "")}
+
+
+def stop_batch() -> dict:
+    """停在当前这道题之后。
+
+    不打断正在跑的那一道：模型调用已经发出去了，钱已经花掉，让它写完结果比半路
+    丢掉划算；而且中途取消会把题留在 RUNNING 上，下次谁也发不动它。
+    """
+    if not batch_running():
+        return {"ok": False, "message": "现在没有在跑的批量质检"}
+    _job["stopping"] = True
+    return {"ok": True, "message": f"跑完手上这道就停（已完成 {_job['done']}/{_job['total']}）"}
+
+
+async def _run_batch(items: list[tuple[int, str]]) -> None:
+    try:
+        for tid, task_no in items:
+            if _job["stopping"]:
+                log.info("批量质检被叫停，剩下 %d 道没跑", _job["total"] - _job["done"])
+                break
+            _job["current"] = task_no
+            try:
+                res = await run_precheck(tid)
+            except Exception as exc:  # noqa: BLE001
+                # 一道题炸了不能把整批带走：后面那些和它没关系，而这一道的原因
+                # 已经落在 precheck_status=ERROR 上，人在列表里看得见
+                log.exception("题 %s 质检抛异常：%s", task_no, exc)
+                _job["failed"] += 1
+            else:
+                if not res.get("ok"):
+                    _job["failed"] += 1
+                elif res.get("passed"):
+                    _job["passed"] += 1
+                else:
+                    _job["revise"] += 1
+            _job["done"] += 1
+    finally:
+        _job.update({"running": False, "current": "", "stopping": False,
+                     "finished_at": utc_now().isoformat()})
+        log.info("批量质检收工：%d/%d 跑完 · 通过 %d · 待改 %d · 没跑成 %d",
+                 _job["done"], _job["total"], _job["passed"], _job["revise"], _job["failed"])

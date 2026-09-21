@@ -151,10 +151,27 @@ def test_vet_rewrite_keeps_a_sound_draft():
     assert text and not why
 
 
-def test_vet_rewrite_drops_a_shrunken_draft():
-    """模型「顺手」把一千字压成两百字发生过。套进去之后论点没了，人得整段重写。"""
+def test_vet_rewrite_drops_a_draft_that_cut_too_deep():
+    """压短是这一步要做的事，压到没有论点不是。按绝对下限判，不按占原文几成判。"""
     text, why = gp._vet_rewrite("A 更好。", GOOD, "A")
-    assert text == "" and "缩水" in why
+    assert text == "" and "删过头" in why
+
+
+def test_vet_rewrite_keeps_a_draft_that_halves_the_length():
+    """篇幅目标收到三四百之后，把一段长理由压掉一半正是合格的改法，不能再当缩水拦下。"""
+    half = ("A 侧把超限判定放在解析入口，越界时返回的错误里带着是步数超了还是深度超了。"
+            "B 侧只回了一句解析失败，调用方拿不到可以分辨的信息。所以 A 更好。")
+    assert gp.gsb_rules.visible_chars(half) < gp.gsb_rules.visible_chars(GOOD) * 0.6
+    text, why = gp._vet_rewrite(half, GOOD, "A")
+    assert text and not why
+
+
+def test_vet_rewrite_drops_a_draft_that_is_still_too_long():
+    """只换说法不压篇幅的稿子换上去没有意义，问题只是挪了个位置。"""
+    long_draft = GOOD * 4
+    assert gp.gsb_rules.visible_chars(long_draft) > gp.gsb_rules.REASON_SOFT_MAX_CHARS
+    text, why = gp._vet_rewrite(long_draft, GOOD, "A")
+    assert text == "" and "上限" in why
 
 
 def test_vet_rewrite_drops_a_draft_that_adds_a_block():
@@ -197,8 +214,26 @@ def test_stale_is_false_when_reason_untouched(qc_task):
 
 
 def test_stale_is_false_before_any_pass(qc_task):
-    """没放行的题谈不上过期，那一档要说的是「还没质检」。"""
+    """没质检过就没有指纹，谈不上过期，那一档要说的是「还没质检」。"""
     assert gp.stale(_task(qc_task)) is False
+
+
+def test_stale_also_covers_a_fail_whose_reason_got_fixed(qc_task):
+    """判了待改的题被人改完理由，那一稿同样没问过模型。
+
+    stale 不分质检走到哪一档，因为「该不该再跑一次」要的就是不分档的口径；
+    提交门禁那边先判过 PRECHECK_OK 才问到这里，不受影响。
+    """
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, qc_task)
+        t.precheck_status = m.PRECHECK_FAIL
+        t.precheck = {"passed": False, "reason_digest": gp.reason_digest(GOOD)}
+        t.gsb = {**t.gsb, "reason": GOOD + "改了一句。"}
+        assert gp.stale(t) is True
+        # 门禁那句话还是「改掉并确认」，没被这一改带偏
+        assert "确认" in gp.submit_block(t)
 
 
 # ---------------- 阶段投影 ----------------
@@ -350,13 +385,71 @@ def test_run_precheck_records_issues(qc_task, monkeypatch):
     assert t.precheck["issues"][0]["suggest"] == "两边对问题的定位是一致的"
 
 
-def test_run_precheck_never_touches_the_reason(qc_task, monkeypatch):
-    """质检只报问题、不改文字：自动改的话，人下次打开看到的已经不是他确认过的那一段，
-    而差异藏在几百字里翻不出来。"""
-    _stub(monkeypatch, text=_report(passed=False, rewrite="整段换掉的稿子" * 40,
+# 一份合格的改写稿：写到了两侧、落在篇幅窗口里、词表和核验都不命中
+FIXED = ("A 侧把超限判定放在解析入口，越界时返回的错误里写明是步数超了还是深度超了，"
+         "与题目要求一致。B 侧只返回一句解析失败，调用方无法分辨是哪一种越界，"
+         "只能回到源码里再读一遍。A 侧另外补了两种越界各自的用例，B 侧没有。"
+         "所以 A 更好。")
+
+
+def test_run_precheck_applies_the_rewrite(qc_task, monkeypatch):
+    """质检不再只报问题：改好的稿子直接盖掉理由正文，人不必逐条回正文里替换。"""
+    _stub(monkeypatch, text=_report(passed=False, rewrite=FIXED,
+                                    issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]))
+    r = asyncio.run(gp.run_precheck(qc_task))
+    task = _task(qc_task)
+    assert task.gsb["reason"] == FIXED
+    assert r["applied"] and r["reason"] == FIXED
+    # 改前那一稿要留着，否则自动改写就成了一次不可追溯的覆盖
+    assert task.precheck["reason_before"] == GOOD
+
+
+def test_applying_marks_it_passed_and_not_stale(qc_task, monkeypatch):
+    """改写已经落上去，这一稿在规则层面就是干净的，不该再要人确认一次。
+    指纹也必须跟着换，否则提交门禁会把刚改好的这一稿判成「质检之后又改过」。"""
+    _stub(monkeypatch, text=_report(passed=False, rewrite=FIXED,
                                     issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]))
     asyncio.run(gp.run_precheck(qc_task))
+    task = _task(qc_task)
+    assert task.precheck_status == m.PRECHECK_PASS
+    assert not gp.stale(task)
+    assert gp.submit_block(task) == ""
+
+
+def test_run_precheck_keeps_the_reason_when_the_rewrite_is_unusable(qc_task, monkeypatch):
+    """稿子只要会把理由改坏就整份丢掉，宁可留着待改让人自己动手。"""
+    _stub(monkeypatch, text=_report(passed=False, rewrite=FIXED + "以上是我的分析。",
+                                    issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]))
+    asyncio.run(gp.run_precheck(qc_task))
+    task = _task(qc_task)
+    assert task.gsb["reason"] == GOOD
+    assert task.precheck_status == m.PRECHECK_FAIL
+    assert "红项" in task.precheck["rewrite_dropped"]
+
+
+def test_run_precheck_can_report_without_applying(qc_task, monkeypatch):
+    """apply=False 留给「只想看看有什么问题」的场合，走的是同一次模型调用。"""
+    _stub(monkeypatch, text=_report(passed=False, rewrite=FIXED,
+                                    issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]))
+    r = asyncio.run(gp.run_precheck(qc_task, apply=False))
     assert _task(qc_task).gsb["reason"] == GOOD
+    assert not r["applied"] and r["issues"] == 1
+
+
+def test_a_reason_that_only_breaks_length_is_not_a_pass(qc_task, monkeypatch):
+    """模型对篇幅没有概念，一段超长的理由它逐句读完会回 pass；而篇幅正是这一步要压的。"""
+    from app.db import session
+
+    long_reason = GOOD * 4
+    assert gp.gsb_rules.visible_chars(long_reason) > gp.gsb_rules.REASON_SOFT_MAX_CHARS
+    with session() as db:
+        task = db.get(m.Task, qc_task)
+        task.gsb = {**task.gsb, "reason": long_reason}
+    _stub(monkeypatch, text=_report(passed=True, rewrite=FIXED))
+    asyncio.run(gp.run_precheck(qc_task))
+    task = _task(qc_task)
+    assert task.gsb["reason"] == FIXED
+    assert task.precheck_status == m.PRECHECK_PASS
 
 
 def test_run_precheck_marks_error_when_model_fails(qc_task, monkeypatch):
@@ -508,3 +601,192 @@ def test_submittable_ids_only_lists_cleared_tasks(qc_task):
         t.precheck_status = m.PRECHECK_CONFIRMED
         t.precheck = {"reason_digest": gp.reason_digest(GOOD)}
     assert gp.submittable_ids() == [qc_task]
+
+
+# ---------------- 批量质检 ----------------
+# 页面上一次勾一百多道，一道就是一次模型调用。这一节守的是「发出去之前先剔干净」——
+# 漏一道就是白烧一次调用，而人是看不出来的：结果长得和上一次一模一样。
+
+@pytest.fixture()
+def screencast_task(tmp_db):
+    """一道结论已出、还没录屏的题。质检现在赶在录屏之前跑，这就是那时候的样子。"""
+    from app.db import session
+
+    with session() as db:
+        t = m.Task(task_no="12", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
+        t.gsb = {"verdict": "A", "reason": GOOD}
+        db.add(t)
+        db.flush()
+        return t.id
+
+
+def test_skip_reason_lets_an_unchecked_task_through(screencast_task):
+    """没录屏不是跳过的理由：质检要的是理由正文，跟录屏没关系。"""
+    assert gp.skip_reason(_task(screencast_task)) == ""
+
+
+def test_skip_reason_turns_down_a_fresh_pass(screencast_task):
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, screencast_task)
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
+    assert "没再改过" in gp.skip_reason(_task(screencast_task))
+
+
+def test_skip_reason_lets_a_stale_pass_back_in(screencast_task):
+    """理由在质检之后又改过，那份结论不代表现在这一稿，该重跑。"""
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, screencast_task)
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
+        t.gsb = {**t.gsb, "reason": GOOD + "补一句。"}
+    assert gp.skip_reason(_task(screencast_task)) == ""
+
+
+def test_skip_reason_turns_down_an_unfixed_fail(screencast_task):
+    """判了待改、理由却一个字没改，再问一遍挑出来的还是那几处。
+
+    一百多道题一个按钮发出去，这一条漏掉就是一百多次白花的调用，而人看不出来——
+    结果和上一次长得一模一样。
+    """
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, screencast_task)
+        t.precheck_status = m.PRECHECK_FAIL
+        t.precheck = {"passed": False, "reason_digest": gp.reason_digest(GOOD)}
+    assert "没再改过" in gp.skip_reason(_task(screencast_task))
+
+
+def test_skip_reason_lets_a_fixed_fail_back_in(screencast_task):
+    """按意见改完了，这一稿还没问过模型，该再跑一次。"""
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, screencast_task)
+        t.precheck_status = m.PRECHECK_FAIL
+        t.precheck = {"passed": False, "reason_digest": gp.reason_digest(GOOD)}
+        t.gsb = {**t.gsb, "reason": GOOD.replace("两边对问题的定位一致", "两边对问题的定位是一致的")}
+    assert gp.skip_reason(_task(screencast_task)) == ""
+
+
+def test_skip_reason_always_lets_an_error_retry(screencast_task):
+    """ERROR 是质检自己没跑成（账单被拒、模型超时），重跑正是该做的事。"""
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, screencast_task)
+        t.precheck_status = m.PRECHECK_ERROR
+        t.precheck = {"error": "账号有未付账单", "reason_digest": gp.reason_digest(GOOD)}
+    assert gp.skip_reason(_task(screencast_task)) == ""
+
+
+def test_skip_reason_turns_down_a_task_still_running(screencast_task):
+    from app.db import session
+
+    with session() as db:
+        db.get(m.Task, screencast_task).precheck_status = m.PRECHECK_RUNNING
+    assert "正在跑" in gp.skip_reason(_task(screencast_task))
+
+
+def test_skip_reason_turns_down_a_task_without_a_reason(tmp_db):
+    from app.db import session
+
+    with session() as db:
+        t = m.Task(task_no="13", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
+        db.add(t)
+        db.flush()
+        tid = t.id
+    assert "理由正文" in gp.skip_reason(_task(tid))
+
+
+def test_start_batch_reports_what_it_refused_to_send(screencast_task, monkeypatch):
+    """一批里挡下几道，人必须当场知道是哪几道 —— 否则他以为整批都发了，
+    回头对不上数才发现。"""
+    from app.db import session
+
+    with session() as db:
+        done = m.Task(task_no="14", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
+        done.gsb = {"verdict": "A", "reason": GOOD}
+        done.precheck_status = m.PRECHECK_PASS
+        done.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
+        db.add(done)
+        db.flush()
+        done_id = done.id
+
+    _stub(monkeypatch, text=_report(passed=True))
+
+    async def go():
+        res = gp.start_batch([screencast_task, done_id])
+        await gp._batch
+        return res
+
+    res = asyncio.run(go())
+    assert res["started"] == 1
+    assert [s["task_no"] for s in res["skipped"]] == ["14"]
+    # 挡下的那道一次调用都没花：结论还是原来那份
+    assert _task(done_id).precheck["passed"] is True
+    assert _task(screencast_task).precheck_status == m.PRECHECK_PASS
+
+
+def test_start_batch_refuses_when_nothing_is_worth_running(screencast_task):
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, screencast_task)
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
+    res = gp.start_batch([screencast_task])
+    assert res["ok"] is False and res["started"] == 0
+    assert gp.batch_running() is False
+
+
+def test_batch_keeps_going_after_one_task_blows_up(screencast_task, monkeypatch):
+    """一道炸了不能把整批带走：后面那些和它没关系。"""
+    from app.db import session
+
+    with session() as db:
+        second = m.Task(task_no="15", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
+        second.gsb = {"verdict": "A", "reason": GOOD}
+        db.add(second)
+        db.flush()
+        second_id = second.id
+
+    calls: list[str] = []
+
+    async def ask(prompt, **kw):
+        calls.append(kw.get("purpose", ""))
+        if len(calls) == 1:
+            raise LlmError("第一道超时了", retryable=True)
+        return LlmResult(text=_report(passed=True), model="stub-model")
+
+    monkeypatch.setattr(gp.llm, "ask", ask)
+
+    async def go():
+        gp.start_batch([screencast_task, second_id])
+        await gp._batch
+
+    asyncio.run(go())
+    assert len(calls) == 2
+    assert gp.job()["failed"] == 1 and gp.job()["passed"] == 1
+    assert _task(screencast_task).precheck_status == m.PRECHECK_ERROR
+    assert _task(second_id).precheck_status == m.PRECHECK_PASS
+
+
+def test_job_tallies_the_batch_and_clears_running(screencast_task, monkeypatch):
+    _stub(monkeypatch, text=_report(passed=False,
+                                    issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]))
+
+    async def go():
+        gp.start_batch([screencast_task])
+        await gp._batch
+
+    asyncio.run(go())
+    job = gp.job()
+    assert job["running"] is False and job["done"] == 1 and job["total"] == 1
+    assert job["revise"] == 1 and job["passed"] == 0
+    assert job["current"] == "" and job["finished_at"]

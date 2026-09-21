@@ -147,6 +147,9 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         # 提示写什么都照它来，免得前端自己凑一套条件，和后端回绝的理由对不上。
         "precheck_status": t.precheck_status,
         "precheck_issues": len(precheck.get("issues") or []),
+        # 质检会直接改写理由正文。改过的题在列表上要看得出来，否则人翻到详情页才发现
+        # 现在这段话不是分析当时那一段，而改前那一稿存在 precheck.reason_before 里。
+        "precheck_applied": bool(precheck.get("applied")),
         "precheck_summary": precheck.get("summary") or precheck.get("error") or "",
         "precheck_stale": gsb_precheck.stale(t),
         "precheck_block": gsb_precheck.submit_block(t),

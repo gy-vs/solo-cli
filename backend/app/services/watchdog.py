@@ -534,13 +534,24 @@ async def _advance_pair(task_id: int) -> dict:
 
 
 async def run_quality_gate(task_id: int) -> dict:
-    """本地核验 + solo-qa 的 GSB 质检。
+    """理由质检 + 本地核验 + solo-qa 的 GSB 质检。
 
-    两道都要过，拦的东西不一样：本地核验只看确定性的东西（长度、AI 痕迹、证据能不能
-    在材料里定位、两侧材料齐不齐），快且不花钱；solo-qa 那道是平台自己的口径，会调模型
-    判 AI 化与理由质量，慢但结论权威。先跑本地的，红项已经拦下来就不必再去花那次模型钱。
+    三道拦的东西不一样：理由质检把措辞改顺、篇幅压到规范之内，会调模型并且直接改写
+    理由正文；本地核验只看确定性的东西（长度、AI 痕迹、证据能不能在材料里定位、两侧
+    材料齐不齐），快且不花钱；solo-qa 那道是平台自己的口径，慢但结论权威。
+
+    顺序是定死的：理由质检必须排在最前面。它会换掉理由正文，排在后面的话，核验与平台
+    质检读到的是改之前那一稿，而最终提交上去的是改之后的——两边看的不是同一段话，
+    核验过了也说明不了提交的那一份合规。
+
+    理由质检没跑成不挡后面两道。它是让文字更像人写的，不是判这道题成不成立；模型欠费
+    或者超时的时候把整条闸门停掉，等于一道题都过不去。
     """
-    from app.services import gsb_verifier, qa_bridge
+    from app.services import gsb_precheck, gsb_verifier, qa_bridge
+
+    pre = await gsb_precheck.run_precheck(task_id)
+    if not pre.get("ok"):
+        log.warning("题 %d 理由质检没跑成，继续走核验：%s", task_id, pre.get("message", ""))
 
     report = await gsb_verifier.run_verify(task_id)
     if report.get("overall") == "block":
@@ -559,7 +570,7 @@ async def run_quality_gate(task_id: int) -> dict:
             task.gsb_qc = qc
             task.auto_error = _qc_note(qc)[:2000]
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return qc
+    return {**qc, "precheck": pre}
 
 
 def _qc_note(qc: dict) -> str:

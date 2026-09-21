@@ -1663,3 +1663,78 @@ def test_a_side_flagged_abnormal_is_blocked_too(task_with_runs, monkeypatch):
     assert r["ok"] is False
     assert "A 侧" in r["message"]
     assert pushed == []
+
+
+# ---------------- 质检闸门的次序 ----------------
+
+def test_quality_gate_prechecks_before_verifying(tmp_db, monkeypatch):
+    """理由质检会换掉理由正文，所以必须排在核验与平台质检之前。
+
+    排在后面的话，核验读到的是改之前那一稿，而提交上去的是改之后的 —— 两边看的不是
+    同一段话，核验过了也说明不了提交的那一份合规。
+    """
+    from app.db import session
+    from app.services import gsb_precheck, gsb_verifier, qa_bridge
+
+    with session() as db:
+        t = m.Task(task_no="07", prompt_hash="h", user_prompt="p", status=m.ANALYZED)
+        t.gsb = {"verdict": "A", "reason": "A 侧改对了，B 侧没有。"}
+        db.add(t)
+        db.flush()
+        tid = t.id
+
+    order: list[str] = []
+
+    async def fake_precheck(task_id, **kw):
+        order.append("precheck")
+        return {"ok": True, "applied": True}
+
+    async def fake_verify(task_id):
+        order.append("verify")
+        return {"overall": "ok", "items": []}
+
+    async def fake_qc(task_id):
+        order.append("qc")
+        return {"ok": True, "passed": True, "summary": ""}
+
+    monkeypatch.setattr(gsb_precheck, "run_precheck", fake_precheck)
+    monkeypatch.setattr(gsb_verifier, "run_verify", fake_verify)
+    monkeypatch.setattr(qa_bridge, "gsb_qc", fake_qc)
+
+    out = asyncio.run(wd.run_quality_gate(tid))
+    assert order == ["precheck", "verify", "qc"]
+    assert out["precheck"]["applied"]
+
+
+def test_quality_gate_goes_on_when_precheck_fails(tmp_db, monkeypatch):
+    """理由质检是让文字更像人写的，不是判这道题成不成立。模型欠费或超时的时候
+    把整条闸门停掉，等于一道题都过不去。"""
+    from app.db import session
+    from app.services import gsb_precheck, gsb_verifier, qa_bridge
+
+    with session() as db:
+        t = m.Task(task_no="07", prompt_hash="h", user_prompt="p", status=m.ANALYZED)
+        t.gsb = {"verdict": "A", "reason": "A 侧改对了，B 侧没有。"}
+        db.add(t)
+        db.flush()
+        tid = t.id
+
+    reached = []
+
+    async def dead_precheck(task_id, **kw):
+        return {"ok": False, "message": "模型请求被拒"}
+
+    async def fake_verify(task_id):
+        reached.append("verify")
+        return {"overall": "ok", "items": []}
+
+    async def fake_qc(task_id):
+        reached.append("qc")
+        return {"ok": True, "passed": True, "summary": ""}
+
+    monkeypatch.setattr(gsb_precheck, "run_precheck", dead_precheck)
+    monkeypatch.setattr(gsb_verifier, "run_verify", fake_verify)
+    monkeypatch.setattr(qa_bridge, "gsb_qc", fake_qc)
+
+    asyncio.run(wd.run_quality_gate(tid))
+    assert reached == ["verify", "qc"]
