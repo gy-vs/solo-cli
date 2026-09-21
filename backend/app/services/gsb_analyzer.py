@@ -463,14 +463,18 @@ def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
 
     篇幅超了就把要砍掉多少字算出来一起给。只说「超过上限」它往往只削掉一两句，
     给出确切的字数缺口才会真的去掉一整个次要论点。
+
+    缺口按窗口中位算，不按上限算。照上限要它会压到刚好擦线，实测一段九百多字的
+    改三轮仍停在六百三十字，离上限只差十几个字；瞄中位留出余量，略微收不够也还
+    落在区间里。
     """
     listed = "\n".join(f"{i}. {d}" for i, d in enumerate(defects, 1))
     n = gsb_rules.visible_chars(reason)
     if n > gsb_rules.REASON_SOFT_MAX_CHARS:
+        aim = (gsb_rules.REASON_TARGET_MIN + gsb_rules.REASON_TARGET_MAX) // 2
         listed += (f"\n\n这一段现在 {n} 字，要收到 {gsb_rules.REASON_TARGET_MIN} 到 "
-                   f"{gsb_rules.REASON_TARGET_MAX} 字，也就是至少去掉 "
-                   f"{n - gsb_rules.REASON_TARGET_MAX} 字。删掉整个次要论点，"
-                   f"不要靠压缩句子硬凑。")
+                   f"{gsb_rules.REASON_TARGET_MAX} 字，最好落在 {aim} 字左右，也就是去掉大约 "
+                   f"{n - aim} 字。删掉整个次要论点，不要靠压缩句子硬凑。")
     return f"""下面这段是一份双跑对比的评审理由，它违反了写作规范，需要你改写。
 
 【当前正文】

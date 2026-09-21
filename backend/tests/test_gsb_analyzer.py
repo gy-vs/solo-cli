@@ -388,14 +388,15 @@ def test_polish_reason_refuses_to_trade_too_long_for_too_short(monkeypatch):
     assert left
 
 
-def test_polish_reason_prompt_says_how_many_characters_to_cut(monkeypatch):
-    """只说「超过上限」模型往往只削掉一两句，给出确切缺口才会去掉整个次要论点。"""
+def test_polish_reason_prompt_aims_at_the_middle_of_the_window(monkeypatch):
+    """按上限要它会压到刚好擦线，瞄中位才留出余量。"""
     calls: list[str] = []
     monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON], calls))
     long = CLEAN_REASON * 6
     asyncio.run(ga.polish_reason(long, verdict="A"))
-    over = ga.gsb_rules.visible_chars(long) - ga.gsb_rules.REASON_TARGET_MAX
-    assert f"至少去掉 {over} 字" in calls[0]
+    aim = (ga.gsb_rules.REASON_TARGET_MIN + ga.gsb_rules.REASON_TARGET_MAX) // 2
+    assert f"落在 {aim} 字左右" in calls[0]
+    assert f"去掉大约 {ga.gsb_rules.visible_chars(long) - aim} 字" in calls[0]
 
 
 def test_polish_reason_keeps_the_better_version_when_a_rewrite_is_worse(monkeypatch):
