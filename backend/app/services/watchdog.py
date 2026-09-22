@@ -548,26 +548,31 @@ async def _advance_pair(task_id: int) -> dict:
 
 
 async def run_quality_gate(task_id: int) -> dict:
-    """事实核验 + 措辞质检 + 本地核验 + solo-qa 的 GSB 质检。
+    """事实核验 + 措辞质检 + 本地核验。
 
-    四道拦的东西各不相同，一道都不能省：
+    三道拦的东西各不相同，一道都不能省：
     - 事实核验：理由里关于执行结果的话和轨迹对不对得上。会调模型，对不上的直接订正。
     - 措辞质检：读起来像不像一个人写的，篇幅压到规范之内。会调模型，直接改写正文。
     - 本地核验：确定性的东西（长度、AI 痕迹、证据能不能定位、两侧材料齐不齐），
       快且不花钱。
-    - solo-qa 质检：平台自己的口径，慢但结论权威。
+
+    平台那道（solo-qa 的 GSB 质检）不在这条链上。它是把结论送进 solo-qa 的容器里
+    按平台口径再判一遍，而平台自己收到提交之后本来就会判，我们这边先跑一遍既慢
+    又是重复劳动 —— 每道题要起一个 solo2-backend 容器，几百兆内存，跑几分钟，
+    换回来的结论和提交之后平台给的是同一份。代码留着（qa_bridge.gsb_qc），
+    想临时对一下口径可以手动调，但自动流程不走它。
 
     顺序是定死的，前两道尤其不能换。两道都会整段换掉理由正文，而事实必须先定下来：
     先把话说对，再把话说顺。反过来的话，措辞那一版打磨的是一段事实还错着的话，
     事实核验接着又把它改一遍，前一次的打磨白做，而且改完的那一段没人再看措辞。
 
-    后两道也必须排在前两道之后：它们读到的必须是最终要提交的那一段，否则核验过了
-    也说明不了提交的那一份合规。
+    本地核验排在最后：它读到的必须是最终要提交的那一段，否则核验过了也说明不了
+    提交的那一份合规。
 
-    前两道没跑成都不挡后面。模型欠费或者超时的时候把整条闸门停掉，等于一道题都过不去；
-    过不了的那一档会留在 ERROR 上，看门狗看到账单恢复会自己回来补。
+    前两道没跑成都不挡本地核验。模型欠费或者超时的时候把整条闸门停掉，等于一道题都
+    过不去；过不了的那一档会留在 ERROR 上，看门狗看到账单恢复会自己回来补。
     """
-    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier, qa_bridge
+    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier
 
     fact = await gsb_factcheck.run_factcheck(task_id)
     if not fact.get("ok"):
@@ -580,42 +585,16 @@ async def run_quality_gate(task_id: int) -> dict:
         log.warning("题 %d 措辞质检没跑成，继续走核验：%s", task_id, pre.get("message", ""))
 
     report = await gsb_verifier.run_verify(task_id)
-    if report.get("overall") == "block":
-        blocked = [i["message"] for i in report.get("items", []) if i["level"] == "block"]
-        with session() as db:
-            task = db.get(Task, task_id)
-            if task is not None:
-                task.auto_error = ("本地核验有红项，未送质检：" + "；".join(blocked[:4]))[:2000]
-        bus.publish("tasks", {"type": "task", "id": task_id})
-        return {"ok": False, "stage": "verify", "blocked": blocked}
-
-    qc = await qa_bridge.gsb_qc(task_id)
+    blocked = [i["message"] for i in report.get("items", []) if i["level"] == "block"]
     with session() as db:
         task = db.get(Task, task_id)
         if task is not None:
-            task.gsb_qc = qc
-            task.auto_error = _qc_note(qc)[:2000]
+            task.auto_error = ("本地核验有红项：" + "；".join(blocked[:4]))[:2000] if blocked else ""
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return {**qc, "precheck": pre, "factcheck": fact}
-
-
-def _qc_note(qc: dict) -> str:
-    """把质检结论折成一句给人看的话。通过时返回空串，清掉上一轮的报错。
-
-    INCOMPLETE 单独一档：它是平台侧没跑成（查重池连不上、GitHub Token 缺失、
-    轨迹取不到），不是这道题有问题。混进「被打回」里会让人跑去改理由，
-    而实际上该做的是过会儿再跑一次。
-    """
-    if not qc.get("ok"):
-        return f"质检未完成：{qc.get('error', '')}"
-    if qc.get("passed"):
-        return ""
-    summary = qc.get("summary", "")
-    if qc.get("incomplete"):
-        return f"质检未跑完，稍后重跑：{summary}"
-    rule = qc.get("hit_rule_label") or qc.get("hit_rule") or ""
-    head = f"质检{'废弃' if qc.get('conclusion') == 'DISCARD' else '打回'}"
-    return f"{head}（{rule}）：{summary}" if rule else f"{head}：{summary}"
+    if blocked:
+        return {"ok": False, "stage": "verify", "blocked": blocked,
+                "precheck": pre, "factcheck": fact}
+    return {"ok": True, "verify": report, "precheck": pre, "factcheck": fact}
 
 
 # ---------------- 巡检主体 ----------------

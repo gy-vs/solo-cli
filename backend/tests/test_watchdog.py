@@ -1179,47 +1179,6 @@ def test_advance_pair_keeps_container_when_trace_missing(task_with_runs, monkeyp
     assert removed == ["solo-cc-07-B"]
 
 
-# ---------------- 质检结论折成给人看的一句话 ----------------
-
-def test_qc_note_is_empty_when_passed():
-    """通过时要把上一轮的报错清掉，不能留着旧结论误导人。"""
-    assert wd._qc_note({"ok": True, "passed": True, "summary": "全部通过"}) == ""
-
-
-def test_qc_note_separates_platform_failure_from_rejection():
-    """质检压根没跑成，和这道题被打回，是两件事。"""
-    note = wd._qc_note({"ok": False, "error": "查重池连不上"})
-    assert "质检未完成" in note and "查重池连不上" in note
-
-
-def test_incomplete_conclusion_tells_people_to_rerun_not_to_fix():
-    """INCOMPLETE 是平台侧没跑完，让人去改理由就是白费工。"""
-    note = wd._qc_note({
-        "ok": True, "passed": False, "incomplete": True,
-        "conclusion": "INCOMPLETE", "summary": "分支与起跑点未能核验",
-    })
-    assert "重跑" in note
-    assert "打回" not in note and "废弃" not in note
-
-
-def test_qc_note_carries_the_rule_that_was_hit():
-    note = wd._qc_note({
-        "ok": True, "passed": False, "conclusion": "REJECT",
-        "hit_rule": "T4", "hit_rule_label": "轨迹规则 T4 · 上传了多份轨迹文件",
-        "summary": "A 侧传了 2 个文件",
-    })
-    assert "打回" in note and "T4" in note and "A 侧传了 2 个文件" in note
-
-
-def test_discard_and_reject_are_worded_differently():
-    """废弃是这条数据作废，打回是改完再交，两者的下一步动作不同。"""
-    common = {"ok": True, "passed": False, "summary": "题面与已有数据重复"}
-    discard = wd._qc_note({**common, "conclusion": "DISCARD"})
-    reject = wd._qc_note({**common, "conclusion": "REJECT"})
-    assert "废弃" in discard
-    assert "打回" in reject
-
-
 # ---------------- 容器没了 ≠ 人按了停止 ----------------
 
 def test_vanished_container_with_trace_counts_as_finished():
@@ -1668,16 +1627,16 @@ def test_a_side_flagged_abnormal_is_blocked_too(task_with_runs, monkeypatch):
 # ---------------- 质检闸门的次序 ----------------
 
 def test_quality_gate_checks_facts_then_wording_then_verifies(tmp_db, monkeypatch):
-    """两道质检都会整段换掉理由，所以都必须排在核验与平台质检之前，而且事实在前。
+    """两道模型质检都会整段换掉理由，所以都必须排在本地核验之前，而且事实在前。
 
     事实必须先定下来：先把话说对，再把话说顺。反过来的话，措辞那一版打磨的是一段
     事实还错着的话，事实核验接着又把它改一遍，前一次打磨白做，改完也没人再看措辞。
 
-    后两道排在最后，是因为它们读到的必须是最终要提交的那一段 —— 读的要是改之前那一稿，
+    本地核验排在最后，是因为它读到的必须是最终要提交的那一段 —— 读的要是改之前那一稿，
     核验过了也说明不了提交的那一份合规。
     """
     from app.db import session
-    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier, qa_bridge
+    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier
 
     with session() as db:
         t = m.Task(task_no="07", prompt_hash="h", user_prompt="p", status=m.ANALYZED)
@@ -1700,18 +1659,43 @@ def test_quality_gate_checks_facts_then_wording_then_verifies(tmp_db, monkeypatc
         order.append("verify")
         return {"overall": "ok", "items": []}
 
-    async def fake_qc(task_id):
-        order.append("qc")
-        return {"ok": True, "passed": True, "summary": ""}
-
     monkeypatch.setattr(gsb_factcheck, "run_factcheck", fake_factcheck)
     monkeypatch.setattr(gsb_precheck, "run_precheck", fake_precheck)
     monkeypatch.setattr(gsb_verifier, "run_verify", fake_verify)
-    monkeypatch.setattr(qa_bridge, "gsb_qc", fake_qc)
 
     out = asyncio.run(wd.run_quality_gate(tid))
-    assert order == ["factcheck", "precheck", "verify", "qc"]
-    assert out["precheck"]["applied"] and out["factcheck"]["applied"]
+    assert order == ["factcheck", "precheck", "verify"]
+    assert out["ok"] and out["precheck"]["applied"] and out["factcheck"]["applied"]
+
+
+def test_quality_gate_does_not_touch_the_platform_checker(tmp_db, monkeypatch):
+    """平台那道不在闸门上：它每道题要起一个 solo2-backend 容器，几百兆内存跑几分钟，
+    而换回来的结论和提交之后平台自己给的是同一份。这条断言是防回退用的。"""
+    from app.db import session
+    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier, qa_bridge
+
+    with session() as db:
+        t = m.Task(task_no="07", prompt_hash="h", user_prompt="p", status=m.ANALYZED)
+        t.gsb = {"verdict": "A", "reason": "A 侧改对了，B 侧没有。"}
+        db.add(t)
+        db.flush()
+        tid = t.id
+
+    async def boom(*a, **kw):
+        raise AssertionError("闸门不该起质检容器")
+
+    async def ok_check(task_id, **kw):
+        return {"ok": True}
+
+    async def fake_verify(task_id):
+        return {"overall": "ok", "items": []}
+
+    monkeypatch.setattr(qa_bridge, "gsb_qc", boom)
+    monkeypatch.setattr(gsb_factcheck, "run_factcheck", ok_check)
+    monkeypatch.setattr(gsb_precheck, "run_precheck", ok_check)
+    monkeypatch.setattr(gsb_verifier, "run_verify", fake_verify)
+
+    assert asyncio.run(wd.run_quality_gate(tid))["ok"] is True
 
 
 @pytest.mark.parametrize("dead", ["factcheck", "precheck"])
@@ -1722,7 +1706,7 @@ def test_quality_gate_goes_on_when_a_model_backed_check_fails(tmp_db, monkeypatc
     并不会让一道没核过的题溜到提交 —— 提交门禁那边照样认 ERROR。
     """
     from app.db import session
-    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier, qa_bridge
+    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier
 
     with session() as db:
         t = m.Task(task_no="07", prompt_hash="h", user_prompt="p", status=m.ANALYZED)
@@ -1744,19 +1728,14 @@ def test_quality_gate_goes_on_when_a_model_backed_check_fails(tmp_db, monkeypatc
         reached.append("verify")
         return {"overall": "ok", "items": []}
 
-    async def fake_qc(task_id):
-        reached.append("qc")
-        return {"ok": True, "passed": True, "summary": ""}
-
     monkeypatch.setattr(gsb_factcheck, "run_factcheck",
                         dead_check if dead == "factcheck" else live_check)
     monkeypatch.setattr(gsb_precheck, "run_precheck",
                         dead_check if dead == "precheck" else live_check)
     monkeypatch.setattr(gsb_verifier, "run_verify", fake_verify)
-    monkeypatch.setattr(qa_bridge, "gsb_qc", fake_qc)
 
     asyncio.run(wd.run_quality_gate(tid))
-    assert reached == ["alive", "verify", "qc"]
+    assert reached == ["alive", "verify"]
 
 
 # ---------------- 质检积压与模型恢复 ----------------

@@ -85,10 +85,6 @@ SPECS: tuple[Spec, ...] = (
     Spec("qc.image", "质检镜像", "题目查重", default="solo2-backend:latest",
          help="复用 solo-qa 自己的后端镜像（它的 compose 里就叫这个名），避免依赖版本冲突"),
     Spec("qc.timeout_minutes", "质检超时（分钟）", "题目查重", default="15", kind="number"),
-    Spec("qc.max_parallel", "质检容器并发", "题目查重", default="4", kind="number",
-         help="和「分析/质检并发」是两回事：那个管同时发几个模型调用，模型在别人的"
-              "机器上；这一步每道题要起一个 solo-qa 容器，占的是本机内存。"
-              "按 Docker 分到的内存除以单个容器的峰值来估，机器给得多就调大"),
     Spec("design.count", "默认设计题数", "题目设计", default="5", kind="number"),
     Spec("design.model", "设计模型", "题目设计", default="claude-opus-5-thinking-high", kind="select"),
     Spec("design.timeout_minutes", "设计超时（分钟）", "题目设计", default="90", kind="number"),

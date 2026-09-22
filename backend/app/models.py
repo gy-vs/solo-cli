@@ -202,8 +202,11 @@ class Task(Base, JsonMixin):
     # 避免旧代码按五维结构去读它。
     gsb_json: Mapped[str] = mapped_column(Text, default="{}")
     verify_json: Mapped[str] = mapped_column(Text, default="{}")       # GSB 核验报告
-    # solo-qa 的 GSB 质检结论。本地核验（verify_json）只判确定性规则，这里存的是平台
-    # 口径的结果，含 AI 化评分与命中的规则号，两者都过才敢上传。
+    # solo-qa 的 GSB 质检结论，含 AI 化评分与命中的规则号。
+    #
+    # 自动流程已经不写它了：那一步要给每道题起一个 solo2-backend 容器跑几分钟，
+    # 而换回来的结论和提交之后平台自己给的是同一份，等于把平台的活先干一遍。
+    # 列留着是因为历史数据在里面，手动调 qa_bridge.gsb_qc 对口径时也还会写。
     #
     # 叫 gsb_qc_json 而不是 qc_json：后者是五维质检时代的列，已经废弃删掉了，名字重用
     # 会让老库里残留的旧格式数据被当成新结论读出来。

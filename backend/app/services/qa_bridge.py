@@ -22,34 +22,6 @@ log = logging.getLogger("qa_bridge")
 SCRIPT_DEDUP = "qa_dedup.py"
 SCRIPT_GSB_QC = "qa_gsb_qc.py"
 
-# 同时最多起几个质检容器。这个额度和「分析/质检并发」是两回事，必须分开：
-# 那个数管的是同时在跑几个模型调用，模型在别人的机器上，开三十个只是三十条 HTTP 流；
-# 而这一步每道题要起一个 solo2-backend 容器，占的是本机内存。
-#
-# 分不开的代价是实打实的：模型并发调到 30 之后，闸门的前两步（事实核验、措辞质检）
-# 各要一两分钟，跑完就一起涌到这一步，于是三十个容器同时起。Docker Desktop 默认只
-# 分到几个 G，这个镜像四百多兆、跑起来还要装 Python 运行时，撞上去就是整批 OOM，
-# 而 OOM 掉的那几道会被记成「质检未完成」，看上去像是平台的问题。
-#
-# 四个是按「Docker 分到 8G、单个容器算 600M 峰值」估的，留了一倍余量。机器内存给得
-# 多就调大，这个数和模型并发没有任何关系。
-QC_PARALLEL_DEFAULT = 4
-_slots: asyncio.Semaphore | None = None
-_slots_limit = 0
-
-
-def _gate() -> asyncio.Semaphore:
-    """取容器额度的信号量，额度改了就换一个新的。
-
-    不在模块级建：Semaphore 会绑定到创建它时的事件循环，而测试里每个用例各起一个
-    循环，跨循环复用同一把会直接抛错。
-    """
-    global _slots, _slots_limit
-    limit = max(1, settings_store.get_int("qc.max_parallel", QC_PARALLEL_DEFAULT))
-    if _slots is None or _slots_limit != limit:
-        _slots, _slots_limit = asyncio.Semaphore(limit), limit
-    return _slots
-
 
 def project_host() -> str:
     return settings_store.get("qc.project_host").rstrip("/")
@@ -66,17 +38,6 @@ def available() -> tuple[bool, str]:
 
 
 async def _run(script: str, payload: dict, *, timeout_s: int, mounts: list[str] | None = None) -> dict:
-    """起一个质检容器跑桥接脚本。等额度的时间不算进超时。
-
-    超时是给「容器起来了却不返回」用的，而排队等额度是正常的，两者混在一起会让
-    队尾那几道题一进容器就被判超时 —— 而它们一秒都还没跑。
-    """
-    async with _gate():
-        return await _run_now(script, payload, timeout_s=timeout_s, mounts=mounts)
-
-
-async def _run_now(script: str, payload: dict, *, timeout_s: int,
-                   mounts: list[str] | None = None) -> dict:
     root = project_host()
     image = settings_store.get("qc.image") or "solo2-backend:latest"
     cmd = [
