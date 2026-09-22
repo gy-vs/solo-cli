@@ -152,6 +152,28 @@ def test_normalize_keeps_startup_commands_verbatim():
     assert got["a_startup"]["steps"] == ["先装依赖"]
 
 
+def test_normalize_keeps_evidence_quotes_verbatim():
+    """quote 一个字都不许洗，它的唯一用途是回材料里逐字比对。
+
+    洗过的那一版会吃掉 /** */ 的星号和模板字符串的反引号，还会把工具入参里的绝对
+    路径缩成文件名，洗完的句子在材料里必然找不到，回查于是把有据的引用判成编造。
+    """
+    obj = {"verdict": "A", "evidence": [
+        {"side": "A", "file": "src/index.ts",
+         "quote": "/** One-shot expansion; throws if any variable is missing. */"},
+        {"side": "B", "file": "test/rfc-check.ts",
+         "quote": "console.log(`RFC vectors: ${pass} pass, ${fail} fail`);"},
+        {"side": "A", "file": "tests/stub.py",
+         "quote": "Write /tmp/attrs-test-stubs/pytest/__init__.py"},
+    ]}
+    got = ga.normalize(obj, {})
+    assert [e["quote"] for e in got["evidence"]] == [
+        "/** One-shot expansion; throws if any variable is missing. */",
+        "console.log(`RFC vectors: ${pass} pass, ${fail} fail`);",
+        "Write /tmp/attrs-test-stubs/pytest/__init__.py",
+    ]
+
+
 def test_normalize_survives_garbage_field_types():
     obj = {"verdict": "A", "reason": None, "a_findings": "不是字典",
            "b_startup": ["不是字典"], "evidence": ["不是字典", {"side": "b", "file": "x.py"}]}

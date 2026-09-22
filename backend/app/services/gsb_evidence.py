@@ -95,9 +95,44 @@ def _readme(materials: dict[str, dict]) -> str:
 
 
 # ---------------- 逐字回查 ----------------
+# 比对前材料和 quote 都要过同一道归一化，抹掉两类不算改内容的差异。
+#
+# 一类是空白：转抄时改掉缩进和折行是常事。
+#
+# 另一类是行首记号。引一段代码注释，抄回来的是注释文字，`//` 和折行处的 `*` 不会
+# 跟着抄——材料里是 `// Only functions actually exhibiting the clash are touched,
+# so the\n// analysis ... is unchanged.`，交回来的是连成一句的同一段话。补丁的 +/-
+# 行首标记同理，带不带全看它抄的是补丁还是文件内容。这些都不是编造，按原样比会把
+# 有据的引用判成编的，所以在这里一起抹掉；只在行首生效，行内一个字不动。
+# 记号可能叠着来：补丁里的注释行是 `+// ...`，两层都要吃掉，所以整组带量词。
+# 每个分支都至少吃掉一个字符，不会在原地打转。
+_LINE_LEAD = re.compile(r"(?m)^(?:[ \t]*(?://+|/\*+|\*+/|\*|#+|;+|[-+]+))+[ \t]*")
+# 独立成段的省略号：跨行取材时用它把两段原文接起来。行内的 ...args 不是这个用法，
+# 所以要求两侧是空白或首尾。
+_GAP = re.compile(r"(?:(?<=\s)|^)(?:\.{3,}|…)(?=\s|$)")
 
-def _squash(text: str) -> str:
-    return re.sub(r"\s+", "", text or "")
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", "", _LINE_LEAD.sub("", text or ""))
+
+
+def _appears_in(body: str, quote: str) -> bool:
+    """quote 是否出自 body。body 与 quote 都要先过 _norm。
+
+    带省略号的拆成几段依次找，且每段只在上一段之后的位置里找。分段是为了容忍
+    「取两段、中间用省略号接上」这种转抄；限定顺序是因为不限顺序就等于放过「把
+    两处不相干的话拼成一条证据」，而那恰恰是这道回查要拦的。
+    """
+    parts = [p for p in (_norm(p) for p in _GAP.split(quote)) if p]
+    if not parts:
+        return False
+    at = 0
+    for part in parts:
+        i = body.find(part, at)
+        if i < 0:
+            return False
+        at = i + len(part)
+    return True
 
 
 def corpus(task_no: str, side: str) -> str:
@@ -140,13 +175,17 @@ def sides_with_material(task_no: str) -> set[str]:
 def check_quotes(task_no: str, evidence: list[dict]) -> tuple[list[dict], list[dict]]:
     """把每条 evidence 的 quote 拿回材料里对一遍，返回 (对得上的, 对不上的)。
 
-    比对前去掉全部空白：模型转抄时常把缩进和折行改掉，那不算改内容，按原样比会把
-    绝大多数正确引用判成编的。反过来，去掉空白之后仍然找不到的那种，就是它自己
-    写出来的句子。
+    归一化之后仍然找不到的那种，就是它自己写出来的句子。
     """
     kept: list[dict] = []
     dropped: list[dict] = []
     bodies: dict[str, str] = {}
+
+    def body(side: str) -> str:
+        if side not in bodies:
+            bodies[side] = _norm(corpus(task_no, side))
+        return bodies[side]
+
     for e in evidence:
         if not isinstance(e, dict):
             continue
@@ -155,13 +194,17 @@ def check_quotes(task_no: str, evidence: list[dict]) -> tuple[list[dict], list[d
         if side not in config.SIDES:
             dropped.append({**e, "why": f"side 不是 A 或 B：{side or '空'}"})
             continue
-        if len(_squash(quote)) < MIN_QUOTE_CHARS:
+        if len(_norm(quote)) < MIN_QUOTE_CHARS:
             dropped.append({**e, "why": f"quote 太短，不足 {MIN_QUOTE_CHARS} 个字符"})
             continue
-        if side not in bodies:
-            bodies[side] = _squash(corpus(task_no, side))
-        if _squash(quote) in bodies[side]:
+        if _appears_in(body(side), quote):
             kept.append(e)
+            continue
+        # 找不到时再看对侧。同一段话在另一侧找得到，说明引用是真的、只是 side 标错了。
+        # 这和凭空编一句要修的地方不同，分开说人才不用自己再去两侧翻一遍。
+        other = next(s for s in config.SIDES if s != side)
+        if _appears_in(body(other), quote):
+            dropped.append({**e, "why": f"这段话出自 {other} 侧的材料，side 却标成了 {side}"})
         else:
             dropped.append({**e, "why": f"这段话在 {side} 侧的轨迹和补丁里都找不到"})
     return kept, dropped

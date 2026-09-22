@@ -463,7 +463,12 @@ def normalize(obj: dict, repos: dict[str, Path] | None = None) -> dict:
         "evidence": [
             {"side": str(e.get("side") or "").upper()[:1],
              "file": _clean(e.get("file"), repos),
-             "quote": _clean(e.get("quote"), repos)}
+             # quote 一个字都不洗。_clean 那套是给交付出去的正文准备的，套在 quote 上
+             # 只会把它改坏：去 markdown 记号会吃掉代码里的反引号和 /** */，去绝对路径
+             # 会把「Write /tmp/stubs/pytest/__init__.py」洗成「Write __init__.py」，
+             # 洗完的句子回材料里必然找不到，回查于是把有据的引用判成编造。它唯一的
+             # 用途就是逐字比对，又不随理由上传，留着原文没有外泄的问题。
+             "quote": str(e.get("quote") or "").strip()}
             for e in (obj.get("evidence") or []) if isinstance(e, dict)
         ][:24],
         "remark": _clean(obj.get("remark"), repos),

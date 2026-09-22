@@ -159,6 +159,78 @@ def test_quote_matching_ignores_whitespace(coder_root: Path):
     assert len(kept) == 1
 
 
+def _with_patch(side: str, patch: str) -> dict[str, dict]:
+    m = _materials()
+    m[side] = {**m[side], "patch": patch}
+    return m
+
+
+def test_quote_matching_ignores_comment_markers(coder_root: Path):
+    """引一段代码注释，`//` 和折行处的 `*` 通常不会跟着抄，这不算编造。
+
+    材料里是分成两行的 `//` 注释，交回来的是连成一句的同一段话。按原样比会把这
+    一类全判成编的——一批已提交的题回查下来，对不上的引用多数是这么来的。
+    """
+    _trace_file(config.TaskPaths("07", "A").traces / "s-a.jsonl")
+    gsb_evidence.build("07", "题面", _with_patch("A", (
+        "diff --git a/src/A.ts b/src/A.ts\n"
+        "+// Only functions actually exhibiting the clash are touched, so the\n"
+        "+// analysis and mangling of unaffected code is unchanged.\n")))
+
+    kept, dropped = gsb_evidence.check_quotes("07", [
+        {"side": "A", "file": "src/A.ts",
+         "quote": "Only functions actually exhibiting the clash are touched, so the "
+                  "analysis and mangling of unaffected code is unchanged."},
+    ])
+    assert len(kept) == 1 and not dropped
+
+
+def test_quote_matching_spans_an_ellipsis(coder_root: Path):
+    """跨行取材时用省略号把两段原文接起来，两段都在就算对上。"""
+    _trace_file(config.TaskPaths("07", "A").traces / "s-a.jsonl")
+    gsb_evidence.build("07", "题面", _with_patch("A", (
+        "diff --git a/src/A.ts b/src/A.ts\n"
+        "+const own = readSlots(cls)\n"
+        "+const merged = mergeSlots(own, base)\n"
+        "+const conflicting = merged.filter(isConflicting)\n")))
+
+    kept, dropped = gsb_evidence.check_quotes("07", [
+        {"side": "A", "file": "src/A.ts",
+         "quote": "const own = readSlots(cls)\n    ...\n    "
+                  "const conflicting = merged.filter(isConflicting)"},
+    ])
+    assert len(kept) == 1 and not dropped
+
+
+def test_quote_matching_rejects_two_snippets_stitched_out_of_order(coder_root: Path):
+    """分段比对是为了容忍跨行取材，不是放过把两处话倒着拼成一条证据。"""
+    _trace_file(config.TaskPaths("07", "A").traces / "s-a.jsonl")
+    gsb_evidence.build("07", "题面", _with_patch("A", (
+        "diff --git a/src/A.ts b/src/A.ts\n"
+        "+const own = readSlots(cls)\n"
+        "+const conflicting = merged.filter(isConflicting)\n")))
+
+    kept, dropped = gsb_evidence.check_quotes("07", [
+        {"side": "A", "file": "src/A.ts",
+         "quote": "const conflicting = merged.filter(isConflicting) ... "
+                  "const own = readSlots(cls)"},
+    ])
+    assert not kept and len(dropped) == 1
+
+
+def test_quote_from_the_other_side_is_reported_as_a_mislabel(coder_root: Path):
+    """同一段话在对侧找得到，是 side 标错而不是编造，要修的地方不一样。"""
+    _trace_file(config.TaskPaths("07", "A").traces / "s-a.jsonl")
+    gsb_evidence.build("07", "题面", _with_patch("A", (
+        "diff --git a/src/A.ts b/src/A.ts\n+const onlyOnSideA = readSlots(cls)\n")))
+
+    kept, dropped = gsb_evidence.check_quotes("07", [
+        {"side": "B", "file": "src/A.ts", "quote": "const onlyOnSideA = readSlots(cls)"},
+    ])
+    assert not kept
+    assert "出自 A 侧" in dropped[0]["why"] and "标成了 B" in dropped[0]["why"]
+
+
 def test_short_quotes_are_dropped(coder_root: Path):
     """几个字符的引用在任何材料里都能找到，放行等于这道回查形同虚设。"""
     _trace_file(config.TaskPaths("07", "A").traces / "s-a.jsonl")
