@@ -1945,6 +1945,32 @@ def test_recovery_leaves_a_check_that_failed_for_a_reason_the_model_cannot_fix(
         assert db.get(m.Task, tid).factcheck_status == m.FACTCHECK_ERROR
 
 
+@pytest.mark.parametrize("err, stalled", [
+    # CLI 被账单拦下时打的就是这一句，一个关键词都不沾。白名单那版漏掉的正是它 ——
+    # 26 道 ERROR 里有 16 道是这个措辞，全都永远卡着。
+    ("✗ Failed to reach the Cursor API. If you are behind a corporate proxy,", True),
+    ("Cursor 账号有未付账单，模型请求被拒", True),
+    ("模型 40 分钟没有返回", True),
+    ("输出中没有可解析的质检 JSON", True),
+    # 这一类重试多少次都是同样的结果，放回流程只会每轮空转
+    ("两侧都没有轨迹执行记录，无法核验", False),
+])
+def test_legacy_error_rows_default_to_retryable_unless_clearly_not(err, stalled):
+    """老行只能看报错文本，而 CLI 的措辞穷举不完，所以用排除法而不是白名单。
+
+    两个方向的代价不对等：误判成模型问题只是白跑一次质检，误判成任务问题这道题
+    就再也没人管了。
+    """
+    assert wd._llm_stalled({"error": err}) is stalled
+
+
+def test_the_llm_error_flag_wins_over_the_text(tmp_db):
+    """新行带标记，就不必再猜文本 —— 标记说不是模型问题，那就不是。"""
+    assert wd._llm_stalled({"error": "看着很像超时", "llm_error": False}) is False
+    assert wd._llm_stalled({"error": "两侧都没有轨迹执行记录", "llm_error": True}) is True
+    assert wd._llm_stalled({}) is False
+
+
 def test_recovery_still_rescues_rows_written_before_the_llm_error_flag(tmp_db, monkeypatch):
     """标记是后加的。账单那阵子攒下的 ERROR 行拿不到它，一条都不放回去等于白做。"""
     from app.db import session

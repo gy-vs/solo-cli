@@ -968,9 +968,13 @@ async def _advance_one(task_id: int) -> None:
 
 
 def _advance_slots() -> int:
-    """还能再开几个后台推进。额度就是设置里那个「分析/质检并发」：推产物之后的两步
-    都在调模型，一起开太多只会互相拖慢。"""
-    limit = max(1, settings_store.get_int("auto.max_parallel", 2))
+    """还能再开几个后台推进。额度就是设置里那个「分析/质检并发」。
+
+    推产物之后的每一步都在调模型，所以这个数就是同时在跑的模型调用数。兜底值要和
+    settings_store 里的 Spec 默认值一致，不然「设置页显示 30、实际按 2 跑」这种账
+    没人对得出来。
+    """
+    limit = max(1, settings_store.get_int("auto.max_parallel", 30))
     return max(0, limit - len(_advance_tasks))
 
 
@@ -1081,28 +1085,29 @@ _last_probe_at = 0.0
 _llm_ok = True
 
 
+# 明确不是模型问题的失败。这一步重试多少次结果都一样，放回流程只会让它下一轮再报
+# 同样的错，从此每轮空转。目前只有一种：这道题压根没有轨迹可核。
+_NOT_LLM_ERROR = re.compile(r"没有轨迹|无法核验|轨迹文件缺失")
+
+
 def _llm_stalled(report: dict) -> bool:
     """这一档是不是「模型没答上来」，而不是这道题本身有问题。
 
-    两道质检失败时会打 llm_error 标记，这里只认那个标记，不去猜报错文本。猜的代价
-    是实打实的：「两侧都没有轨迹执行记录」这种失败重试一百次还是同样的结果，混进来
-    之后每次探测成功都会把它放回流程，下一轮再报一次，从此每轮空转。
+    两道质检失败时会打 llm_error 标记，有标记就只认标记。
 
-    没有标记的老行按报错文本兜一道：建这个标记之前留下的 ERROR 行拿不到它，而那批
-    恰恰是账单那阵子攒下来的，一条都不放回去等于白做这件事。
+    没有标记的是建这个标记之前留下的老行，只能看报错文本 —— 而这里用的是排除法，
+    不是白名单。白名单那版漏掉了一多半：CLI 被账单拦下时打的是「Failed to reach the
+    Cursor API. If you are behind a corporate proxy...」，一个关键词都不沾，26 道
+    ERROR 里有 16 道就这么永远卡着。CLI 的报错措辞是它自己的事，穷举不完。
+
+    两个方向的代价不对等，所以默认按「是模型问题」算：误判成模型问题，代价是白跑一次
+    质检；误判成任务问题，代价是这道题再也没人管。
     """
     if not report.get("error"):
         return False
     if "llm_error" in report:
         return bool(report["llm_error"])
-    return _LLM_ERROR_HINT.search(str(report.get("error") or "")) is not None
-
-
-# 老行兜底用。只认高置信度的说法：模型调用失败的原因最终都从 llm.classify 出来，
-# 而它给的那几句话是固定的。
-_LLM_ERROR_HINT = re.compile(
-    r"账单|API Key|模型名|无权|没有返回|没有新输出|返回了空内容|模型调用失败"
-    r"|\b(429|5\d{2})\b|rate.?limit|timed? ?out|ConnectError", re.I)
+    return not _NOT_LLM_ERROR.search(str(report.get("error") or ""))
 
 
 def _blocked_by_llm() -> tuple[int, int]:

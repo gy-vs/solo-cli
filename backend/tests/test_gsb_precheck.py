@@ -508,6 +508,46 @@ def test_run_precheck_keeps_the_reason_when_the_rewrite_is_unusable(qc_task, mon
     assert "红项" in task.precheck["rewrite_dropped"]
 
 
+def test_precheck_asks_again_when_the_first_round_gives_no_rewrite(qc_task, monkeypatch):
+    """只列问题不给稿子的那种，要把原因说回去再问一轮。
+
+    库里 69 道判了待改的题，没有一道是稿子被判据拦下的，全都是模型压根没给 rewrite。
+    问一次没给就记待改收工，那道题从此只能等人手改，而它缺的只是再问一遍。
+    """
+    seen: list[str] = []
+    replies = [
+        _report(passed=False, issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]),
+        _report(passed=False, rewrite=FIXED,
+                issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]),
+    ]
+
+    async def ask(prompt, **kw):
+        seen.append(prompt)
+        return LlmResult(text=replies[min(len(seen) - 1, len(replies) - 1)], model="stub-model")
+
+    monkeypatch.setattr(gp.llm, "ask", ask)
+    r = asyncio.run(gp.run_precheck(qc_task))
+    assert r["applied"] is True and _task(qc_task).precheck_status == m.PRECHECK_PASS
+    assert len(seen) == 2
+    # 第二轮要把上一版为什么没用说给它听，否则它多半原样再交一遍
+    assert "上一版改写稿没被采用" in seen[1] and "没有给出改好之后的整段正文" in seen[1]
+
+
+def test_precheck_stops_asking_after_the_budget_and_leaves_it_to_a_human(qc_task, monkeypatch):
+    """连着几轮都交不出能用的稿子，多半是这段理由本身要重写，那才是人该看的。"""
+    seen = _stub(monkeypatch, text=_report(
+        passed=False, issues=[{"quote": "两边对问题的定位一致", "kind": "句子生硬"}]))
+    r = asyncio.run(gp.run_precheck(qc_task))
+    assert r["passed"] is False and _task(qc_task).precheck_status == m.PRECHECK_FAIL
+    assert len(seen) == gp.PRECHECK_FIX_ROUNDS
+
+
+def test_precheck_does_not_burn_a_second_call_when_the_first_one_passes(qc_task, monkeypatch):
+    seen = _stub(monkeypatch, text=_report(passed=True))
+    asyncio.run(gp.run_precheck(qc_task))
+    assert len(seen) == 1
+
+
 def test_run_precheck_can_report_without_applying(qc_task, monkeypatch):
     """apply=False 留给「只想看看有什么问题」的场合，走的是同一次模型调用。"""
     _stub(monkeypatch, text=_report(passed=False, rewrite=FIXED,

@@ -55,6 +55,10 @@ log = logging.getLogger("gsb_precheck")
 # 质检的 prompt 只有规则表加一段几百字的正文，正常一分钟内就回。给死上限是为了
 # 不让一次卡顿把整批题的质检拖成和 GSB 分析一样长。
 PRECHECK_TIMEOUT_S = 600
+# 挑出了毛病却交不出能用的改写稿时再问几轮，把上一版没被采用的原因一并告诉它。
+# 两轮和事实核验那边同一个口径：第一轮多半是没给稿子或者篇幅没压下来，说清楚就改对了；
+# 连着两轮都交不出来，多半是这段理由本身要重写，那才是人该看一眼的事。
+PRECHECK_FIX_ROUNDS = 2
 # 一段理由里这类毛病通常两三处，多的五六处。给上限是防模型逐句开条目，
 # 交回来三十条「这句可以更自然」，人一条都不会看。
 MAX_ISSUES = 12
@@ -186,7 +190,8 @@ def hints(reason: str) -> list[dict]:
 
 # ---------------- prompt ----------------
 
-def build_prompt(reason: str, *, verdict: str = "", task_no: str = "") -> str:
+def build_prompt(reason: str, *, verdict: str = "", task_no: str = "",
+                 retry_note: str = "") -> str:
     found = hints(reason)
     listed = "\n".join(f"   「{h['word']}」在这一句里：{h['quote']}" for h in found[:12])
     hint_block = (f"""
@@ -202,6 +207,12 @@ def build_prompt(reason: str, *, verdict: str = "", task_no: str = "") -> str:
            if n > cap else
            f"这一段现在 {n} 字，rewrite 保持在 {lo} 到 {hi} 字，不要写长。")
 
+    retry_block = f"""
+【上一版改写稿没被采用】
+{retry_note}
+这一轮要在改掉措辞问题的同时避开上面这个毛病。
+""".rstrip() if retry_note else ""
+
     return f"""你在给一份双跑对比的评审理由做最后一道文字质检。这段话马上要交给评审方。
 你要做两件事：把不像人写的地方挑出来，并且直接交出改好之后的整段正文。
 
@@ -211,6 +222,7 @@ def build_prompt(reason: str, *, verdict: str = "", task_no: str = "") -> str:
 【逐条规则】
 {TONE_RULES}
 {hint_block}
+{retry_block}
 
 【篇幅】
 {cut}
@@ -548,37 +560,54 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
     started = time.time()
     base = {"reason_digest": reason_digest(reason), "reason_chars": gsb_rules.visible_chars(reason),
             "finished_at": utc_now().isoformat()}
-    try:
-        r = await llm.ask(build_prompt(reason, verdict=verdict, task_no=task_no),
-                          purpose=f"质检 {task_no}", attempts=1, timeout_s=PRECHECK_TIMEOUT_S)
-        parsed = gsb_analyzer.extract_object(r.text, "issues", "质检 JSON")
-    except (llm.LlmError, ValueError) as exc:
-        log.warning("题 %s 提交前质检没跑完：%s", task_no, exc)
-        # llm_error 标记这次失败是「模型没答上来」而不是这段理由有问题。看门狗的恢复
-        # 探测按它挑要放回流程的题，见 watchdog._blocked_by_llm。
-        _save(task_id, PRECHECK_ERROR, {**base, "error": str(exc)[:600], "llm_error": True,
-                                        "duration_s": round(time.time() - started)})
-        return {"ok": False, "message": f"质检没跑完：{exc}"}
 
-    report = {**base, **normalize(parsed, reason=reason, verdict=verdict),
-              "model": r.model, "duration_s": round(time.time() - started)}
-
-    # 有改写稿就直接落到理由上。改完之后本地规则要重新判一遍：模型偶尔只改了被点名的
-    # 那几句，篇幅或者别的说法还留着，那种稿子换上去只是把问题换了个位置，仍然算待改。
+    # 挑出了毛病却交不出能用的稿子时，把「上一版为什么没被采用」告诉它再问一轮。
+    # 不再问的代价是实打实的：库里 69 道判了待改的题，没有一道是稿子被判据拦下的，
+    # 全都是模型压根没给 rewrite —— 问一次没给就记待改收工，那道题从此只能等人手改，
+    # 而它缺的只是再问一遍。事实核验那边本来就是这么做的，两处对齐。
     applied, new_reason = False, ""
-    if apply and report["rewrite"]:
-        left = local_defects(report["rewrite"], verdict)
-        if left:
+    report: dict = {}
+    retry_note = ""
+    for rnd in range(1, PRECHECK_FIX_ROUNDS + 1):
+        try:
+            r = await llm.ask(
+                build_prompt(reason, verdict=verdict, task_no=task_no, retry_note=retry_note),
+                purpose=f"质检 {task_no}", attempts=1, timeout_s=PRECHECK_TIMEOUT_S)
+            parsed = gsb_analyzer.extract_object(r.text, "issues", "质检 JSON")
+        except (llm.LlmError, ValueError) as exc:
+            log.warning("题 %s 提交前质检没跑完：%s", task_no, exc)
+            # llm_error 标记这次失败是「模型没答上来」而不是这段理由有问题。看门狗的
+            # 恢复探测按它挑要放回流程的题，见 watchdog._blocked_by_llm。
+            _save(task_id, PRECHECK_ERROR, {**base, "error": str(exc)[:600], "llm_error": True,
+                                            "duration_s": round(time.time() - started)})
+            return {"ok": False, "message": f"质检没跑完：{exc}"}
+
+        report = {**base, **normalize(parsed, reason=reason, verdict=verdict),
+                  "model": r.model, "rounds": rnd,
+                  "duration_s": round(time.time() - started)}
+        if report["passed"] or not apply:
+            break
+
+        # 有改写稿就直接落到理由上。改完之后本地规则要重新判一遍：模型偶尔只改了被
+        # 点名的那几句，篇幅或者别的说法还留着，那种稿子换上去只是把问题换了个位置。
+        if report["rewrite"]:
+            left = local_defects(report["rewrite"], verdict)
+            if not left:
+                applied, new_reason = True, report["rewrite"]
+                report.update({
+                    "applied": True,
+                    "applied_at": utc_now().isoformat(),
+                    "reason_before": reason,
+                    "chars_before": gsb_rules.visible_chars(reason),
+                    "local_defects": [],
+                })
+                break
             report["apply_skipped"] = "；".join(left[:2])
+            retry_note = f"上一版改完之后仍然有这些毛病：{report['apply_skipped']}"
         else:
-            applied, new_reason = True, report["rewrite"]
-            report.update({
-                "applied": True,
-                "applied_at": utc_now().isoformat(),
-                "reason_before": reason,
-                "chars_before": gsb_rules.visible_chars(reason),
-                "local_defects": [],
-            })
+            retry_note = (report.get("rewrite_dropped")
+                          or "上一版只列了问题，没有给出改好之后的整段正文")
+        log.info("题 %s 质检第 %d 轮没拿到能用的改写稿：%s", task_no, rnd, retry_note[:120])
     # 改写已经落上去，这一稿在规则层面是干净的，就按通过记。留在待改上等于要人再去
     # 确认一次一个已经改好的文本，而他手里并没有比这更该做的动作。
     status = PRECHECK_PASS if (report["passed"] or applied) else PRECHECK_FAIL

@@ -61,8 +61,10 @@ SPECS: tuple[Spec, ...] = (
     Spec("auto.destroy_on_finish", "结束后自动销毁容器", "自动流水线", default="1", kind="bool",
          help="轨迹导出成功后才销毁；导出失败会保留容器等待人工处理"),
     Spec("auto.analyze", "两边跑完后自动 GSB 分析", "自动流水线", default="1", kind="bool"),
-    Spec("auto.max_parallel", "分析/质检并发", "自动流水线", default="2", kind="number",
-         help="这两步都在调模型，并发过高会互相拖慢"),
+    Spec("auto.max_parallel", "分析/质检并发", "自动流水线", default="30", kind="number",
+         help="分析与两道质检都在调模型，这个数就是同时在跑的模型调用数。"
+              "一道题的分析十几分钟、每道质检一两分钟，积压上百道时低并发要跑一整天；"
+              "撞限流的话调用会自己退避重试，代价比串行等着小"),
     Spec("watchdog.interval_seconds", "守护扫描间隔（秒）", "守护", default="300", kind="number",
          help="扫异常重跑与配对触发分析；run 一结束会立刻唤醒一次，这个间隔只是兜底"),
     Spec("watchdog.paused", "暂停自动重跑与废弃", "守护", default="0", kind="bool",
@@ -83,6 +85,10 @@ SPECS: tuple[Spec, ...] = (
     Spec("qc.image", "质检镜像", "题目查重", default="solo2-backend:latest",
          help="复用 solo-qa 自己的后端镜像（它的 compose 里就叫这个名），避免依赖版本冲突"),
     Spec("qc.timeout_minutes", "质检超时（分钟）", "题目查重", default="15", kind="number"),
+    Spec("qc.max_parallel", "质检容器并发", "题目查重", default="4", kind="number",
+         help="和「分析/质检并发」是两回事：那个管同时发几个模型调用，模型在别人的"
+              "机器上；这一步每道题要起一个 solo-qa 容器，占的是本机内存。"
+              "按 Docker 分到的内存除以单个容器的峰值来估，机器给得多就调大"),
     Spec("design.count", "默认设计题数", "题目设计", default="5", kind="number"),
     Spec("design.model", "设计模型", "题目设计", default="claude-opus-5-thinking-high", kind="select"),
     Spec("design.timeout_minutes", "设计超时（分钟）", "题目设计", default="90", kind="number"),
