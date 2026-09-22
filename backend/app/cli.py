@@ -1,9 +1,11 @@
-"""在对话里触发的命令行入口。目前只管提交前质检与随后的批量提交。
+"""在对话里触发的命令行入口。管提交前质检、录屏交付与批量提交。
 
-这个模块存在的理由只有一个：发起质检不能放在页面上。它要在人已经看过录屏、准备整批
-提交的那一刻跑——跑早了理由还会改，结论当场就过期；而一个点一下就烧掉一次模型调用的
-按钮，摆在页面上迟早会被点。所以发起的口子只留在这里，nginx 那边把
-`/api/tasks/*/precheck` 与 `/api/tasks/batch/precheck` 一并挡掉，浏览器根本到不了。
+整条流水线现在自己跑：跑完自动分析，分析完自动过两道质检（事实核验 + 措辞），
+看门狗还会把卡住的补上。留着这个入口是为了两件机器替不了的事——
+
+1. 交付录屏。录屏在外部录完，人手上只有两个文件路径，只能他自己说出来。
+   `deliver` 收下路径，把视频归档进题目目录、代传到平台，然后直接提交。
+2. 兜底与查看。批量重跑某几道的质检、看一眼整批卡在哪儿、手动提交。
 
 不 import 那些 service 自己跑，而是打后端进程的 HTTP 口。差别在界面会不会动：事件
 总线是进程内的，另起一个进程写库，浏览器一个事件都收不到，人盯着列表看不见「质检
@@ -14,10 +16,11 @@
 
 用法（在宿主机仓库根目录）：
 
-    docker compose exec backend python -m app.cli ready          # 该质检哪些题
-    docker compose exec backend python -m app.cli precheck       # 全部跑一遍
-    docker compose exec backend python -m app.cli precheck 219 221
-    docker compose exec backend python -m app.cli status         # 质检栏总览
+    docker compose exec backend python -m app.cli status         # 整批卡在哪儿
+    docker compose exec backend python -m app.cli ready          # 还该质检哪些题
+    docker compose exec backend python -m app.cli gate 219 221   # 整条质检走一遍
+    docker compose exec backend python -m app.cli precheck 219   # 只跑措辞那一道
+    docker compose exec backend python -m app.cli deliver 219 ~/a.mp4 ~/b.mp4
     docker compose exec backend python -m app.cli submit         # 批量提交放行的
 """
 
@@ -41,6 +44,10 @@ TIMEOUT = httpx.Timeout(None, connect=10)
 PRECHECK_LABEL = {
     "IDLE": "未质检", "RUNNING": "质检中", "PASS": "通过",
     "FAIL": "待改", "CONFIRMED": "已确认", "ERROR": "没跑完",
+}
+FACTCHECK_LABEL = {
+    "IDLE": "未核验", "RUNNING": "核验中", "PASS": "一致",
+    "FAIL": "有出入", "CONFIRMED": "已确认", "ERROR": "没跑完",
 }
 
 
@@ -71,13 +78,18 @@ def _resolve(items: list[dict], wanted: list[str]) -> tuple[list[int], list[str]
 
 
 def _line(t: dict) -> str:
-    """一道题在清单里占的那一行。"""
-    status = PRECHECK_LABEL.get(t.get("precheck_status") or "", t.get("precheck_status") or "—")
-    n = t.get("precheck_issues") or 0
-    tail = t.get("precheck_summary") or ""
-    stale = "（理由已改过，结论过期）" if t.get("precheck_stale") else ""
-    return (f"  {t['task_no']:<12} {status:<6} {n} 处{stale}"
-            + (f"  {tail[:60]}" if tail else ""))
+    """一道题在清单里占的那一行。两道质检各占一栏。
+
+    分两栏而不是合成一句「质检没过」：两者该做的动作完全不同，一个是回去核对轨迹，
+    一个是改句子，合并之后人还得再点进去才知道是哪一种。
+    """
+    fact = FACTCHECK_LABEL.get(t.get("factcheck_status") or "", t.get("factcheck_status") or "—")
+    tone = PRECHECK_LABEL.get(t.get("precheck_status") or "", t.get("precheck_status") or "—")
+    nf, nt = t.get("factcheck_mismatches") or 0, t.get("precheck_issues") or 0
+    stale = "（理由已改过，结论过期）" if t.get("precheck_stale") or t.get("factcheck_stale") else ""
+    tail = t.get("factcheck_summary") or t.get("precheck_summary") or ""
+    return (f"  {t['task_no']:<12} 事实 {fact:<4} {nf} 处   措辞 {tone:<4} {nt} 处{stale}"
+            + (f"  {tail[:50]}" if tail else ""))
 
 
 # ---------------- 子命令 ----------------
@@ -88,12 +100,84 @@ async def cmd_ready(args: argparse.Namespace) -> int:
         r.raise_for_status()
         items = r.json()["items"]
     if not items:
-        print("没有该质检的题。口径是「两侧录屏链接齐了、还没拿到有效质检结论」。")
+        print("没有该质检的题。口径是「结论已出、还没拿到有效质检结论」，和录屏没关系 ——"
+              "质检排在录屏前面，录完再改理由就得重录。")
         return 0
     print(f"该做提交前质检的题 {len(items)} 道：")
     for t in items:
         print(_line(t))
     return 0
+
+
+async def cmd_gate(args: argparse.Namespace) -> int:
+    """整条闸门走一遍：事实核验 + 措辞质检 + 本地核验 + 平台质检。
+
+    正常由看门狗自动跑，这里给「刚改完理由想立刻看整条结论」和补跑积压用。
+    走的是后台队列，按分析并发额度排，所以立刻返回，进度看 status。
+    """
+    async with _client() as c:
+        items = await _tasks(c)
+        if args.task_nos:
+            ids, missing = _resolve(items, args.task_nos)
+            if missing:
+                print(f"这些题号在库里找不到：{'、'.join(missing)}", file=sys.stderr)
+                if not ids:
+                    return 2
+        else:
+            r = await c.get("/api/tasks/precheck/ready")
+            r.raise_for_status()
+            ids = [t["id"] for t in r.json()["items"]]
+        nos = {t["id"]: t["task_no"] for t in items}
+        if not ids:
+            print("没有该质检的题，不用跑。")
+            return 0
+        print(f"要质检 {len(ids)} 道：{'、'.join(nos.get(i, str(i)) for i in ids)}")
+        if args.dry_run:
+            print("（--dry-run，没有真的发起）")
+            return 0
+        r = await c.post("/api/tasks/batch/quality-gate", json={"ids": ids})
+        r.raise_for_status()
+        results = r.json()["results"]
+
+    started = [x for x in results if x.get("started")]
+    print()
+    for x in results:
+        print(f"  题 {nos.get(x['id'], x['id'])}：{x.get('message') or ''}")
+    print(f"\n已发起 {len(started)} 道，其余在队列里等额度。跑完看 "
+          f"`python -m app.cli status`，界面上也会自己刷新。")
+    return 0
+
+
+async def cmd_deliver(args: argparse.Namespace) -> int:
+    """交付录屏并提交：给两侧的本地视频路径，收下、代传、直接交到平台。
+
+    这是整条流水线上最后一个人工动作。前面每一步都自己跑完了，缺的只有这两个文件，
+    而它们在哪儿只有人知道。
+    """
+    async with _client() as c:
+        items = await _tasks(c)
+        ids, missing = _resolve(items, [args.task_no])
+        if missing or not ids:
+            print(f"题号 {args.task_no} 在库里找不到", file=sys.stderr)
+            return 2
+        task_id = ids[0]
+        body = {"A": args.a, "B": args.b, "submit": not args.no_submit}
+        r = await c.post(f"/api/tasks/{task_id}/screencast/deliver", json=body)
+        if r.status_code >= 400:
+            try:
+                print(f"没成：{r.json().get('detail')}", file=sys.stderr)
+            except ValueError:
+                print(f"没成：HTTP {r.status_code} {r.text[:300]}", file=sys.stderr)
+            return 1
+        out = r.json()
+
+    print(f"题 {args.task_no}：{out['message']}")
+    submitted = out.get("submitted")
+    if submitted and submitted.get("ok"):
+        print(f"  已提交 #{submitted.get('submission_id') or ''}")
+    elif args.no_submit:
+        print("  （--no-submit，只收下没提交）")
+    return 0 if not submitted or submitted.get("ok") else 1
 
 
 async def cmd_precheck(args: argparse.Namespace) -> int:
@@ -139,25 +223,37 @@ async def cmd_precheck(args: argparse.Namespace) -> int:
 
 
 async def cmd_status(args: argparse.Namespace) -> int:
+    """质检与录屏两步的总览。顺序照流水线来：先质检，后录屏。"""
     async with _client() as c:
         items = await _tasks(c)
-    qc = [t for t in items if t["status"] == "QC"]
-    waiting = [t for t in items if t["status"] == "ANALYZED"]
-    if not qc and not waiting:
-        print("没有在录屏或质检这两步上的题。")
+    checking = [t for t in items if t["status"] == "ANALYZED"]
+    recording = [t for t in items if t["status"] == "QC"]
+    if not checking and not recording:
+        print("没有在质检或录屏这两步上的题。")
         return 0
-    if waiting:
-        print(f"还在等录屏 {len(waiting)} 道：{'、'.join(t['task_no'] for t in waiting)}")
-    if qc:
-        print(f"\n质检栏 {len(qc)} 道：")
-        for t in sorted(qc, key=lambda x: x["task_no"]):
+
+    if checking:
+        print(f"待质检 {len(checking)} 道：")
+        for t in sorted(checking, key=lambda x: x["task_no"]):
             print(_line(t))
-        ok = [t for t in qc if not t.get("precheck_block")]
-        blocked = [t for t in qc if t.get("precheck_block")]
+        hand = [t for t in checking
+                if t.get("factcheck_status") in ("FAIL", "ERROR")
+                or t.get("precheck_status") in ("FAIL", "ERROR")]
+        auto = len(checking) - len(hand)
+        if auto:
+            print(f"  其中 {auto} 道看门狗会自己补跑，不用管。")
+        for t in hand:
+            why = t.get("factcheck_summary") or t.get("precheck_summary") or ""
+            print(f"  题 {t['task_no']} 要人看一眼：{why[:80]}")
+
+    if recording:
+        print(f"\n待录屏 {len(recording)} 道（质检都放行了，理由不会再动）：")
+        ok = [t for t in recording if not t.get("precheck_block")]
+        for t in sorted(recording, key=lambda x: x["task_no"]):
+            print(f"  {t['task_no']:<12} {t.get('precheck_block') or '录屏已齐，可提交'}")
         print(f"\n可以直接提交 {len(ok)} 道"
               + (f"：{'、'.join(t['task_no'] for t in ok)}" if ok else ""))
-        for t in blocked:
-            print(f"  题 {t['task_no']} 提交被挡：{t['precheck_block']}")
+        print("录完把视频交上来：python -m app.cli deliver 题号 A.mp4 B.mp4")
     return 0
 
 
@@ -195,16 +291,25 @@ async def cmd_submit(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m app.cli",
-        description="solo-cli 的对话侧命令。提交前质检只能从这里发起，页面上没有入口。")
+        description="solo-cli 的对话侧命令。流水线自己会跑，这里管录屏交付与兜底。")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("ready", help="列出该做提交前质检的题（录屏已齐、还没有有效结论）")
+    sub.add_parser("status", help="质检与录屏两步的总览，含每道题卡在哪儿")
+    sub.add_parser("ready", help="列出该做提交前质检的题（结论已出、还没有有效结论）")
 
-    q = sub.add_parser("precheck", help="跑提交前质检。不给题号就跑 ready 列出的全部")
+    g = sub.add_parser("gate", help="整条质检走一遍（事实核验 + 措辞 + 核验 + 平台）")
+    g.add_argument("task_nos", nargs="*", metavar="题号")
+    g.add_argument("-n", "--dry-run", action="store_true", help="只看要跑哪些，不真的发起")
+
+    q = sub.add_parser("precheck", help="只跑措辞那一道。不给题号就跑 ready 列出的全部")
     q.add_argument("task_nos", nargs="*", metavar="题号")
     q.add_argument("-n", "--dry-run", action="store_true", help="只看要跑哪些，不真的发起")
 
-    sub.add_parser("status", help="录屏与质检两步的总览，含每道题为什么不能提交")
+    d = sub.add_parser("deliver", help="交付录屏并提交：收下本机视频、代传、直接交到平台")
+    d.add_argument("task_no", metavar="题号")
+    d.add_argument("a", metavar="A侧视频路径")
+    d.add_argument("b", metavar="B侧视频路径")
+    d.add_argument("--no-submit", action="store_true", help="只收下和代传，先不提交")
 
     s = sub.add_parser("submit", help="批量提交。不给题号就提交全部质检放行的题")
     s.add_argument("task_nos", nargs="*", metavar="题号")
@@ -212,8 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-HANDLERS = {"ready": cmd_ready, "precheck": cmd_precheck,
-            "status": cmd_status, "submit": cmd_submit}
+HANDLERS = {"ready": cmd_ready, "gate": cmd_gate, "precheck": cmd_precheck,
+            "deliver": cmd_deliver, "status": cmd_status, "submit": cmd_submit}
 
 
 def main(argv: list[str] | None = None) -> int:

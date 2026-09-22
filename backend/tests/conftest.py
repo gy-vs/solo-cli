@@ -28,6 +28,25 @@ def no_container_side_effects(monkeypatch):
     monkeypatch.setattr(dockerx, "run", guarded)
 
 
+@pytest.fixture(autouse=True)
+def tmp_coder_root(tmp_path, monkeypatch):
+    """把工作区根目录指到临时目录，和 no_container_side_effects 是同一类保护。
+
+    CODER_ROOT 默认落在 `/Users/gaoyong/solo-coder-0908`，那是真人的工作区。凡是
+    会写盘的代码路径（归档录屏、落分析材料、写轨迹索引）在测试里都会往那儿写 ——
+    本机上没有这个目录就抛 PermissionError，有这个目录则更糟：测试会把题号 07、08
+    的真实产物覆盖掉。
+
+    TaskPaths 的每个属性都是现取模块全局，所以换掉属性就能让全部调用方一起改道，
+    不必逐个 fixture 去传路径。
+    """
+    from app import config
+
+    monkeypatch.setattr(config, "CODER_ROOT_MOUNT", tmp_path / "coder")
+    monkeypatch.setattr(config, "CODER_ROOT_HOST", str(tmp_path / "coder"))
+    monkeypatch.setattr(config, "EXPORT_DIR", tmp_path / "exports")
+
+
 @pytest.fixture()
 def tmp_db(tmp_path, monkeypatch):
     """把 db 模块的 engine 换成临时库。

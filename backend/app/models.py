@@ -40,8 +40,8 @@ QUEUED = "QUEUED"                    # 两个 run 都在等槽位
 RUNNING = "RUNNING"                  # 至少一个 run 在跑
 RUN_DONE = "RUN_DONE"                # 两个 run 都结束，等 push 与分析
 ANALYZING = "ANALYZING"              # GSB 对比进行中
-ANALYZED = "ANALYZED"                # 有结论，等录屏
-QC = "QC"                            # 两侧录屏已齐，走提交前质检
+ANALYZED = "ANALYZED"                # 有结论，等提交前质检（事实核验 + 措辞）
+QC = "QC"                            # 质检已放行，等录屏与提交
 UPLOADED = "UPLOADED"                # 已提交 solo2
 DONE = "DONE"                        # 人工确认完成
 NEEDS_ATTENTION = "NEEDS_ATTENTION"  # 重跑用尽或准备失败，等人工
@@ -51,10 +51,14 @@ ALL_STATUSES = (
     AVAILABLE, CLAIMED, QUEUED, RUNNING, RUN_DONE, ANALYZING, ANALYZED, QC,
     UPLOADED, DONE, NEEDS_ATTENTION, DISCARDED,
 )
-# 允许上传的状态。只有 QC —— 提交前质检是提交的必经一步，而 ANALYZED 表示录屏还没齐，
-# 那时连质检都还没轮到。把 ANALYZED 留在这里等于给绕过质检开一条路。
+# 允许上传的状态。只有 QC —— 提交前质检是提交的必经一步，ANALYZED 表示它还没过。
+# 把 ANALYZED 留在这里等于给绕过质检开一条路。
+#
+# 录屏齐不齐不由状态承担，由 submit_block 单独判。录屏是在外部录完之后贴进来的，
+# 它不影响质检结论，所以不该决定题落在哪一栏 —— 早先按录屏推状态的做法把质检排到了
+# 录屏后面，措辞一改就得重录一遍。
 UPLOADABLE = frozenset({QC})
-# 结论已经出来、还在人工手上的两个状态。录屏齐不齐决定题落在哪一个，见 gsb_precheck.sync_stage。
+# 结论已经出来、还没提交的两个状态。质检放行与否决定题落在哪一个，见 gsb_precheck.sync_stage。
 SETTLING = frozenset({ANALYZED, QC})
 
 # 还可以往外发容器的题。RUNNING 必须在内：槽位按容器算，一道题的两侧各排各的队，
@@ -87,9 +91,23 @@ ANALYSIS_DONE = "DONE"
 ANALYSIS_FAILED = "FAILED"
 
 # ---------------- 提交前质检 ----------------
-# 题级状态 QC 只说「这道题在质检这一步」，质检本身走到哪一档由这里承担。
-# ERROR 和 FAIL 必须分开：FAIL 是模型判理由写得像机器，该做的是改文字；ERROR 是质检
-# 自己没跑成（模型超时、输出解不开），该做的是重跑。混成一档会让人跑去改一段没问题的话。
+# 质检这一步有两道，各记各的档，不能合成一个字段：一道查事实、一道查措辞，过不了的
+# 原因和该做的动作完全不同。合成一档的话，界面上只能显示「质检没过」，而人分不出
+# 该去核对轨迹还是该去改句子。
+#
+# ERROR 和 FAIL 也必须分开：FAIL 是判出了问题、该改内容；ERROR 是这道检查自己没跑成
+# （模型超时、账单被拒、输出解不开），该做的是重跑。混成一档会让人跑去改一段没问题的话。
+
+# 事实核验：理由里关于执行结果的话和轨迹对不对得上。见 gsb_factcheck。
+FACTCHECK_IDLE = "IDLE"
+FACTCHECK_RUNNING = "RUNNING"
+FACTCHECK_PASS = "PASS"              # 与轨迹一致，或不符处已自动订正
+FACTCHECK_FAIL = "FAIL"              # 报出了不符但没能自动订正，等人工
+FACTCHECK_CONFIRMED = "CONFIRMED"    # 人工看过并放行
+FACTCHECK_ERROR = "ERROR"            # 核验没跑完
+FACTCHECK_OK = frozenset({FACTCHECK_PASS, FACTCHECK_CONFIRMED})
+
+# 措辞质检：理由读起来像不像一个人写的。见 gsb_precheck。
 PRECHECK_IDLE = "IDLE"              # 还没质检过
 PRECHECK_RUNNING = "RUNNING"
 PRECHECK_PASS = "PASS"              # 模型判读起来像人写的
@@ -197,6 +215,11 @@ class Task(Base, JsonMixin):
     # 正则和平台规则都碰不到那一类毛病（见 gsb_precheck 模块说明）。
     precheck_status: Mapped[str] = mapped_column(String(16), default=PRECHECK_IDLE)
     precheck_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 事实核验：理由里关于执行结果的断言和轨迹对不对得上。和上面三个都不重复 ——
+    # verify_json 判格式、gsb_qc_json 是平台口径、precheck_json 判措辞，
+    # 「说的是不是真的」三者一个都碰不到（见 gsb_factcheck 模块说明）。
+    factcheck_status: Mapped[str] = mapped_column(String(16), default=FACTCHECK_IDLE)
+    factcheck_json: Mapped[str] = mapped_column(Text, default="{}")
     upload_json: Mapped[str] = mapped_column(Text, default="{}")
 
     # ---- 队列与来源 ----
@@ -275,6 +298,14 @@ class Task(Base, JsonMixin):
     @precheck.setter
     def precheck(self, v: dict) -> None:
         self.precheck_json = self._dump(v)
+
+    @property
+    def factcheck(self) -> dict:
+        return self._load(self.factcheck_json, {})
+
+    @factcheck.setter
+    def factcheck(self, v: dict) -> None:
+        self.factcheck_json = self._dump(v)
 
     @property
     def upload(self) -> dict:

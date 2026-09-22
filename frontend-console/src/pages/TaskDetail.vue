@@ -5,6 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { api, SIDES, type GateReport, type Gsb, type Side, type TaskDetail, type TaskRunDetail, type VerifyReport } from '../api'
 import ContainerLive from '../components/ContainerLive.vue'
 import ContainerTerminal from '../components/ContainerTerminal.vue'
+import FactcheckPanel from '../components/FactcheckPanel.vue'
 import GateChecks from '../components/GateChecks.vue'
 import GsbEditor from '../components/GsbEditor.vue'
 import PrecheckPanel from '../components/PrecheckPanel.vue'
@@ -67,17 +68,23 @@ async function load(keepEdits = false) {
   }
   verifyReport.value = t.verify && 'overall' in t.verify ? (t.verify as VerifyReport) : null
   loading.value = false
-  // 跑完就看两侧判定；分析出结论后直接进 GSB；等录屏时停在录屏页；
-  // 质检有话说的时候先去质检页，那是这一步唯一要人动手的地方
+  // 落在哪一页，看这道题现在缺的是什么：还在跑就看两侧判定；等质检而质检有话说
+  // 就去质检页，那是这一步唯一要人动手的地方；质检过了缺录屏就停在录屏页。
   if (!tabPinned.value && !dirty.value) {
     if (!pairEnded(t)) tab.value = t.runs?.length ? 'runs' : 'prompt'
-    else if (t.status === 'QC') tab.value = t.precheck_block ? 'precheck' : 'gsb'
-    // 待录屏而质检有话说：该动手的是改措辞，不是去录屏页
-    else if (t.status === 'ANALYZED' && t.precheck_status === 'FAIL') tab.value = 'precheck'
-    else if (t.status === 'ANALYZED' || t.status === 'UPLOADED' || t.status === 'DONE') {
+    else if (t.status === 'ANALYZED') {
+      tab.value = needsHand(t) ? 'precheck' : 'gsb'
+    } else if (t.status === 'QC' || t.status === 'UPLOADED' || t.status === 'DONE') {
       tab.value = SIDES.every((s) => t.screencast?.[s]) ? 'gsb' : 'screencast'
     } else tab.value = 'runs'
   }
+}
+
+/** 两道质检里有没有等着人动手的。FAIL 是判出了问题、ERROR 是自己没跑成，
+ *  两者都要人看一眼；IDLE 和 RUNNING 不算 —— 那是还没轮到或者正在跑。 */
+function needsHand(t: TaskDetail): boolean {
+  return ['FAIL', 'ERROR'].includes(t.factcheck_status)
+    || ['FAIL', 'ERROR'].includes(t.precheck_status)
 }
 const pairEnded = (t: TaskDetail) => (t.runs?.length === 2) && t.runs.every((r) => RUN_END.includes(r.status))
 
@@ -120,19 +127,21 @@ const gsbDot = computed(() => {
   if (t.gsb_verdict) return 'bg-ok'
   return ''
 })
-/** 质检那个 tab 上的小点：跑着的时候呼吸，挑出问题等人改的时候亮橙。
+/** 质检那个 tab 上的小点：跑着的时候呼吸，挑出问题等人改的时候亮起来。
  *
- * 待录屏的题也点：质检现在赶在录屏之前跑，那时题还是 ANALYZED，只认 QC 的话
- * 刚跑出一堆问题的题在标签上看不出任何动静。没跑过的不点，那不是「有事要做」。 */
+ * 两道一起点，事实那一道优先——它判的是说错了，比措辞生硬严重，颜色也更重。
+ * 没跑过的不点：那不是「有事要做」，只是还没轮到。
+ *
+ * 不看 precheck_block：待质检的题那句话永远非空（说的是「质检还没过」），
+ * 拿它点灯会让每一道待质检的题都亮着橙点，等于没点。 */
 const precheckDot = computed(() => {
   const t = task.value
   if (!t || (t.status !== 'QC' && t.status !== 'ANALYZED')) return ''
-  if (t.precheck_status === 'RUNNING') return 'bg-run animate-breathe'
-  if (t.precheck_status === 'IDLE') return ''
+  if (t.factcheck_status === 'RUNNING' || t.precheck_status === 'RUNNING') return 'bg-run animate-breathe'
+  if (t.factcheck_status === 'FAIL' || t.factcheck_status === 'ERROR') return 'bg-err'
   if (t.precheck_status === 'ERROR') return 'bg-err'
-  // 不看 precheck_block：待录屏的题那句话永远非空（说的是「录屏没齐不能提交」），
-  // 拿它点灯会让每一道待录屏的题都亮着橙点
-  if (t.precheck_status === 'FAIL' || t.precheck_stale) return 'bg-warn'
+  if (t.precheck_status === 'FAIL' || t.precheck_stale || t.factcheck_stale) return 'bg-warn'
+  if (t.factcheck_status === 'IDLE' && t.precheck_status === 'IDLE') return ''
   return 'bg-ok'
 })
 
@@ -379,22 +388,41 @@ const payloadPreview = computed<[string, string][]>(() => {
       <div v-if="ended && !task.gsb_verdict && task.analysis_status !== 'RUNNING'" class="mt-3 text-xs text-fg1">
         两侧都跑完了。看护会自动提交产物并开始对比分析，也可以点「提交产物并分析」立刻走一遍。
       </div>
-      <div v-if="task.status === 'ANALYZED' && !screencastReady" class="mt-3 text-xs text-warn flex items-start gap-1.5">
+      <div v-if="task.status === 'QC' && !screencastReady" class="mt-3 text-xs text-warn flex items-start gap-1.5">
         <span class="dot mt-1.5 shrink-0 bg-warn" />
-        <span>结论已经出了，就等录屏。按录屏页给的步骤把两侧项目分别跑起来录完，把链接贴回来这道题就进质检。</span>
+        <span>
+          两道质检都放行了，理由不会再动，照着它录就行。按录屏页给的步骤把两侧项目分别跑起来录完，
+          把视频路径贴回录屏页，系统会收下、代传并直接提交。
+        </span>
       </div>
-      <div v-if="task.status === 'QC' && task.precheck_block" class="mt-3 text-xs text-warn flex items-start gap-1.5">
+      <div v-if="task.status === 'QC' && screencastReady && task.precheck_block"
+        class="mt-3 text-xs text-warn flex items-start gap-1.5">
         <span class="dot mt-1.5 shrink-0 bg-warn" />
-        <span>{{ task.precheck_block }}。质检看的是理由读起来像不像一个人写的，去「提交前质检」页逐条看。</span>
+        <span>{{ task.precheck_block }}</span>
       </div>
-      <!-- 待录屏的题不提「不能提交」——那是明摆着的，录屏还没录。这里要说的是另一件事：
-           趁还没录，先把质检挑出来的措辞改掉，改完再录就不用重录 -->
-      <div v-if="task.status === 'ANALYZED' && task.precheck_status === 'FAIL'"
+      <!-- 事实那一道排在措辞前面，提示也照这个顺序给：说错了比说得生硬严重，
+           而两者该做的动作完全不同 —— 一个是回去核对轨迹，一个是改句子 -->
+      <div v-if="task.status === 'ANALYZED' && task.factcheck_status === 'FAIL'"
+        class="mt-3 text-xs text-err flex items-start gap-1.5">
+        <span class="dot mt-1.5 shrink-0 bg-err" />
+        <span>
+          事实核验发现 {{ task.factcheck_mismatches }} 处描述和轨迹对不上，自动订正没成功。
+          去「提交前质检」页看是哪几处——报告里写了轨迹里实际是什么，照着改完确认就行。
+        </span>
+      </div>
+      <div v-else-if="task.status === 'ANALYZED' && task.precheck_status === 'FAIL'"
         class="mt-3 text-xs text-warn flex items-start gap-1.5">
         <span class="dot mt-1.5 shrink-0 bg-warn" />
         <span>
           质检挑出 {{ task.precheck_issues }} 处机械化表达。趁还没录屏，去「提交前质检」页逐条改完再录，
           录完再改理由就得重录一遍。
+        </span>
+      </div>
+      <div v-else-if="task.status === 'ANALYZED' && task.factcheck_applied"
+        class="mt-3 text-xs text-fg1 flex items-start gap-1.5">
+        <span class="dot mt-1.5 shrink-0 bg-ok" />
+        <span>
+          事实核验对着轨迹订正了 {{ task.factcheck_mismatches }} 处描述，改了哪几处在「提交前质检」页写着。
         </span>
       </div>
       <div v-if="discarded" class="mt-3 text-xs text-fg1">
@@ -540,11 +568,16 @@ const payloadPreview = computed<[string, string][]>(() => {
           <ScreencastPanel v-else :task="task" :gsb="gsb" @saved="load(true)" />
         </template>
 
-        <!-- 提交前质检 -->
+        <!-- 提交前质检：事实核验在前、措辞在后，摆放顺序照流水线的顺序来。
+             先把话说对，再把话说顺——反过来打磨的是一段事实还错着的话 -->
         <template v-if="tab === 'precheck'">
           <div v-if="!task.gsb_verdict" class="card empty">还没有理由正文，质检没有可读的东西</div>
-          <PrecheckPanel v-else :task="task" :report="task.precheck" :dirty="dirty" :readonly="locked"
-            @confirmed="load()" @ran="load()" @apply="applyRewrite" />
+          <template v-else>
+            <FactcheckPanel :task="task" :report="task.factcheck" :dirty="dirty" :readonly="locked"
+              @confirmed="load()" @ran="load()" />
+            <PrecheckPanel :task="task" :report="task.precheck" :dirty="dirty" :readonly="locked"
+              @confirmed="load()" @ran="load()" @apply="applyRewrite" />
+          </template>
         </template>
 
         <!-- 上传 -->

@@ -66,15 +66,20 @@ export const discardedTasks = computed(() => store.tasks.filter((t) => t.status 
 /** 需要人工处理的题：重跑用尽或推产物失败，首页要能一眼看到 */
 export const stuckTasks = computed(() => store.tasks.filter((t) => t.status === 'NEEDS_ATTENTION'))
 
-/** 分析完、等录屏链接的题 */
+/** 质检放行了、等录屏链接的题。质检排在录屏前面，所以这一批的理由不会再动了 */
 export const waitingScreencast = computed(() => store.tasks.filter(
-  (t) => t.status === 'ANALYZED' && SIDES.some((s) => !t.screencast?.[s]),
+  (t) => t.status === 'QC' && SIDES.some((s) => !t.screencast?.[s]),
 ))
 
-/** 录屏齐了、停在提交前质检这一步的题 */
-export const inQc = computed(() => store.tasks.filter((t) => t.status === 'QC'))
-/** 其中质检还没放行的：要么没跑过质检，要么模型挑出了问题等人改 */
-export const qcPending = computed(() => inQc.value.filter((t) => !!t.precheck_block))
+/** 结论已出、停在提交前质检这一步的题 */
+export const inQc = computed(() => store.tasks.filter((t) => t.status === 'ANALYZED'))
+/** 其中等着人动手的：两道里任意一道判了待人工，或者自己没跑成。
+ *  不看 precheck_block —— 待质检的题那句话永远非空（说的是「质检还没过」），
+ *  拿它数等于把整栏都算成要人处理。 */
+export const qcPending = computed(() => inQc.value.filter(
+  (t) => ['FAIL', 'ERROR'].includes(t.factcheck_status)
+    || ['FAIL', 'ERROR'].includes(t.precheck_status),
+))
 
 /** 合并 SSE 高频事件，250ms 内只刷一次 */
 export function scheduleRefresh() {

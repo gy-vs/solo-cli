@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
+import time
 from datetime import datetime
 
 from sqlalchemy import select
@@ -35,12 +37,12 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import (
-    ANALYSIS_FAILED, ANALYSIS_IDLE, ANALYSIS_RUNNING, ANALYZING, DISCARDED, NEEDS_ATTENTION,
-    QUEUED, RUN_DONE,
+    ANALYSIS_FAILED, ANALYSIS_IDLE, ANALYSIS_RUNNING, ANALYZED, ANALYZING, DISCARDED,
+    FACTCHECK_IDLE, NEEDS_ATTENTION, PRECHECK_IDLE, QC, QUEUED, RUN_DONE,
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
-    RUN_TIMEOUT, SCHEDULABLE, WATCHED, RunEvent, Task, TaskRun, as_utc, utc_now,
+    RUN_TIMEOUT, SCHEDULABLE, SETTLING, WATCHED, RunEvent, Task, TaskRun, as_utc, utc_now,
 )
-from app.services import dockerx, gsb_repo, settings_store
+from app.services import dockerx, gsb_repo, llm, settings_store
 
 log = logging.getLogger("watchdog")
 
@@ -73,6 +75,10 @@ _advance_tasks: dict[int, asyncio.Task] = {}
 # NEEDS_ATTENTION 的、有分析失败过的，配对扫描一律够不着（见 _pairs_ready），
 # 当场丢掉就是悄无声息地不干活 —— 人在界面上只会看到自己点过的那批里有几道永远没动静。
 _advance_wanted: list[int] = []
+# 人工点过「跑质检」、还没轮到额度的题。和 _advance_wanted 分开排：那批要走推产物
+# 加分析，这批只跑两道质检，一道题的耗时差着一个量级，混在一个队里会让点质检的人
+# 排在几道正在做分析的题后面干等。
+_gate_wanted: list[int] = []
 _last_tick_at: datetime | None = None
 _last_error = ""
 _last_stats: dict = {}
@@ -251,8 +257,16 @@ def clear_analysis(task: Task) -> None:
     task.gsb = {}
     task.verify = {}
     task.gsb_qc = {}
+    # 两道提交前质检评的都是那段已经不存在的理由，留着它们，一道重跑过的题会带着
+    # 上一轮的「事实核验通过」直接可提交，而那份核验对的是上一跑的轨迹。
+    task.factcheck_status = FACTCHECK_IDLE
+    task.factcheck = {}
+    task.precheck_status = PRECHECK_IDLE
+    task.precheck = {}
     analysis_dir = config.TaskPaths(task.task_no).analysis
-    for name in ("gsb_prompt.md", "gsb_raw.txt"):
+    # gsb_facts.json 是事实核验的材料，它对应的是上一跑的轨迹，必须跟着清掉：
+    # 留着的话下一轮核验会拿上一跑的执行记录去判新理由，报出来的不符全是假的。
+    for name in ("gsb_prompt.md", "gsb_raw.txt", "gsb_facts.json"):
         (analysis_dir / name).unlink(missing_ok=True)
 
 
@@ -534,24 +548,36 @@ async def _advance_pair(task_id: int) -> dict:
 
 
 async def run_quality_gate(task_id: int) -> dict:
-    """理由质检 + 本地核验 + solo-qa 的 GSB 质检。
+    """事实核验 + 措辞质检 + 本地核验 + solo-qa 的 GSB 质检。
 
-    三道拦的东西不一样：理由质检把措辞改顺、篇幅压到规范之内，会调模型并且直接改写
-    理由正文；本地核验只看确定性的东西（长度、AI 痕迹、证据能不能在材料里定位、两侧
-    材料齐不齐），快且不花钱；solo-qa 那道是平台自己的口径，慢但结论权威。
+    四道拦的东西各不相同，一道都不能省：
+    - 事实核验：理由里关于执行结果的话和轨迹对不对得上。会调模型，对不上的直接订正。
+    - 措辞质检：读起来像不像一个人写的，篇幅压到规范之内。会调模型，直接改写正文。
+    - 本地核验：确定性的东西（长度、AI 痕迹、证据能不能定位、两侧材料齐不齐），
+      快且不花钱。
+    - solo-qa 质检：平台自己的口径，慢但结论权威。
 
-    顺序是定死的：理由质检必须排在最前面。它会换掉理由正文，排在后面的话，核验与平台
-    质检读到的是改之前那一稿，而最终提交上去的是改之后的——两边看的不是同一段话，
-    核验过了也说明不了提交的那一份合规。
+    顺序是定死的，前两道尤其不能换。两道都会整段换掉理由正文，而事实必须先定下来：
+    先把话说对，再把话说顺。反过来的话，措辞那一版打磨的是一段事实还错着的话，
+    事实核验接着又把它改一遍，前一次的打磨白做，而且改完的那一段没人再看措辞。
 
-    理由质检没跑成不挡后面两道。它是让文字更像人写的，不是判这道题成不成立；模型欠费
-    或者超时的时候把整条闸门停掉，等于一道题都过不去。
+    后两道也必须排在前两道之后：它们读到的必须是最终要提交的那一段，否则核验过了
+    也说明不了提交的那一份合规。
+
+    前两道没跑成都不挡后面。模型欠费或者超时的时候把整条闸门停掉，等于一道题都过不去；
+    过不了的那一档会留在 ERROR 上，看门狗看到账单恢复会自己回来补。
     """
-    from app.services import gsb_precheck, gsb_verifier, qa_bridge
+    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier, qa_bridge
+
+    fact = await gsb_factcheck.run_factcheck(task_id)
+    if not fact.get("ok"):
+        log.warning("题 %d 事实核验没跑成，继续走措辞质检：%s", task_id, fact.get("message", ""))
+    elif fact.get("applied"):
+        log.info("题 %d 事实核验订正了 %d 处后进入措辞质检", task_id, fact.get("mismatches", 0))
 
     pre = await gsb_precheck.run_precheck(task_id)
     if not pre.get("ok"):
-        log.warning("题 %d 理由质检没跑成，继续走核验：%s", task_id, pre.get("message", ""))
+        log.warning("题 %d 措辞质检没跑成，继续走核验：%s", task_id, pre.get("message", ""))
 
     report = await gsb_verifier.run_verify(task_id)
     if report.get("overall") == "block":
@@ -570,7 +596,7 @@ async def run_quality_gate(task_id: int) -> dict:
             task.gsb_qc = qc
             task.auto_error = _qc_note(qc)[:2000]
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return {**qc, "precheck": pre}
+    return {**qc, "precheck": pre, "factcheck": fact}
 
 
 def _qc_note(qc: dict) -> str:
@@ -963,6 +989,187 @@ def _start_advance(task_id: int) -> None:
         _advance_one(task_id), name=f"advance-{task_id}")
 
 
+# ---------------- 质检积压 ----------------
+# 分析跑完自动接一道质检，这条路走通了就不会有积压。会有积压是因为质检也在调模型：
+# 账单被拒、网关抽风、后端重启，任何一次没跑成，题就停在「待质检」上，而它已经过了
+# 配对扫描那一关（analysis_status 是 DONE），后面没有任何一步会再碰它。
+#
+# 这一步专收这种题：结论已经有了、两道质检还没都放行的，一律重新排进闸门。判「该不该
+# 再跑」用的是两个模块自己的 skip_reason，所以不会对着一段没改过的话反复烧调用。
+
+def _quality_backlog() -> list[int]:
+    """结论已出、两道质检还没都走完的题，按题号排。
+
+    口径借 gsb_precheck.ready_ids，不在这里另写一套：CLI 和页面上那个 ready 列表用的
+    是同一个函数，两处各判一套的话，人看到「该质检 12 道」而巡检自己捡了 15 道，
+    对不上账的时候没人说得清哪边是对的。
+    """
+    from app.services import gsb_precheck
+
+    return gsb_precheck.ready_ids()
+
+
+async def _gate_one(task_id: int) -> None:
+    r = await run_quality_gate(task_id)
+    if not r.get("ok"):
+        log.info("题 %s 补跑质检没有全过：%s", task_id, r.get("error") or r.get("summary") or "")
+
+
+def _start_gate(task_id: int) -> None:
+    """补跑质检也占推进额度。两者都在调模型，分开算额度等于把并发悄悄翻倍。"""
+    _advance_tasks[task_id] = asyncio.create_task(
+        _gate_one(task_id), name=f"gate-{task_id}")
+
+
+async def _scan_quality_backlog() -> int:
+    """把卡在待质检的题重新排进闸门。返回这一轮新起了几个。
+
+    排在配对之后：新跑完的题该优先拿到结论，补跑的这批已经等了一轮，再等一轮无妨。
+    人工排的队又比扫描自己捡的优先，和配对那边同一个道理。
+    """
+    started = 0
+    while _gate_wanted and _advance_slots():
+        task_id = _gate_wanted.pop(0)
+        if _advancing_now(task_id):
+            continue
+        log.info("题 %s 是人工点的质检，开始跑事实核验与措辞质检", task_id)
+        _start_gate(task_id)
+        started += 1
+    for task_id in _quality_backlog():
+        if not _advance_slots():
+            break
+        if _advancing_now(task_id) or task_id in _gate_wanted:
+            continue
+        log.info("题 %s 结论已出但质检没走完，补跑事实核验与措辞质检", task_id)
+        _start_gate(task_id)
+        started += 1
+    return started
+
+
+def queue_gate(task_id: int) -> dict:
+    """把一道题排进后台质检，不等它跑完。
+
+    和 queue_advance 同一个理由：两道质检都在调模型，一道题几分钟，批量点十道那条
+    HTTP 请求必然先超时，而动作已经在后台跑起来了 —— 人看到的是一个失败，回头再点
+    一遍，于是同一道题被质检两遍。
+    """
+    _reap_advances()
+    if _advancing_now(task_id):
+        return {"ok": True, "started": False, "message": "这道题正在跑质检"}
+    if task_id in _gate_wanted:
+        return {"ok": True, "started": False,
+                "message": f"已在质检队列里等额度，第 {_gate_wanted.index(task_id) + 1} 位"}
+    if _advance_slots():
+        _start_gate(task_id)
+        return {"ok": True, "started": True, "message": "已开始跑事实核验与措辞质检"}
+    _gate_wanted.append(task_id)
+    wake()
+    return {"ok": True, "started": False,
+            "message": f"分析并发已满，排在第 {len(_gate_wanted)} 位等额度"}
+
+
+# ---------------- 模型恢复探测 ----------------
+# 账单被拒不是偶发故障，它会一直拒到人去结账为止，而这期间每一次分析、每一次质检都
+# 会失败一次并把题留在 FAILED / ERROR 上。等账结清了，这批题没有任何机制会自己回来：
+# 分析失败的靠人换 Key 才触发 retry_failed_analyses，质检 ERROR 的连这个都没有。
+#
+# 所以这里主动探一下。探测本身也是一次模型调用，不能每轮都探：没有积压时一次都不探，
+# 有积压时按 PROBE_GAP_S 节流。探通了就把两类都放回流程，剩下的交给上面两步扫描。
+
+PROBE_GAP_S = 600
+_last_probe_at = 0.0
+_llm_ok = True
+
+
+def _llm_stalled(report: dict) -> bool:
+    """这一档是不是「模型没答上来」，而不是这道题本身有问题。
+
+    两道质检失败时会打 llm_error 标记，这里只认那个标记，不去猜报错文本。猜的代价
+    是实打实的：「两侧都没有轨迹执行记录」这种失败重试一百次还是同样的结果，混进来
+    之后每次探测成功都会把它放回流程，下一轮再报一次，从此每轮空转。
+
+    没有标记的老行按报错文本兜一道：建这个标记之前留下的 ERROR 行拿不到它，而那批
+    恰恰是账单那阵子攒下来的，一条都不放回去等于白做这件事。
+    """
+    if not report.get("error"):
+        return False
+    if "llm_error" in report:
+        return bool(report["llm_error"])
+    return _LLM_ERROR_HINT.search(str(report.get("error") or "")) is not None
+
+
+# 老行兜底用。只认高置信度的说法：模型调用失败的原因最终都从 llm.classify 出来，
+# 而它给的那几句话是固定的。
+_LLM_ERROR_HINT = re.compile(
+    r"账单|API Key|模型名|无权|没有返回|没有新输出|返回了空内容|模型调用失败"
+    r"|\b(429|5\d{2})\b|rate.?limit|timed? ?out|ConnectError", re.I)
+
+
+def _blocked_by_llm() -> tuple[int, int]:
+    """因为模型调不通而卡住的题有多少。返回 (分析失败的, 质检没跑完的)。
+
+    只认「模型不通」这一类原因。分析失败的原因五花八门（轨迹缺失、输出解不开、
+    结论认不出来），拿那些题去触发探测等于每十分钟白烧一次调用，而它们重跑多少次
+    都是同样的结果。
+    """
+    analyses = qc = 0
+    with session() as db:
+        for task in db.execute(select(Task).where(
+                Task.analysis_status == ANALYSIS_FAILED)).scalars():
+            if llm.classify(task.auto_error or "")[1] is False:
+                analyses += 1  # 不可重试 = 账单 / 鉴权 / 模型名，正是要等恢复的那类
+        for task in db.execute(select(Task).where(Task.status.in_(SETTLING))).scalars():
+            if _llm_stalled(task.factcheck or {}) or _llm_stalled(task.precheck or {}):
+                qc += 1
+    return analyses, qc
+
+
+def _release_llm_blocked() -> int:
+    """把因为模型不通而卡住的题放回流程。返回放回了几道。
+
+    质检那两档只复位成 IDLE，不在这里直接跑：跑不跑、跑几道要走额度，
+    那是 _scan_quality_backlog 的事。这里只负责把门打开。
+    """
+    freed = len(retry_failed_analyses())
+    with session() as db:
+        for task in db.execute(select(Task).where(Task.status.in_(SETTLING))).scalars():
+            touched = False
+            if _llm_stalled(task.factcheck or {}):
+                task.factcheck_status, task.factcheck, touched = FACTCHECK_IDLE, {}, True
+            if _llm_stalled(task.precheck or {}):
+                task.precheck_status, task.precheck, touched = PRECHECK_IDLE, {}, True
+            if touched:
+                task.auto_error = ""
+                freed += 1
+    return freed
+
+
+async def _scan_llm_recovery() -> int:
+    """模型恢复了就把卡住的题全放回流程。返回放回了几道。"""
+    global _last_probe_at, _llm_ok
+    analyses, qc = _blocked_by_llm()
+    if not (analyses or qc):
+        _llm_ok = True
+        return 0
+    now = time.time()
+    if now - _last_probe_at < PROBE_GAP_S:
+        return 0
+    _last_probe_at = now
+    probe = await llm.probe_ping()
+    if not probe.get("ok"):
+        if _llm_ok:
+            log.warning("模型仍然调不通（%s），%s 道分析、%s 道质检等着恢复",
+                        probe.get("message", "")[:200], analyses, qc)
+        _llm_ok = False
+        return 0
+    _llm_ok = True
+    freed = _release_llm_blocked()
+    if freed:
+        log.info("模型恢复调用（%s），把 %s 道卡住的题放回流程", probe.get("message", ""), freed)
+        wake()
+    return freed
+
+
 async def _scan_pairs() -> int:
     """把该推进的题交给后台，不等它跑完。返回这一轮新起了几个。
 
@@ -998,7 +1205,12 @@ async def tick() -> dict:
     # 也都排在配对之前：推进是按额度慢慢来的，状态不能跟着它一起等。
     stats["run_done"] = _settle_finished()
     stats["settled"] = _settle_stopped()
+    # 探测排在推进前面：账单刚恢复时，这一步会把上一轮卡住的题放回流程，
+    # 紧接着的两步扫描当轮就能把它们排上，不必再等一个周期。
+    stats["freed"] = await _scan_llm_recovery()
     advanced = await _scan_pairs()
+    # 补跑质检排在配对之后，共用同一份额度：新跑完的题该优先拿到结论
+    stats["gated"] = await _scan_quality_backlog()
     # 台账校正放最后：上面几步可能刚销毁过容器，这时对齐一次正好
     fixed = await _reconcile_containers()
     return {"adopted": adopted, **stats, "advanced": advanced, "container_fixed": fixed}
@@ -1034,9 +1246,10 @@ async def _loop() -> None:
             # 每轮都留一行。巡检绝大多数时候什么都不做，一声不吭的话，「它到底还在不在
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
             log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 转待分析 %s · 转人工 %s"
-                     " · 起推进 %s（在跑 %s） · 耗时 %.1fs",
+                     " · 恢复放回 %s · 起推进 %s · 补质检 %s（在跑 %s） · 耗时 %.1fs",
                      stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
-                     stats["run_done"], stats["settled"], stats["advanced"], len(_advance_tasks),
+                     stats["run_done"], stats["settled"], stats["freed"], stats["advanced"],
+                     stats["gated"], len(_advance_tasks),
                      (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise
@@ -1087,6 +1300,7 @@ async def stop() -> None:
         job.cancel()
     _advance_tasks.clear()
     _advance_wanted.clear()
+    _gate_wanted.clear()
     if _task:
         _task.cancel()
 

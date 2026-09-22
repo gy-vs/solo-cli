@@ -280,38 +280,11 @@ def reason_digest(reason: str) -> str:
 def _vet_rewrite(rewrite: str, original: str, verdict: str) -> tuple[str, str]:
     """决定这份整段改写稿要不要留。返回 (采信的稿子, 丢弃原因)。
 
-    把关比以前更要紧了：这份稿子不再等人点一下才生效，质检跑完就直接盖掉理由正文。
-    所以凡是「套进去之后核验才报红」的稿子，必须在这里就拦下来。
-
-    以前拦的是缩水——按篇幅不能低于原文六成算。那条线现在是反的：篇幅目标从五百多
-    收到三四百之后，把一段六百字的理由压到三百五正是这一步要做的事，照旧规则会把
-    每一份合格的稿子都判成「删掉了论点」。改成按绝对下限判：低于写作规范的下限才算
-    删过头，中间随便压。
-
-    三道关：
-    - 篇幅落在规范的窗口里（下限防删过头，上限防它只换说法不压篇幅）；
-    - 不能引入原文没有的核验红项；
-    - 两侧都要还在。结论翻没翻这件事程序判不了，但一份只剩单侧的稿子必然是删过头了，
-      而这恰好是 reason_both_sides 这条红项管的事，上一条已经覆盖。
+    判据本身在 gsb_analyzer.vet_rewrite —— 事实核验那一步也整段换理由，两处必须
+    照同一把尺子量，否则同一份稿子会在一步被放行、在另一步被拦。这里只留一个
+    名字，是因为把关这件事是这个模块的职责，调用方按模块名找得到。
     """
-    text = _clean(rewrite)
-    if not text:
-        return "", ""
-    n = gsb_rules.visible_chars(text)
-    floor = (gsb_rules.MIN_SAME_REASON_CHARS if verdict == "Same"
-             else gsb_rules.MIN_REASON_CHARS)
-    if n < floor:
-        return "", f"改写稿只有 {n} 字，不足 {floor} 字，删过头了"
-    if n > gsb_rules.REASON_SOFT_MAX_CHARS:
-        return "", (f"改写稿 {n} 字，仍然超过 {gsb_rules.REASON_SOFT_MAX_CHARS} 字的上限，"
-                    f"只换了说法没有压篇幅")
-    before = {name for name, level, _ in gsb_rules.reason_checks(original, verdict=verdict)
-              if level == "block"}
-    after = [msg for name, level, msg in gsb_rules.reason_checks(text, verdict=verdict)
-             if level == "block" and name not in before]
-    if after:
-        return "", f"改写稿引入了原文没有的红项：{'；'.join(after[:2])}"
-    return text, ""
+    return gsb_analyzer.vet_rewrite(rewrite, original, verdict)
 
 
 def local_defects(reason: str, verdict: str = "") -> list[str]:
@@ -374,57 +347,82 @@ def normalize(obj: dict, *, reason: str, verdict: str = "") -> dict:
 
 # ---------------- 阶段投影 ----------------
 
-def screencast_ready(task: Task) -> bool:
+def missing_screencast(task: Task) -> list[str]:
+    """还缺哪几侧的录屏链接。"""
     sc = task.screencast or {}
-    return all(str(sc.get(s) or "").strip() for s in config.SIDES)
+    return [s for s in config.SIDES if not str(sc.get(s) or "").strip()]
+
+
+def screencast_ready(task: Task) -> bool:
+    return not missing_screencast(task)
+
+
+def quality_settled(task: Task) -> bool:
+    """两道质检都放行了没有。事实核验管「说的是不是真的」，措辞质检管「读起来像不像人写的」。
+
+    两道都要过。只认措辞那一道的话，一段写得很顺、但把对方没犯的错算上去的理由
+    会一路走到提交；只认事实那一道，交出去的又是一段机器味的话。
+    """
+    from app.services import gsb_factcheck
+
+    return gsb_factcheck.settled(task) and task.precheck_status in PRECHECK_OK and not stale(task)
 
 
 def sync_stage(db, task: Task) -> bool:  # noqa: ANN001
-    """按录屏齐不齐把题在 ANALYZED 和 QC 之间挪。返回有没有挪动。
+    """按两道质检过没过把题在 ANALYZED 和 QC 之间挪。返回有没有挪动。
 
-    质检这一步的入口条件就是「录屏录完了」，所以状态由录屏链接推出来，而不是让
-    某个动作各写各的。填完两条链接题自己就进质检栏，链接被清掉又退回待录屏——
-    以前那种「谁动谁写」的做法在这里会留下一批录屏齐了却还挂在待录屏栏的题，
-    而人正是照着栏目决定下一步做什么。
+    这里原先是按录屏齐不齐推的，含义正好反过来：ANALYZED 是「等录屏」，填完两条
+    链接才进质检。那个顺序有个实打实的代价 —— 质检会整段改写理由，而人是对着理由
+    去录屏、讲解产物的，改完就得重录一遍。录屏本身只是提交时要填的一个参数，它不
+    影响质检判什么，没有理由排在质检前面。所以两步对调：分析一完就质检，质检放行
+    了再去录。
 
-    只在 ANALYZED 与 QC 之间动。已经上传、已完成、需人工的题不碰：那些状态下录屏
-    链接的有无不再决定任何事。
+    状态由质检结论推出来，而不是让某个动作各写各的。两道都过题自己就进待录屏栏，
+    理由被人改过（指纹对不上）又退回待质检 —— 「谁动谁写」的做法迟早会留下一批
+    质检早就过了却还挂在待质检栏的题，而人正是照着栏目决定下一步做什么。
+
+    只在 ANALYZED 与 QC 之间动。已经上传、已完成、需人工的题不碰：那些状态下
+    质检结论的新旧不再决定任何事。
     """
-    if task.status == ANALYZED and screencast_ready(task):
+    if task.status == ANALYZED and quality_settled(task):
         task.status = QC
         return True
-    if task.status == QC and not screencast_ready(task):
+    if task.status == QC and not quality_settled(task):
         task.status = ANALYZED
-        # 退回待录屏就把质检结论一起清掉。录屏链接被换掉通常是重录了一份，
-        # 这时留着上一轮的「通过」会让它在重新录完之后直接可提交，等于跳过质检。
-        task.precheck_status = PRECHECK_IDLE
-        task.precheck = {}
         return True
     return False
 
 
 def sync_all() -> int:
-    """开机对账：补齐迁移出来的空档，再按录屏齐不齐重新归位。返回挪动了几道。
+    """开机对账：补齐迁移出来的空档，再按质检过没过重新归位。返回挪动了几道。
 
-    两件事都是给历史数据补的。质检这一步是后加的，此前录屏齐了的题一律停在 ANALYZED，
-    不补这一次它们会挂在待录屏栏里（录屏明明齐了），提交按钮还是灰的，人看不出为什么。
-    而 ALTER TABLE 补出来的 precheck_status 是空串 —— 空串在界面上什么都不显示，
-    提交门禁那边也得靠白名单才挡得住，规整成 IDLE 省掉后面每一处的特例判断。
+    两件事都是给历史数据补的。ALTER TABLE 补出来的 precheck_status / factcheck_status
+    是空串 —— 空串在界面上什么都不显示，提交门禁那边也得靠白名单才挡得住，规整成
+    IDLE 省掉后面每一处的特例判断。
+
+    归位这一次会把一批题从 QC 退回 ANALYZED，这是对的，不是回退。QC 的含义从「录屏
+    齐了」换成了「两道质检都放行」，而事实核验是新加的一道，历史数据一律没跑过。
+    退回去它们会被看门狗按新流程补上核验，补完自己再进来。
     """
+    from app.services import gsb_factcheck
+
     moved, fixed = [], 0
     with session() as db:
         for task in db.query(Task).all():
             if not task.precheck_status:
                 task.precheck_status = PRECHECK_IDLE
                 fixed += 1
+            if not task.factcheck_status:
+                task.factcheck_status = gsb_factcheck.FACTCHECK_IDLE
+                fixed += 1
             if task.status in SETTLING and sync_stage(db, task):
                 moved.append(task.id)
     for tid in moved:
         bus.publish("tasks", {"type": "task", "id": tid})
     if fixed:
-        log.info("提交前质检：%d 道题补上质检初始状态", fixed)
+        log.info("提交前质检：补上 %d 处质检初始状态", fixed)
     if moved:
-        log.info("提交前质检：%d 道题按录屏齐不齐重新归位", len(moved))
+        log.info("提交前质检：%d 道题按质检过没过重新归位", len(moved))
     return len(moved)
 
 
@@ -449,10 +447,20 @@ def submit_block(task: Task) -> str:
 
     这里是提交的唯一口径，界面上那个按钮灰不灰也照它算，免得前端按一套条件放行、
     后端按另一套回绝，人点下去才知道不行。
+
+    录屏在这里判，不在状态上判。质检移到录屏前面之后，状态只表示「质检过没过」，
+    而录屏仍然是提交的必填项 —— 缺了它平台会以「字段缺失」回绝，那句话得在人按
+    按钮之前就说出来。
     """
+    from app.services import gsb_factcheck
+
     if task.status not in UPLOADABLE:
-        return (f"当前状态 {task.status} 不能提交，两侧录屏链接齐了才会进质检"
+        return (f"当前状态 {task.status} 不能提交，两道提交前质检都放行了才会进待录屏"
                 if task.status == ANALYZED else f"当前状态 {task.status} 不能提交")
+    if blocked := gsb_factcheck.factcheck_block(task):
+        return blocked
+    if missing := missing_screencast(task):
+        return f"还缺 {'、'.join(missing)} 侧的录屏，录完贴进来就能提交"
     report = task.precheck or {}
     status = task.precheck_status
     # 白名单：只有明确放行的两档算过，其余一律挡下。写成「排除掉几个坏档」的黑名单会
@@ -484,7 +492,12 @@ def _save(task_id: int, status: str, report: dict, *, reason: str = "") -> None:
     两件事必须在同一个事务里做完：换正文、把指纹改成新正文的。分两次写的话，中间
     那一瞬间库里是「新正文 + 旧指纹」，而 stale() 正是拿这两样比的，这时候读一次就会
     判成「质检之后理由又改过」，把刚放行的题挡在提交门外。
+
+    事实核验那一档的指纹也要一起过继，理由见 gsb_factcheck.reseal —— 它记的同样是
+    「这份结论对应哪一稿」，这里换了正文不管它，等于每道题都要把事实核验再跑一遍。
     """
+    from app.services import gsb_factcheck
+
     with session() as db:
         task = db.get(Task, task_id)
         if task is None:
@@ -495,6 +508,7 @@ def _save(task_id: int, status: str, report: dict, *, reason: str = "") -> None:
             task.gsb = gsb
             report = {**report, "reason_digest": reason_digest(reason),
                       "reason_chars": gsb_rules.visible_chars(reason)}
+            gsb_factcheck.reseal(task, reason)
         task.precheck_status = status
         task.precheck = report
         sync_stage(db, task)
@@ -540,7 +554,9 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
         parsed = gsb_analyzer.extract_object(r.text, "issues", "质检 JSON")
     except (llm.LlmError, ValueError) as exc:
         log.warning("题 %s 提交前质检没跑完：%s", task_no, exc)
-        _save(task_id, PRECHECK_ERROR, {**base, "error": str(exc)[:600],
+        # llm_error 标记这次失败是「模型没答上来」而不是这段理由有问题。看门狗的恢复
+        # 探测按它挑要放回流程的题，见 watchdog._blocked_by_llm。
+        _save(task_id, PRECHECK_ERROR, {**base, "error": str(exc)[:600], "llm_error": True,
                                         "duration_s": round(time.time() - started)})
         return {"ok": False, "message": f"质检没跑完：{exc}"}
 
@@ -620,24 +636,28 @@ def confirm(task_id: int, note: str = "") -> dict:
 # ---------------- 该质检哪些题 ----------------
 
 def ready_ids() -> list[int]:
-    """录屏已齐、还没拿到有效质检结论的题，按题号排。
+    """两道质检里还有一道没走完的题，按题号排。
 
-    口径只认「录屏齐了」这一件事，因为质检要在人看过录屏、准备整批提交的时候跑。
+    两道都要看。只问措辞那一道的话，历史数据会整批漏掉——它们的 precheck 早就是 PASS，
+    而事实核验是后加的一道，一律还是 IDLE，于是这批最该核的题在 ready 列表里一个都
+    不出现，而看门狗的积压扫描又明明挑得到它们，两边对不上账。
+
+    不再看录屏。质检移到了录屏前面，等录屏齐了才跑就回到了老流程 —— 措辞一改人得
+    重录一遍。
+
     已经通过或已经人工确认、而且理由没再改过的题不重复跑：一次质检就是一次模型调用，
     对着同一段没动过的话再问一遍，答案一样，钱白花。
     """
+    from app.services import gsb_factcheck
+
     with session() as db:
-        out = []
-        for task in db.query(Task).filter(Task.status.in_((ANALYZED, QC))).all():
-            # 「该不该再跑一次」的口径只写在 skip_reason 里，这边只额外加录屏这一条：
-            # 两处各判一套的话，CLI 挑出来的题和页面勾出来的题会对不上。
-            if screencast_ready(task) and not skip_reason(task):
-                out.append((task.task_no, task.id))
+        out = [(t.task_no, t.id) for t in db.query(Task).filter(Task.status.in_((ANALYZED, QC))).all()
+               if not (skip_reason(t) and gsb_factcheck.skip_reason(t))]
         return [tid for _, tid in sorted(out)]
 
 
 def submittable_ids() -> list[int]:
-    """质检放行、可以直接提交的题。批量提交按它取。"""
+    """质检放行、录屏也齐了、可以直接提交的题。批量提交按它取。"""
     with session() as db:
         return [t.id for t in db.query(Task).filter(Task.status == QC).all()
                 if submittable(t)]

@@ -35,6 +35,9 @@ export type Status =
 /** 提交前质检走到哪一档。ERROR 是质检自己没跑成，和 FAIL 不是一回事 */
 export type PrecheckStatus = 'IDLE' | 'RUNNING' | 'PASS' | 'FAIL' | 'CONFIRMED' | 'ERROR'
 
+/** 事实核验走到哪一档。取值与措辞质检同形，两者是提交前并列的两道 */
+export type FactcheckStatus = PrecheckStatus
+
 /** 单侧运行状态。取值与题级有同名的，比较时别混用 */
 export type RunStatus = 'PENDING' | 'QUEUED' | 'RUNNING' | 'FINISHED' | 'FAILED' | 'TIMEOUT' | 'INTERRUPTED'
 
@@ -109,9 +112,19 @@ export interface TaskBrief {
   precheck_summary: string
   /** 质检之后理由又改过，这份结论不再代表现在这一稿 */
   precheck_stale: boolean
-  /** 不能提交的原因。空串表示能提交，按钮灰不灰照这个字段，别在前端另凑一套条件 */
+  /** 不能提交的原因。两道质检、录屏、状态全在后端判完，空串表示能提交。
+   *  按钮灰不灰照这个字段，别在前端另凑一套条件 */
   precheck_block: string
   precheck_at: string
+  /** 事实核验：理由里关于执行结果的话和轨迹对不对得上 */
+  factcheck_status: FactcheckStatus
+  factcheck_mismatches: number
+  /** 核验发现不符并自动订正过。改前那一稿在 factcheck.reason_before */
+  factcheck_applied: boolean
+  /** 订正留痕，一处一句：哪一段哪一句、轨迹里其实是什么、改成了什么 */
+  factcheck_notes: string[]
+  factcheck_summary: string
+  factcheck_stale: boolean
   upload_ok: boolean | null
   submission_id: number | null
   priority: number
@@ -212,12 +225,48 @@ export interface PrecheckReport {
   error?: string
 }
 
+/** 事实核验报告。一处不符记四样：原文、轨迹里其实是什么、改成了什么、归哪一侧 */
+export interface FactMismatch {
+  quote: string
+  side?: Side | ''
+  claim?: string
+  fact?: string
+  fix?: string
+}
+
+export interface FactcheckReport {
+  mismatches?: FactMismatch[]
+  /** 订正留痕，一处一句，直接可读 */
+  notes?: string[]
+  summary?: string
+  applied?: boolean
+  applied_at?: string
+  /** 订正之前那一稿。自动改写不留这一份就成了不可追溯的覆盖 */
+  reason_before?: string
+  chars_before?: number
+  /** 本地那把确定性的尺子先摘出来的可疑断言，模型未必都认 */
+  local_suspects?: { quote: string; side: string; why: string }[]
+  /** 改写稿没被采用的原因。非空说明这次只报了问题没能自动订正 */
+  rewrite_dropped?: string
+  model?: string
+  rounds?: number
+  duration_s?: number
+  finished_at?: string
+  confirmed_at?: string
+  confirmed_from?: string
+  confirmed_note?: string
+  /** 措辞质检改写之后，事实结论过继到新一稿的时间 */
+  resealed_at?: string
+  error?: string
+}
+
 export interface TaskDetail extends TaskBrief {
   user_prompt: string
   gsb: Gsb | Record<string, never>
   analysis: any
   verify: VerifyReport | Record<string, never>
   precheck: PrecheckReport | Record<string, never>
+  factcheck: FactcheckReport | Record<string, never>
   upload: any
   dedup: any
   runs: TaskRunDetail[]
@@ -482,7 +531,12 @@ export const api = {
   saveScreencast: (id: number, body: Partial<Record<Side, string>>) =>
     put<{ verify: VerifyReport; task: TaskBrief }>(`/api/tasks/${id}/screencast`, body),
   uploadScreencast: (id: number, side: Side, path: string) =>
-    post<{ ok: boolean; url: string; message: string }>(`/api/tasks/${id}/screencast/upload?side=${side}&path=${encodeURIComponent(path)}`),
+    post<{ ok: boolean; url: string; path: string; message: string }>(`/api/tasks/${id}/screencast/upload?side=${side}&path=${encodeURIComponent(path)}`),
+  /** 交付录屏：给两侧的本地文件路径，后端收进题目目录、代传、顺手提交。
+   *  submit 传 false 就只收下不提交。这是整条流水线上最后一个人工动作。 */
+  deliverScreencast: (id: number, body: { A?: string; B?: string; submit?: boolean }) =>
+    post<{ ok: boolean; message: string; submitted: { ok: boolean; message: string } | null; task: TaskBrief }>(
+      `/api/tasks/${id}/screencast/deliver`, body),
 
   // ---- 宿主机动作（启动项目、录屏）----
   /** 这两件事后端在容器里干不了，统一转给宿主机上的 host-agent */
@@ -497,8 +551,24 @@ export const api = {
   hostRecordStop: (id: number, side: Side) =>
     post<{ ok: boolean; file: string; host_file: string; size: number; seconds: number; message: string }>(`/api/host/tasks/${id}/record/stop?side=${side}`),
 
-  // ---- 提交前质检 ----
-  /** 单道，跑完才回（一道一分半，按钮转着圈等）。状态不对时后端回 409 */
+  // ---- 提交前质检：事实核验（说得对不对）与措辞质检（说得像不像人话）两道 ----
+  /** 事实核验单道。拿轨迹里的执行记录去对理由，不符的地方后端直接订正并留痕，
+   *  订正明细在返回的 notes 里，也落进 task.factcheck.notes */
+  factcheck: (id: number) =>
+    post<{ ok: boolean; passed: boolean; applied: boolean; mismatches: number
+      notes: string[]; summary: string; message: string }>(`/api/tasks/${id}/factcheck`),
+  confirmFactcheck: (id: number, note = '') =>
+    post<{ ok: boolean; message: string; task: TaskBrief }>(
+      `/api/tasks/${id}/factcheck/confirm`, { note }),
+  batchFactcheck: (ids: number[]) =>
+    post<{ results: BatchResult[] }>('/api/tasks/batch/factcheck', { ids }),
+  /** 整条闸门走一遍：事实核验 → 措辞质检 → 本地核验 → 平台质检。
+   *  顺序和巡检自动跑的完全一致，不另起一套 */
+  qualityGate: (id: number) => post<any>(`/api/tasks/${id}/quality-gate`),
+  startBatchQualityGate: (ids: number[]) =>
+    post<{ results: BatchResult[] }>('/api/tasks/batch/quality-gate', { ids }),
+
+  /** 措辞质检单道，跑完才回（一道一分半，按钮转着圈等）。状态不对时后端回 409 */
   precheck: (id: number) =>
     post<{ ok: boolean; passed: boolean; issues: number; summary: string; message: string }>(
       `/api/tasks/${id}/precheck`),

@@ -30,7 +30,11 @@ def _report(passed=True, issues=(), rewrite="", summary="读起来自然"):
 
 @pytest.fixture()
 def qc_task(tmp_db):
-    """一道录屏已齐、停在质检这一步的题。"""
+    """一道事实核验已过、录屏也齐了、只差措辞质检的题。
+
+    事实核验要先摆好。提交门禁按流水线顺序判，事实那一档没过就直接回绝，
+    后面措辞的每一档都问不到，这一节要验的恰恰是措辞那几档。
+    """
     from app.db import session
 
     with session() as db:
@@ -38,6 +42,8 @@ def qc_task(tmp_db):
                    repo_url="https://github.com/acme/widget")
         t.gsb = {"verdict": "A", "reason": GOOD}
         t.screencast = {"A": "https://v.example/a", "B": "https://v.example/b"}
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"mismatches": [], "reason_digest": gp.reason_digest(GOOD)}
         db.add(t)
         db.flush()
         return t.id
@@ -238,31 +244,50 @@ def test_stale_also_covers_a_fail_whose_reason_got_fixed(qc_task):
 
 # ---------------- 阶段投影 ----------------
 
-def test_screencast_complete_moves_task_into_qc(tmp_db):
+def test_both_checks_cleared_moves_task_on_to_recording(tmp_db):
+    """质检排在录屏前面：两道都放行，题才进待录屏栏。录屏本身不参与这个判断。"""
     from app.db import session
 
     with session() as db:
         t = m.Task(task_no="08", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
-        t.screencast = {"A": "u", "B": "u"}
+        t.gsb = {"verdict": "A", "reason": GOOD}
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"reason_digest": gp.reason_digest(GOOD)}
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
         db.add(t)
         db.flush()
         assert gp.sync_stage(db, t) is True and t.status == m.QC
 
 
-def test_missing_screencast_sends_task_back_and_clears_verdict(tmp_db):
-    """录屏被换掉通常是重录了一份。留着上一轮的「通过」会让它重录完直接可提交。"""
+def test_only_the_wording_check_cleared_is_not_enough(tmp_db):
+    """一段写得很顺、却把对方没犯的错算上去的理由，不能凭措辞那一道就放行。"""
+    from app.db import session
+
+    with session() as db:
+        t = m.Task(task_no="08", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
+        t.gsb = {"verdict": "A", "reason": GOOD}
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
+        db.add(t)
+        db.flush()
+        assert gp.sync_stage(db, t) is False and t.status == m.ANALYZED
+
+
+def test_reason_edited_after_the_gate_sends_the_task_back(tmp_db):
+    """人在界面上又改了一稿，两道结论都不再代表这一稿，题要退回去重检。"""
     from app.db import session
 
     with session() as db:
         t = m.Task(task_no="08", prompt_hash="h", user_prompt="x", status=m.QC)
-        t.screencast = {"A": "u", "B": ""}
+        t.gsb = {"verdict": "A", "reason": GOOD + "补一句。"}
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"reason_digest": gp.reason_digest(GOOD)}
         t.precheck_status = m.PRECHECK_PASS
-        t.precheck = {"passed": True}
+        t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
         db.add(t)
         db.flush()
-        assert gp.sync_stage(db, t) is True
-        assert t.status == m.ANALYZED
-        assert t.precheck_status == m.PRECHECK_IDLE and t.precheck == {}
+        assert gp.sync_stage(db, t) is True and t.status == m.ANALYZED
 
 
 def test_sync_stage_leaves_uploaded_tasks_alone(tmp_db):
@@ -303,19 +328,44 @@ def test_block_treats_an_unmigrated_blank_status_as_unchecked(qc_task):
 
 
 def test_sync_all_fills_blank_status_and_regroups(tmp_db):
-    """开机对账：空档补成 IDLE，录屏齐了的老题从待录屏挪进质检。"""
+    """开机对账：ALTER TABLE 补出来的空档规整成 IDLE，两道都过的题挪进待录屏。"""
     from app.db import session
 
     with session() as db:
         old = m.Task(task_no="11", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
-        old.screencast = {"A": "u", "B": "u"}
-        old.precheck_status = ""
-        db.add(old)
+        old.gsb = {"verdict": "A", "reason": GOOD}
+        old.precheck_status = m.PRECHECK_PASS
+        old.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
+        old.factcheck_status = m.FACTCHECK_CONFIRMED
+        old.factcheck = {"reason_digest": gp.reason_digest(GOOD)}
+        blank = m.Task(task_no="12", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
+        blank.precheck_status = ""
+        blank.factcheck_status = ""
+        db.add_all([old, blank])
         db.flush()
-        tid = old.id
+        tid, blank_id = old.id, blank.id
     assert gp.sync_all() == 1
-    t = _task(tid)
-    assert t.status == m.QC and t.precheck_status == m.PRECHECK_IDLE
+    assert _task(tid).status == m.QC
+    t = _task(blank_id)
+    assert t.precheck_status == m.PRECHECK_IDLE and t.factcheck_status == m.FACTCHECK_IDLE
+    assert t.status == m.ANALYZED
+
+
+def test_sync_all_pulls_back_tasks_that_never_had_a_factcheck(tmp_db):
+    """历史数据一律没跑过事实核验。它们从待录屏退回待质检，等看门狗补上这一道。"""
+    from app.db import session
+
+    with session() as db:
+        legacy = m.Task(task_no="13", prompt_hash="h", user_prompt="x", status=m.QC)
+        legacy.gsb = {"verdict": "A", "reason": GOOD}
+        legacy.screencast = {"A": "u", "B": "u"}
+        legacy.precheck_status = m.PRECHECK_PASS
+        legacy.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
+        db.add(legacy)
+        db.flush()
+        tid = legacy.id
+    assert gp.sync_all() == 1
+    assert _task(tid).status == m.ANALYZED
 
 
 def test_block_counts_issues_when_precheck_failed(qc_task):
@@ -490,14 +540,15 @@ def test_run_precheck_refuses_on_a_running_task(tmp_db):
     assert asyncio.run(gp.run_precheck(tid))["ok"] is False
 
 
-def test_run_precheck_promotes_analyzed_task_with_screencast(tmp_db, monkeypatch):
-    """录屏早就齐了、状态还挂在待录屏的老题，质检完顺手归位到质检栏。"""
+def test_run_precheck_promotes_a_task_whose_factcheck_already_passed(tmp_db, monkeypatch):
+    """措辞是两道里的后一道。它一过，题就该自己挪进待录屏栏，不等别的动作来推。"""
     from app.db import session
 
     with session() as db:
         t = m.Task(task_no="09", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
         t.gsb = {"verdict": "A", "reason": GOOD}
-        t.screencast = {"A": "u", "B": "u"}
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"reason_digest": gp.reason_digest(GOOD)}
         db.add(t)
         db.flush()
         tid = t.id
@@ -555,7 +606,8 @@ def test_confirm_refuses_while_precheck_is_running(qc_task):
 
 # ---------------- 挑题 ----------------
 
-def test_ready_skips_tasks_without_screencast(tmp_db):
+def test_ready_includes_a_task_that_has_not_been_recorded_yet(tmp_db):
+    """质检移到了录屏前面。等录屏齐了才挑，就回到了「措辞一改得重录」的老流程。"""
     from app.db import session
 
     with session() as db:
@@ -563,7 +615,8 @@ def test_ready_skips_tasks_without_screencast(tmp_db):
         t.gsb = {"verdict": "A", "reason": GOOD}
         db.add(t)
         db.flush()
-    assert gp.ready_ids() == []
+        tid = t.id
+    assert gp.ready_ids() == [tid]
 
 
 def test_ready_includes_a_task_waiting_for_precheck(qc_task):

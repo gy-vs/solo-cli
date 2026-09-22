@@ -23,7 +23,7 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import (
-    ANALYSIS_DONE, ANALYSIS_FAILED, ANALYSIS_RUNNING, ANALYZED, ANALYZING,
+    ANALYSIS_DONE, ANALYSIS_FAILED, ANALYSIS_RUNNING, ANALYZED, ANALYZING, FACTCHECK_IDLE,
     NEEDS_ATTENTION, PRECHECK_IDLE, Task, TaskRun, utc_now,
 )
 from app.services import dockerx, gsb_repo, gsb_rules, llm, trace
@@ -42,6 +42,15 @@ VERDICTS = tuple(VERDICT_LABEL)
 DIFF_BUDGET = 40000
 STEP_LIMIT = 140
 STEP_TEXT_LIMIT = 120
+# 步骤列表里一律不带命令输出，输出统一走执行记录那一块。两处都放会把同一段文本
+# 在 prompt 里计两次预算，而步骤列表要的只是「按顺序发生了什么」。
+FACTS_BUDGET = 12000
+# 一条命令的输出留多少。测试框架的结论行（多少过多少败、哪个用例炸了、编译错在哪）
+# 基本都落在输出的头尾，中间是逐条用例的刷屏，所以掐头留尾比整段截断有用。
+OUT_LIMIT = 240
+CHECK_LIMIT = 24
+FAILURE_LIMIT = 16
+ENDING_LIMIT = 800
 
 # 这三类差异不反映模型能力，写进理由等于拿环境问题给模型定罪，平台也不认。
 EXCLUDED_FACTORS = """
@@ -51,6 +60,31 @@ EXCLUDED_FACTORS = """
 3. 网络工程错误，包括网络波动、请求失败、网关超时、连接重置、限流。
 某一侧出现上面任何一种情况，只在 remark 字段里写一句说明，不写进 reason，
 也不作为谁更好的依据。
+""".strip()
+
+# 这一段单独摆出来，不混在写法要求里。它管的不是怎么写，是允不允许说——
+# 违反写法要求最多是读起来像机器，违反这一条是把对方没犯的错算到它头上，
+# 交上去就是一份错的评审。
+#
+# 之所以要写这么死：模型拿到一份看着有问题的 diff（少了个导入、类型对不上、
+# 改了函数签名没改调用方），几乎必然会顺手写一句「这一侧跑不起来」。而那句话
+# 它并没有依据，执行记录里明明白白写着跑通了。这类断言在已提交的数据里出现过
+# 不止一次，每一次都要回头人工订正。
+FACT_REDLINE = """
+【红线：执行结果只能来自执行记录】
+这一条违反了，整份分析作废，比结论判错还严重。
+
+1. 关于「跑没跑起来、编译过没过、测试过没过、报了什么错」的每一句话，都必须能在
+   那一侧的实际执行记录里指出是哪一条命令、哪一段输出。指不出来就不要写。
+2. 不许从代码改动推断执行效果。看着少了个导入、看着类型对不上、看着签名改了调用方
+   没跟着改——这些都只能说成「代码上看这里有问题」，不能说成「所以它跑不起来」
+   「所以构建会失败」。一侧到底跑没跑起来，执行记录里有答案，没答案就是没有依据。
+3. 不许把「执行记录里没有」说成「它没做过」以外的任何东西。没有校验命令，能写的
+   只有「没有留下验证记录」；不能写成「跑不通」「有问题没发现」。
+4. 执行记录里有成功的测试或构建，就不许写「没跑过测试」「没有验证」；有完整的收尾
+   总结，就不许写「戛然而止」「中途放弃」。
+5. 两侧都按同一把尺子量。不要因为某一侧的执行记录更详细就默认它更可靠，也不要
+   因为另一侧记录少就补一句推断出来的负面结论。
 """.strip()
 
 
@@ -111,6 +145,7 @@ async def collect_side(task_no: str, side: str, run: TaskRun, snapshot: str) -> 
     index = _load_trace_index(task_no, side)
     material["steps"] = _condense_steps(index)
     material["counts"] = index.get("counts") or {}
+    material["facts"] = run_facts(index)
     return material
 
 
@@ -131,8 +166,16 @@ def _condense_steps(index: dict) -> list[str]:
         room = STEP_LIMIT - len(keep)
         if room > 0:
             plain = [i for i, s in enumerate(steps) if not s.get("is_error")]
-            stride = max(1, len(plain) // room)
-            keep.update(plain[::stride][:room])
+            # 按名额把正常步均匀铺满整段，必须把最后一步含进来。
+            # 以前用 plain[::stride][:room] 取：stride 向下取整，抽出来的比名额多，
+            # 再被 [:room] 一刀切，切掉的正好是收尾那一截。模型于是看不到最后的
+            # 测试结果和总结，把跑完的一侧写成「戛然而止」「没跑过测试」。
+            if len(plain) <= room:
+                keep.update(plain)
+            else:
+                last = len(plain) - 1
+                keep.update(plain[round(k * last / (room - 1))] if room > 1 else plain[last]
+                            for k in range(room))
         steps = [s for i, s in enumerate(steps) if i in keep]
 
     out = []
@@ -142,6 +185,132 @@ def _condense_steps(index: dict) -> list[str]:
         flag = " [报错]" if s.get("is_error") else ""
         out.append(f"{kind}{flag} {summary}".strip())
     return out
+
+
+# ---------------- 执行记录 ----------------
+# 这一块是为了堵住一类反复出现的错判：模型看着代码改动，推断「这一侧编译不过」
+# 「跑不起来」「没跑过测试」，而轨迹里明明摆着跑通的命令和完整的收尾总结。根子在
+# 材料本身——送进 prompt 的步骤列表只有工具名和命令原文，没有任何一条命令的输出。
+# 模型手上压根没有执行结果，于是只能从 diff 推，推出来的又被当成事实写进理由。
+#
+# 所以把「实际执行了什么、跑出了什么」单独摘成一块结构化材料。摘的是三样：
+#   - 校验类命令（测试、构建、lint、直接跑脚本）连同它们的输出；
+#   - 所有报错的步骤，不限于命令；
+#   - 收尾那段话，用来判这一侧到底有没有跑完。
+# 三样都来自轨迹，没有任何推断。轨迹里没有就是空的，空的本身也是事实——prompt 里
+# 会写明「这一侧没有执行记录」，而不是留白让模型自己填。
+
+SRC_EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+SRC_PATH = re.compile(r"\.(py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|rb|php|c|h|cc|cpp|swift|kt)$")
+# 校验类命令：跑测试、构建、类型检查、lint，以及直接把脚本跑起来复现。
+# 「直接跑脚本」必须收进来——很多题的验证方式就是 node repro.js 看输出对不对，
+# 漏掉它这类题就会整批显示成「没有任何执行记录」。
+VERIFY_CMD = re.compile(
+    r"\b(?:npm|pnpm|yarn|npx|bun|deno)\s+(?:run\s+)?(?:test|build|lint|check|tsc|typecheck)\b"
+    r"|\b(?:pytest|vitest|jest|mocha|tox|nox|rspec|phpunit|ruff|eslint|mypy|tsc|flake8)\b"
+    r"|\bcargo\s+(?:test|build|check|clippy)\b|\bgo\s+(?:test|build|vet)\b"
+    r"|\b(?:mvn|gradle|make|cmake|dotnet)\b|\bdotnet\s+test\b"
+    r"|\bnode\s+--test\b|\bpython\d?\s+-m\s+(?:pytest|unittest)\b"
+    r"|\b(?:node|python\d?|ruby|php|deno\s+run|bun\s+run)\s+[\w./-]+\.\w+", re.I)
+
+
+def _clip(text: str, limit: int = OUT_LIMIT) -> str:
+    """把一段输出压到 limit 以内，掐头留尾。
+
+    测试框架的结论（多少条过、哪条炸了、编译错在哪）落在输出的开头或结尾，中间
+    是逐条用例的刷屏。整段从前面截断会把「N failed」那一行切掉，而那一行恰恰是
+    这块材料存在的全部理由。
+    """
+    body = " ".join(str(text or "").split())
+    if len(body) <= limit:
+        return body
+    head = limit * 2 // 3
+    return f"{body[:head]} …… {body[-(limit - head):]}"
+
+
+def run_facts(index: dict) -> dict:
+    """从轨迹索引里摘出这一侧真实发生过的执行结果。不做任何推断。
+
+    `after_last_edit` 是最有用的一项：改完代码之后还跑没跑过校验，直接决定了
+    「交出去的这一版到底验证过没有」。改之前跑通不算数，那验的是改之前的代码。
+    """
+    steps = list(index.get("steps") or [])
+    last_edit = -1
+    last_edit_file = ""
+    for i, s in enumerate(steps):
+        if s.get("tool") in SRC_EDIT_TOOLS:
+            for f in (s.get("files") or []):
+                if SRC_PATH.search(str(f)):
+                    last_edit, last_edit_file = i, str(f)
+                    break
+
+    checks: list[dict] = []
+    failures: list[dict] = []
+    commands = 0
+    for i, s in enumerate(steps):
+        summary = str(s.get("summary") or "")
+        is_cmd = s.get("tool") == "Bash"
+        if is_cmd:
+            commands += 1
+            cmd = " ".join(summary.lstrip("$ ").split())
+            if VERIFY_CMD.search(cmd) and len(checks) < CHECK_LIMIT:
+                checks.append({"cmd": cmd[:160], "ok": not s.get("is_error"),
+                               "out": _clip(s.get("result")),
+                               "after_last_edit": i > last_edit})
+        if s.get("is_error") and len(failures) < FAILURE_LIMIT:
+            what = (" ".join(summary.lstrip("$ ").split()) if is_cmd
+                    else f"{s.get('tool') or s.get('kind') or 'step'} {summary}")
+            failures.append({"what": what[:160], "out": _clip(s.get("result"))})
+
+    return {
+        "steps_total": len(steps),
+        "commands_total": commands,
+        "last_edit_file": last_edit_file,
+        "checks": checks,
+        "failures": failures,
+        "ending": _clip(index.get("last_assistant_text"), ENDING_LIMIT),
+        "stop_reason": str(index.get("stop_reason") or ""),
+    }
+
+
+def facts_block(facts: dict) -> str:
+    """把执行记录摊成 prompt 里的一段。空的也要写出来，留白会被当成「没查到」。"""
+    if not facts or not facts.get("steps_total"):
+        return "（这一侧没有轨迹，执行情况无从判断，不要就此下任何结论）"
+
+    out: list[str] = []
+    checks = facts.get("checks") or []
+    if checks:
+        out.append("跑过的校验类命令（测试 / 构建 / 类型检查 / 直接运行）：")
+        for c in checks:
+            when = "最后一次改代码之后" if c.get("after_last_edit") else "最后一次改代码之前"
+            out.append(f"  [{'成功' if c.get('ok') else '失败'}·{when}] {c['cmd']}")
+            if c.get("out"):
+                out.append(f"      输出：{c['out']}")
+    else:
+        out.append("跑过的校验类命令：一条都没有。"
+                   "（这是「没有验证过」的唯一依据，也仅能支撑这一句，"
+                   "不要据此说产物跑不起来或者编译不过。）")
+
+    failures = facts.get("failures") or []
+    if failures:
+        out.append("报过错的步骤：")
+        for f in failures:
+            out.append(f"  {f['what']}")
+            if f.get("out"):
+                out.append(f"      报错：{f['out']}")
+    else:
+        out.append("报过错的步骤：没有。")
+
+    if ending := facts.get("ending"):
+        out.append(f"最后说的话（用它判断这一侧是不是跑完了）：{ending}")
+    else:
+        out.append("最后没有留下任何总结性的话。")
+    if reason := facts.get("stop_reason"):
+        out.append(f"结束原因：{reason}")
+
+    text = "\n".join(out)
+    return text if len(text) <= FACTS_BUDGET else text[:FACTS_BUDGET] + "\n  （执行记录过长，已截断）"
 
 
 def _load_trace_index(task_no: str, side: str) -> dict:
@@ -178,6 +347,8 @@ def build_prompt(task: Task, materials: dict[str, dict]) -> str:
             f"改动文件：\n" + ("\n".join(f"  {f}" for f in (m.get('files') or [])) or "  （无）") +
             f"{extra}\n"
             f"过程（按先后顺序，每行一步）：\n{step_text}\n"
+            f"实际执行记录（摘自轨迹，是执行结果的唯一依据）：\n"
+            + "\n".join(f"  {line}" for line in facts_block(m.get('facts') or {}).splitlines()) + "\n"
             f"代码改动：\n<<<PATCH-{side}\n{m.get('patch') or '（无改动）'}\nPATCH-{side}>>>\n"
         )
 
@@ -196,19 +367,29 @@ def build_prompt(task: Task, materials: dict[str, dict]) -> str:
 PROMPT>>>
 
 【两侧的材料】
-下面给出的就是全部材料，没有别的地方可查。产物看代码改动，过程看那一行行的步骤记录。
-判断需求有没有真的实现，以代码改动为准，不要凭步骤记录里的说法下结论。
+下面给出的就是全部材料，没有别的地方可查。每一侧给四样东西，各有各的用途，不要串用：
+- 代码改动：判断产物好坏的依据。需求点实现了没有、接口改没改坏、边界处理得全不全，
+  都看它。
+- 实际执行记录：判断执行结果的唯一依据。跑没跑起来、编译过没过、测试过没过、
+  报了什么错，只看它，它没写的就是没有依据。
+- 步骤记录：看过程走向的，哪里顺、哪里卡、哪里反复试错。它只说做了什么，不说结果，
+  所以不要拿它当结论。
+- 改动统计与文件清单：看改动规模和落点的。
 
 {block('A')}
 {block('B')}
 
+{FACT_REDLINE}
+
 【工作步骤】
 1. 先读原始 prompt，把需求拆成可核验的功能点与约束清单。
 2. 对着两侧的代码改动逐条核验，看功能点是不是真的实现了、约束有没有被破坏。
-3. 再看两侧的过程，判断各自哪里顺、哪里卡、哪里绕了远路或者反复试错。
-4. 逐项对比，给出哪一侧更好，或者确实等价。核验做得细是对的，但写的时候只挑
+3. 再读两侧的实际执行记录，确认各自到底跑过什么、跑出了什么结果。要写进理由的
+   每一句执行结果，都要能在这份记录里指出是哪一条。
+4. 再看两侧的过程，判断各自哪里顺、哪里卡、哪里绕了远路或者反复试错。
+5. 逐项对比，给出哪一侧更好，或者确实等价。核验做得细是对的，但写的时候只挑
    一到两个真正影响结论的点展开，别把核验清单原样交出去。
-5. 另外分别给出两侧产物的启动方式，要让人照着就能把项目跑起来录屏；
+6. 另外分别给出两侧产物的启动方式，要让人照着就能把项目跑起来录屏；
    材料不足以给出完整步骤时，在对应的 note 里写清缺什么。
 
 【不许纳入判断的因素】
@@ -473,13 +654,16 @@ def _reason_score(text: str, *, verdict: str, peer_openings: dict | None
       轻重的话，一段「太短」会被当成和「太长」等价，于是模型回一句二十几个字的
       话也算改好了，而太短恰恰是核验会拦的那一档。
     - 黄项条数其次。
-    - 最后记还超出上限多少字。超篇幅只算一条黄项，一千字砍到七百字在条数上毫无
+    - 最后记离篇幅窗口还差多少字。超篇幅只算一条黄项，一千字砍到七百字在条数上毫无
       变化，只按条数比就会把这次真实的进展整个丢掉，改三轮也原地不动。
+      两头都要记：篇幅窗口抬到三百五到四百五之后，写短了也成了一档要改的毛病，
+      只记超出的那头会让「二百字补到三百字」同样显示成没有进展。
     """
     found = gsb_rules.reason_checks(text, verdict=verdict, peer_openings=peer_openings)
     blocks = sum(1 for _, level, _ in found if level == "block")
-    over = max(0, gsb_rules.visible_chars(text) - gsb_rules.REASON_SOFT_MAX_CHARS)
-    return [m for _, _, m in found], (blocks, len(found) - blocks, over)
+    n = gsb_rules.visible_chars(text)
+    off = max(0, n - gsb_rules.REASON_SOFT_MAX_CHARS, gsb_rules.REASON_SOFT_MIN_CHARS - n)
+    return [m for _, _, m in found], (blocks, len(found) - blocks, off)
 
 
 def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
@@ -503,7 +687,17 @@ def build_reason_fix_prompt(reason: str, defects: list[str]) -> str:
     listed = "\n".join(f"{i}. {d}" for i, d in enumerate(defects, 1))
     n = gsb_rules.visible_chars(reason)
     aim = (gsb_rules.REASON_TARGET_MIN + gsb_rules.REASON_TARGET_MAX) // 2
-    if n <= gsb_rules.REASON_SOFT_MAX_CHARS:
+    if n < gsb_rules.REASON_SOFT_MIN_CHARS:
+        # 写短了。补字这件事比删字危险得多：模型手上已经没有材料了，让它「写长一点」
+        # 它就会去编执行结果。所以把补什么说死——补的是原文已经点到、但只说了半句
+        # 的那些判断依据，不是新的论点。
+        listed += (f"\n\n这一段现在 {n} 字，太短了，要补到 {gsb_rules.REASON_TARGET_MIN} 到 "
+                   f"{gsb_rules.REASON_TARGET_MAX} 字，落在 {aim} 字左右最好。"
+                   f"补的只能是原文里已经点到、但没讲透的那部分：某一侧具体差在哪个文件的"
+                   f"哪个地方、这个问题会造成什么后果、为什么这一点压过了另一侧的长处。"
+                   f"不要补新的论点，更不要补原文里没有的执行结果——"
+                   f"跑没跑通、测试过没过，原文没写的就是没有依据，一个字都不要加。")
+    elif n <= gsb_rules.REASON_SOFT_MAX_CHARS:
         # 没超限也要把预算说出来。不说它就只管换说法，一段 562 字的换完就是 588 字，
         # 措辞那条警告是修掉了，超篇幅那条又冒出来，分数没变好，整版被丢弃——四轮
         # 下来原文一个字没动。这批题本来就贴着上限，余量只有几个字。
@@ -608,6 +802,41 @@ async def polish_reason(reason: str, *, verdict: str, peer_openings: dict | None
     return text, defects
 
 
+def vet_rewrite(rewrite: str, original: str, verdict: str,
+                repos: dict[str, Path] | None = None) -> tuple[str, str]:
+    """决定一份整段改写稿要不要留。返回 (采信的稿子, 丢弃原因)，两者必有一个是空的。
+
+    事实核验和口语化质检都会整段换掉理由，而它们都是自动落库、不等人点头的。所以
+    「什么样的稿子能用」必须只有一份判据：两处各写一套的话，一份稿子在这一步被放行、
+    换到那一步又被拦，人看到的是同一段话时好时坏，而两处的日志都说自己是对的。
+
+    三道关：
+    - 篇幅落在规范的窗口里。下限防删过头，上限防它只换说法不压篇幅。
+    - 不能引入原文没有的核验红项。原文本来就有的不算它的账——那是上一步留下的，
+      在这里拦住只会让这一步永远交不出稿子。
+    - 两侧都还在。结论翻没翻程序判不了，但一份只剩单侧的稿子必然是删过头了，
+      而这恰好是 reason_both_sides 这条红项管的事，上一条已经覆盖。
+    """
+    text = _clean(rewrite, repos)
+    if not text:
+        return "", ""
+    n = gsb_rules.visible_chars(text)
+    floor = (gsb_rules.MIN_SAME_REASON_CHARS if verdict == "Same"
+             else gsb_rules.MIN_REASON_CHARS)
+    if n < floor:
+        return "", f"改写稿只有 {n} 字，不足 {floor} 字，删过头了"
+    if n > gsb_rules.REASON_SOFT_MAX_CHARS:
+        return "", (f"改写稿 {n} 字，仍然超过 {gsb_rules.REASON_SOFT_MAX_CHARS} 字的上限，"
+                    f"只换了说法没有压篇幅")
+    before = {name for name, level, _ in gsb_rules.reason_checks(original, verdict=verdict)
+              if level == "block"}
+    after = [msg for name, level, msg in gsb_rules.reason_checks(text, verdict=verdict)
+             if level == "block" and name not in before]
+    if after:
+        return "", f"改写稿引入了原文没有的红项：{'；'.join(after[:2])}"
+    return text, ""
+
+
 def _findings_defects(a: dict, b: dict) -> list[str]:
     return (gsb_rules.findings_checks(a, label="a_findings.")
             + gsb_rules.findings_checks(b, label="b_findings."))
@@ -702,8 +931,11 @@ async def analyze_task(task_id: int) -> dict:
         t.analysis_status = ANALYSIS_RUNNING
         t.status = ANALYZING
         t.auto_error = ""
-        # 重新分析会整段换掉理由，上一轮的提交前质检结论对新的这一段不再成立。
-        # 留着它，一道重新分析过的题会带着旧的「质检通过」直接可提交。
+        # 重新分析会整段换掉理由，两道提交前质检的结论对新的这一段都不再成立。
+        # 留着它们，一道重新分析过的题会带着旧的「质检通过」直接可提交 —— 事实核验
+        # 那一档尤其不能留，它对的是上一稿理由，而理由马上要被整段换掉。
+        t.factcheck_status = FACTCHECK_IDLE
+        t.factcheck = {}
         t.precheck_status = PRECHECK_IDLE
         t.precheck = {}
         db.flush()
@@ -723,6 +955,12 @@ async def analyze_task(task_id: int) -> dict:
 
         analysis_dir.mkdir(parents=True, exist_ok=True)
         (analysis_dir / "gsb_prompt.md").write_text(prompt_text, encoding="utf-8")
+        # 执行记录单独落一份。事实核验那一步要拿它去对理由里的断言，而它必须和分析
+        # 当时看到的是同一份 —— 现算一遍的话，中间要是重跑过一侧，核验就在拿新轨迹
+        # 判旧理由，报出来的「不符」全是假的。
+        (analysis_dir / "gsb_facts.json").write_text(
+            json.dumps({s: materials[s].get("facts") or {} for s in config.SIDES},
+                       ensure_ascii=False, indent=1), encoding="utf-8")
         log.info("GSB %s prompt %d 字符，开始调用模型", task_no, len(prompt_text))
 
         result = await llm.ask(prompt_text, purpose=f"GSB {task_no}", attempts=2)

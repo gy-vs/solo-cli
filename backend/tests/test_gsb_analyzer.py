@@ -208,6 +208,100 @@ def _task(db, **over):
     return t
 
 
+# ---------------- 执行记录 ----------------
+# 这一块堵的是一类反复出现的错判：模型看着代码改动推断「这一侧跑不起来」「没跑过测试」，
+# 而轨迹里摆着跑通的命令。根子在材料本身 —— 早先送进 prompt 的步骤列表只有工具名和
+# 命令原文，一条输出都没有，模型手上压根没有执行结果，只能从 diff 推。
+
+def _index(*steps, ending="", stop="end_turn") -> dict:
+    return {"steps": list(steps), "last_assistant_text": ending, "stop_reason": stop}
+
+
+def _step(tool, summary, *, result="", error=False, files=()):
+    return {"tool": tool, "summary": summary, "result": result,
+            "is_error": error, "files": list(files)}
+
+
+def test_run_facts_pairs_each_check_with_what_it_actually_printed():
+    facts = ga.run_facts(_index(
+        _step("Edit", "Edit src/parser.ts", files=["src/parser.ts"]),
+        _step("Bash", "$ npm test", result="Tests: 32 passed, 0 failed"),
+    ))
+    assert facts["checks"] == [
+        {"cmd": "npm test", "ok": True, "out": "Tests: 32 passed, 0 failed",
+         "after_last_edit": True}]
+
+
+def test_run_facts_marks_a_check_that_ran_before_the_last_edit():
+    """改之前跑通不算数：那验的是改之前的代码，而交出去的是改之后的。"""
+    facts = ga.run_facts(_index(
+        _step("Bash", "$ npm test", result="全过"),
+        _step("Edit", "Edit src/parser.ts", files=["src/parser.ts"]),
+    ))
+    assert facts["checks"][0]["after_last_edit"] is False
+
+
+def test_run_facts_counts_running_a_script_as_a_check():
+    """很多题的验证方式就是 node repro.js 看输出，漏掉它这类题会整批显示成没有执行记录。"""
+    facts = ga.run_facts(_index(_step("Bash", "$ node repro.js", result="ok")))
+    assert [c["cmd"] for c in facts["checks"]] == ["node repro.js"]
+
+
+def test_run_facts_ignores_commands_that_verify_nothing():
+    facts = ga.run_facts(_index(_step("Bash", "$ ls -la src"), _step("Bash", "$ cat package.json")))
+    assert facts["checks"] == []
+
+
+def test_run_facts_keeps_every_failure_with_its_error_text():
+    facts = ga.run_facts(_index(
+        _step("Bash", "$ npm run build", result="TS2345: 类型不匹配", error=True),
+        _step("Read", "Read src/missing.ts", result="文件不存在", error=True),
+    ))
+    assert [f["what"] for f in facts["failures"]] == ["npm run build", "Read Read src/missing.ts"]
+    assert "TS2345" in facts["failures"][0]["out"]
+
+
+def test_run_facts_carries_the_closing_words():
+    """收尾那段话是判「这一侧跑完没跑完」的依据，压缩步骤时最容易被切掉的也是它。"""
+    facts = ga.run_facts(_index(_step("Bash", "$ npm test"), ending="全部完成，用例都通过了。"))
+    assert facts["ending"] == "全部完成，用例都通过了。"
+
+
+def test_clip_keeps_both_ends_of_a_long_output():
+    """测试框架的结论落在输出头尾，中间是逐条用例的刷屏；从前面截会把「N failed」切掉。"""
+    out = ga._clip("开头" + "中间" * 400 + "3 failed")
+    assert out.startswith("开头") and out.endswith("3 failed") and "……" in out
+    assert len(out) <= ga.OUT_LIMIT + 4
+
+
+def test_facts_block_spells_out_an_empty_record_instead_of_leaving_a_blank():
+    """留白会被当成「没查到」，模型于是自己填一个。空本身也是事实，要写出来。"""
+    text = ga.facts_block(ga.run_facts(_index(_step("Read", "Read src/a.ts"))))
+    assert "跑过的校验类命令：一条都没有" in text
+    # 而且要写清这一条只能支撑到哪一步，不能顺势推出「跑不起来」
+    assert "不要据此说产物跑不起来" in text
+    assert "报过错的步骤：没有。" in text
+
+
+def test_facts_block_says_so_when_there_is_no_trace_at_all():
+    assert "不要就此下任何结论" in ga.facts_block({})
+
+
+def test_prompt_carries_the_execution_record_and_the_red_line(tmp_db):
+    """红线和执行记录必须一起进 prompt：只给记录不立规矩，它照样会从 diff 推。"""
+    from app.db import session
+
+    facts = ga.run_facts(_index(_step("Bash", "$ npm test", result="32 passed"),
+                                ending="全部完成。"))
+    with session() as db:
+        text = ga.build_prompt(_task(db), {s: _material(s, facts=facts) for s in ("A", "B")})
+    assert "npm test" in text and "32 passed" in text
+    assert "【红线：执行结果只能来自执行记录】" in text
+    assert "不许从代码改动推断执行效果" in text
+    # 四样材料各管一段，必须说清楚，否则它会拿步骤记录当结论
+    assert "判断执行结果的唯一依据" in text
+
+
 def test_prompt_shows_both_sides_and_bans_excluded_factors(tmp_db):
     from app.db import session
 
@@ -236,7 +330,9 @@ def test_prompt_is_symmetric_between_sides(tmp_db):
     with session() as db:
         text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
     a = text.split("=== A 侧 ===")[1].split("=== B 侧 ===")[0]
-    b = text.split("=== B 侧 ===")[1].split("【工作步骤】")[0]
+    # B 段到红线那一节为止。红线紧跟在两侧材料后面，它自带一串带冒号的条目，
+    # 切到【工作步骤】会把那些条目算进 B 的骨架，两侧就永远对不上。
+    b = text.split("=== B 侧 ===")[1].split("【红线")[0]
     skeleton = lambda s: [ln.split("：")[0] for ln in s.splitlines() if "：" in ln]  # noqa: E731
     assert skeleton(a) == skeleton(b)
     assert "先跑" not in text and "基准侧" not in text
@@ -335,6 +431,19 @@ def test_condensed_steps_keep_late_errors_that_exceed_the_budget():
     assert sum("[报错]" in s for s in got) == ga.STEP_LIMIT
 
 
+def test_condensed_steps_keep_the_closing_steps():
+    """压缩不能把收尾那一截切掉。
+
+    收尾步里摆着最后一次测试结果和总结。丢了它们，模型就会把跑完并全绿的一侧写成
+    「戛然而止」或「改完之后没再跑测试」——已提交的题里有十三道栽在这上面。
+    """
+    steps = [{"tool": "Read", "summary": f"读 {i}"} for i in range(200)]
+    steps.append({"tool": "Bash", "summary": "npm test 全绿"})
+    got = ga._condense_steps({"steps": steps})
+    assert len(got) <= ga.STEP_LIMIT
+    assert got[-1] == "Bash npm test 全绿"
+
+
 def test_condensed_steps_preserve_original_order():
     index = {"steps": [{"tool": "Read", "summary": "一"}, {"tool": "Edit", "summary": "二"},
                        {"tool": "Bash", "summary": "三"}]}
@@ -346,9 +455,15 @@ def test_condensed_steps_preserve_original_order():
 # 一千多字，而核验里篇幅只是黄项拦不住入库。所以生成完要自查并让模型改，改完再查。
 
 CLEAN_REASON = (
-    "A 侧 lib/dumper.js 的 writeNode 改成返回对象，标签在嵌套映射里透传下去了；"
-    "B 侧只改了 writeNode，锚点用例里 tag 变成 undefined。两边的约束我逐条对过，"
-    "A 侧三条都落到了代码里，B 侧漏了保留注释那一条，所以选 A。"
+    "A 侧 lib/dumper.js 的 writeNode 改成返回对象，标签在嵌套映射里透传下去了，"
+    "改完之后跑过一轮 npm test，相关用例都通过了。B 侧只改了 writeNode，"
+    "锚点用例里 tag 变成 undefined，它也跑过测试，输出里那一组是失败的，"
+    "但没有回头处理就收了尾。两边的约束我逐条对过代码，A 侧三条都落到了实现里，"
+    "还补了一条锚点相关的用例，正好覆盖 B 漏掉的那个场景；"
+    "B 侧漏了保留注释那一条，带注释的文档交出去会丢信息，下游再解析一次就对不齐，"
+    "接手的人还得先查一遍是哪一层把注释丢了。"
+    "错误提示的文案两边都沿用了原来的写法，这部分看不出差别。"
+    "真正让我偏向 A 的是它把失败的那组用例收拾干净了，而 B 留着没管就交了，所以选 A。"
 )
 
 
@@ -446,9 +561,21 @@ def test_forced_polish_keeps_the_original_when_the_rewrite_breaks_a_rule(monkeyp
 
 def test_fix_prompt_states_the_budget_even_when_the_reason_fits():
     """贴着上限的那批余量只有几个字，不给预算它换个说法就把篇幅撑过去了。"""
-    short = "A 侧改好了，B 侧没改好，这道题的胜负就在这里。"
-    prompt = ga.build_reason_fix_prompt(short, ["理由里有「胜负」这类说法"])
+    fits = CLEAN_REASON + "这道题的胜负就在这里。"
+    assert (ga.gsb_rules.REASON_SOFT_MIN_CHARS
+            <= ga.gsb_rules.visible_chars(fits) <= ga.gsb_rules.REASON_SOFT_MAX_CHARS)
+    prompt = ga.build_reason_fix_prompt(fits, ["理由里有「胜负」这类说法"])
     assert f"不要超过 {ga.gsb_rules.REASON_TARGET_MAX} 字" in prompt
+    assert "去掉大约" not in prompt and "太短了" not in prompt
+
+
+def test_fix_prompt_asks_to_fill_out_a_reason_that_came_back_too_short(monkeypatch):
+    """写短了也要改，而且得把「补什么」说死，否则它会去编执行结果。"""
+    short = "A 侧改好了，B 侧没改好，所以 A 更好。"
+    assert ga.gsb_rules.visible_chars(short) < ga.gsb_rules.REASON_SOFT_MIN_CHARS
+    prompt = ga.build_reason_fix_prompt(short, ["理由太短"])
+    assert f"补到 {ga.gsb_rules.REASON_TARGET_MIN}" in prompt
+    assert "不要补原文里没有的执行结果" in prompt
     assert "去掉大约" not in prompt
 
 
@@ -472,7 +599,7 @@ def test_polish_reason_asks_for_a_rewrite_when_the_gap_is_large(monkeypatch):
     calls.clear()
     # 只超出一点点时还是按删减说，重写反而会把已经写好的论证推翻。
     # 倍数按篇幅窗口算，不写死：窗口收窄过一次，写死的倍数会悄悄滑进另一条分支。
-    mild = CLEAN_REASON * 5
+    mild = CLEAN_REASON * 2
     assert (ga.gsb_rules.REASON_SOFT_MAX_CHARS
             < ga.gsb_rules.visible_chars(mild)
             <= ga.gsb_rules.REASON_SOFT_MAX_CHARS * 1.4)

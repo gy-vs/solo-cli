@@ -48,8 +48,9 @@ async def lifespan(_: FastAPI):
             log.warning("题库文件不存在：%s", config.prompt_file())
     except Exception:  # noqa: BLE001
         log.exception("题库导入失败")
-    # 结论已出的题按录屏齐不齐在「待录屏」和「质检」之间对一次账。质检这一步是后加的，
-    # 不补这一次，此前录屏齐了的题会挂在待录屏栏里，提交按钮还是灰的。
+    # 结论已出的题按两道质检过没过在「待质检」和「待录屏」之间对一次账，顺便把
+    # ALTER TABLE 补出来的空档规整成 IDLE。事实核验是后加的一道，历史数据一律没跑过，
+    # 这一次会把它们从待录屏拉回待质检，交给看门狗补上。
     gsb_precheck.sync_all()
     await scheduler.start()
     await watchdog.start()
@@ -72,10 +73,12 @@ async def lifespan(_: FastAPI):
              "（自动重跑已暂停）" if settings_store.get_bool("watchdog.paused", False) else "")
     log.info("并发    : 最多 %s 个容器，按容器排队（A、B 各排各的，跑完再配对）",
              scheduler.max_parallel)
-    # 页面上没有这个入口（nginx 也挡了发起路由），所以把命令印在启动日志里，
-    # 免得下次想跑质检时先去翻代码找它在哪
-    log.info("质检    : 提交前质检只能在这里发起 → "
-             "docker compose exec backend python -m app.cli precheck")
+    log.info("质检    : 分析完自动接两道——事实核验（拿轨迹对理由里的执行结果，"
+             "不符处直接订正）与措辞质检，都放行才进待录屏；卡住的由巡检补跑")
+    # 录屏是整条流水线上唯一还等人的一步，而人手上只有两个文件路径。把这条命令印在
+    # 启动日志里，省得下次要交录屏时先去翻文档找它叫什么
+    log.info("录屏    : 录完交上来 → "
+             "docker compose exec backend python -m app.cli deliver 题号 A.mp4 B.mp4")
     log.info("=" * 60)
     yield
     await scheduler.stop()

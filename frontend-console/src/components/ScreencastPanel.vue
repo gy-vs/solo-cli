@@ -47,6 +47,30 @@ async function upload(side: Side) {
     emit('saved')
   } catch (e: any) { msg.error(e.message) } finally { busy.value = '' }
 }
+
+/** 两侧一起交付：收下、代传、直接提交。
+ *
+ * 分侧点两次上传再去上传页点一次提交，做的是同样的事，但那三步之间没有任何需要人
+ * 判断的地方 —— 质检早就放行了，录屏是最后一个缺的参数。所以给一个按钮走完。
+ */
+const canDeliver = computed(() => SIDES.every((s) => !!paths.value[s].trim() || !!urls.value[s].trim())
+  && SIDES.some((s) => !!paths.value[s].trim()))
+
+async function deliver() {
+  busy.value = 'deliver'
+  try {
+    const r = await api.deliverScreencast(props.task.id, {
+      A: paths.value.A.trim() || undefined,
+      B: paths.value.B.trim() || undefined,
+      submit: true,
+    })
+    // 提交被门禁挡住不算失败：录屏确实收下了，挡的是别的。原话直接转给人，
+    // 别在这里翻译一遍 —— 翻译的版本和后端回绝的理由对不上，人会以为是两个问题
+    r.submitted?.ok ? msg.success(r.message) : msg.warning(r.message)
+    paths.value = { A: '', B: '' }
+    emit('saved')
+  } catch (e: any) { msg.error(e.message) } finally { busy.value = '' }
+}
 </script>
 
 <template>
@@ -61,6 +85,13 @@ async function upload(side: Side) {
     <div class="text-xs text-fg1">
       点「启动项目」会在本机开一个终端窗口，装依赖的命令自动跑掉，剩下的放进历史按 ↑ 调出来。
       录屏按 720p 存到这道题的产物目录，停录后路径自动填好，点上传就能换回链接。
+      两侧路径都有了就点「交付并提交」，收下、代传、提交一次做完。
+    </div>
+    <div v-if="canDeliver" class="flex items-center gap-2">
+      <NButton size="small" type="primary" :loading="busy === 'deliver'" @click="deliver">交付并提交</NButton>
+      <span class="text-[12px] text-fg2">
+        把两侧视频收进这道题的产物目录、代传到平台，然后直接提交。质检没放行的话会停在提交那一步并说明原因。
+      </span>
     </div>
     <div class="grid grid-cols-2 gap-3">
       <div v-for="s in SIDES" :key="s" class="inner p-3 space-y-2">

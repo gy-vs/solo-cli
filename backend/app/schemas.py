@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.models import Task, TaskRun
-from app.services import gsb_precheck, gsb_repo
+from app.services import gsb_factcheck, gsb_precheck, gsb_repo
 
 
 class SettingsUpdate(BaseModel):
@@ -37,6 +37,22 @@ class PrecheckConfirm(BaseModel):
     """人工放行提交前质检。note 记一句为什么放行，只给自己看。"""
 
     note: str = ""
+
+
+class ScreencastDeliver(BaseModel):
+    """交付录屏：给两侧的本地视频路径，收下、代传、顺手提交。
+
+    录屏是在外部录完的，人手上只有两个文件路径。这里收路径而不是收链接，是因为
+    从路径到链接那几步（归档到题目目录、传给平台、把返回的地址填进去）每次都一样，
+    没有让人分三次点的理由。
+
+    submit 为真就接着走提交。默认为真：走到这一步，两道质检早就放行了，
+    录屏是最后一个缺的参数，补上就该交出去。
+    """
+
+    A: str | None = None
+    B: str | None = None
+    submit: bool = True
 
 
 class RerunRequest(BaseModel):
@@ -118,6 +134,7 @@ def run_detail(r: TaskRun) -> dict:
 def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
     gsb = t.gsb or {}
     precheck = t.precheck or {}
+    factcheck = t.factcheck or {}
     return {
         "id": t.id,
         "task_no": t.task_no,
@@ -152,8 +169,17 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "precheck_applied": bool(precheck.get("applied")),
         "precheck_summary": precheck.get("summary") or precheck.get("error") or "",
         "precheck_stale": gsb_precheck.stale(t),
+        # 能不能提交的唯一口径。两道质检、录屏、状态全在里面判完，空串表示能提交。
         "precheck_block": gsb_precheck.submit_block(t),
         "precheck_at": precheck.get("confirmed_at") or precheck.get("finished_at") or "",
+        # 事实核验。和措辞质检摊法一致：列表给几个扁平字段，完整报告在详情页。
+        # notes 是订正留痕，人扫一眼就知道动过哪几处，不必拿改前改后两稿逐字对。
+        "factcheck_status": t.factcheck_status,
+        "factcheck_mismatches": len(factcheck.get("mismatches") or []),
+        "factcheck_applied": bool(factcheck.get("applied")),
+        "factcheck_notes": factcheck.get("notes") or [],
+        "factcheck_summary": factcheck.get("summary") or factcheck.get("error") or "",
+        "factcheck_stale": gsb_factcheck.stale(t),
         "upload_ok": (t.upload or {}).get("ok"),
         "submission_id": (t.upload or {}).get("submission_id"),
         "priority": t.priority,
@@ -184,6 +210,7 @@ def task_detail(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "analysis": t.analysis,
         "verify": t.verify,
         "precheck": t.precheck,
+        "factcheck": t.factcheck,
         "upload": t.upload,
         "dedup": t.dedup,
         "runs": [run_detail(r) for r in sorted(runs or [], key=lambda x: x.side)],

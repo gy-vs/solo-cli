@@ -22,11 +22,12 @@ from app.models import (
 )
 from app.schemas import (
     GsbUpdate, IdList, PrecheckConfirm, QueueMove, RerunBatch, RerunRequest,
-    ScreencastUpdate, task_brief, task_detail,
+    ScreencastDeliver, ScreencastUpdate, task_brief, task_detail,
 )
 from app.services import (
-    dockerx, gate, gsb_analyzer, gsb_precheck, gsb_repo, gsb_uploader, gsb_verifier, pool,
-    pool_bank, prompt_bank, runner, scheduler, settings_store, trace, watchdog,
+    dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo, gsb_uploader,
+    gsb_verifier, pool, pool_bank, prompt_bank, runner, scheduler, settings_store,
+    trace, watchdog,
 )
 
 log = logging.getLogger("tasks")
@@ -164,11 +165,48 @@ async def batch_upload(body: IdList) -> dict:
 
 @router.get("/precheck/ready")
 async def precheck_ready() -> dict:
-    """该做质检的题：录屏已齐、还没拿到有效结论。CLI 默认按这个口径挑。"""
+    """该做质检的题：结论已出、还没拿到有效结论。CLI 默认按这个口径挑。
+
+    不看录屏。质检排在录屏前面，等录屏齐了才挑就回到了「措辞一改得重录」的老流程。
+    """
     ids = gsb_precheck.ready_ids()
     with session() as db:
         items = [task_brief(_get(db, tid), _runs(db, tid)) for tid in ids]
     return {"ids": ids, "items": items}
+
+
+@router.post("/batch/quality-gate")
+async def batch_quality_gate(body: IdList) -> dict:
+    """把勾中的题整条质检走一遍（事实核验 + 措辞 + 本地核验 + 平台质检），不等结果。
+
+    和 batch/precheck/start 的分工：那个只跑措辞那一道，给「我就想改改文字」用；
+    这个走完整条闸门，给积压补跑用。两者都按并发额度排队，不会一起把模型打爆。
+    """
+    results = []
+    with session() as db:
+        for tid in body.ids:
+            t = db.get(Task, tid)
+            if t is None:
+                results.append({"id": tid, "ok": False, "message": "题目不存在"})
+            elif t.status not in (ANALYZED, QC):
+                results.append({"id": tid, "ok": False,
+                                "message": f"状态 {t.status} 不用做提交前质检"})
+            else:
+                results.append({"id": tid, "task_no": t.task_no})
+    return {"results": [r if "ok" in r else {**r, **watchdog.queue_gate(r["id"])}
+                        for r in results]}
+
+
+@router.post("/batch/factcheck")
+async def batch_factcheck(body: IdList) -> dict:
+    """逐道串行跑事实核验。一道失败不影响后面的，各自带原因回来。
+
+    串行的理由和批量措辞质检一样：每道题都是一次模型调用，并发发出去只会一起撞限流。
+    """
+    results = []
+    for tid in body.ids:
+        results.append({"id": tid, **await gsb_factcheck.run_factcheck(tid)})
+    return {"results": results}
 
 
 @router.post("/batch/precheck")
@@ -868,11 +906,11 @@ async def verify(task_id: int) -> dict:
 
 @router.put("/{task_id}/screencast")
 async def save_screencast(task_id: int, body: ScreencastUpdate) -> dict:
-    """填两侧录屏链接。这是上传前唯一必须人工给的东西。
+    """填两侧录屏链接。这是提交前唯一必须人工给的东西。
 
-    两条链接齐了这道题就从待录屏进到质检（gsb_precheck.sync_stage），链接被清掉又退
-    回去。状态不在这里各写各的，否则「录屏齐了却还挂在待录屏栏」这种账迟早对不上，
-    而人正是照着栏目决定下一步做什么。
+    录屏不再决定题落在哪一栏 —— 那由两道质检决定，质检放行了才轮到录屏。但它决定
+    提交门禁开不开（见 gsb_precheck.submit_block），所以填完仍要过一遍阶段投影把
+    状态对齐，别让某个动作各写各的。
     """
     with session() as db:
         t = _get(db, task_id)
@@ -892,21 +930,70 @@ async def save_screencast(task_id: int, body: ScreencastUpdate) -> dict:
 @router.post("/{task_id}/screencast/upload")
 async def upload_screencast(task_id: int, side: str = Query(...),
                             path: str = Query(...)) -> dict:
-    """把本地录屏文件代传到平台，换回一个链接。"""
+    """把本地录屏文件收进题目目录并代传到平台，换回一个链接。"""
     want = _side(side)
     with session() as db:
         _get(db, task_id)
-    res = await gsb_uploader.upload_screencast(task_id, want, Path(path))
+    res = await gsb_uploader.upload_screencast(task_id, want, Path(path).expanduser())
     if not res["ok"]:
         raise HTTPException(400, res["message"])
     return res
 
 
+@router.post("/{task_id}/screencast/deliver")
+async def deliver_screencast(task_id: int, body: ScreencastDeliver) -> dict:
+    """交付录屏并提交：给两侧的本地视频路径，收下、代传、直接交到平台。
+
+    整条流水线到这里只剩一个人工动作。分侧调接口再调一次提交也能做到同样的事，
+    但那是把三步机械操作留给人，而这三步之间没有任何需要人判断的地方。
+
+    提交被门禁挡住不算失败：录屏确实收下了，挡的是别的（质检没过、状态不对），
+    那句话原样带回去，人看一眼就知道还差什么。
+    """
+    with session() as db:
+        t = _get(db, task_id)
+        if t.status in (UPLOADED, DONE):
+            raise HTTPException(409, "已上传的数据不可再编辑")
+    if not (body.A or body.B):
+        raise HTTPException(400, "至少要给一侧的录屏文件路径")
+    res = await gsb_uploader.deliver_screencasts(
+        task_id, {"A": body.A, "B": body.B}, submit=body.submit)
+    if not res["ok"]:
+        raise HTTPException(400, res["message"])
+    with session() as db:
+        return {**res, "task": task_brief(_get(db, task_id), _runs(db, task_id))}
+
+
 # ---------------- 提交前质检：单题与人工确认 ----------------
+# 两道分开发起。合成一个「跑质检」按钮看着省事，但它们的失败含义不一样：事实核验
+# 报的是说错了，措辞质检报的是说得生硬，人重跑哪一道取决于他刚改了什么。
+
+@router.post("/{task_id}/factcheck")
+async def factcheck(task_id: int) -> dict:
+    """对一道题跑事实核验：拿轨迹里的执行记录去对理由，不符处直接订正。"""
+    with session() as db:
+        _get(db, task_id)
+    res = await gsb_factcheck.run_factcheck(task_id)
+    if not res.get("ok"):
+        raise HTTPException(409, res["message"])
+    return res
+
+
+@router.post("/{task_id}/factcheck/confirm")
+async def factcheck_confirm(task_id: int, body: PrecheckConfirm) -> dict:
+    """人工放行事实核验。模型报的不符里总有它自己读偏的，人看一眼直接放行。"""
+    with session() as db:
+        _get(db, task_id)
+    res = gsb_factcheck.confirm(task_id, body.note)
+    if not res["ok"]:
+        raise HTTPException(409, res["message"])
+    with session() as db:
+        return {**res, "task": task_brief(_get(db, task_id), _runs(db, task_id))}
+
 
 @router.post("/{task_id}/precheck")
 async def precheck(task_id: int) -> dict:
-    """对一道题跑提交前质检，跑完才返回（一道一分半，页面上转个圈等得起）。"""
+    """对一道题跑措辞质检，跑完才返回（一道一分半，页面上转个圈等得起）。"""
     with session() as db:
         _get(db, task_id)
     res = await gsb_precheck.run_precheck(task_id)
@@ -925,6 +1012,21 @@ async def precheck_confirm(task_id: int, body: PrecheckConfirm) -> dict:
         raise HTTPException(409, res["message"])
     with session() as db:
         return {**res, "task": task_brief(_get(db, task_id), _runs(db, task_id))}
+
+
+@router.post("/{task_id}/quality-gate")
+async def quality_gate(task_id: int) -> dict:
+    """把两道质检连着本地核验、平台质检整条走一遍。
+
+    正常由巡检自动跑，这里给「改完理由想立刻看整条结论」用。顺序和自动路径完全
+    一致（见 watchdog.run_quality_gate），不另起一套，否则手动跑出来的结论和
+    自动跑出来的会不一样，而两者都说自己是对的。
+    """
+    with session() as db:
+        t = _get(db, task_id)
+        if t.status not in (ANALYZED, QC):
+            raise HTTPException(409, f"状态 {t.status} 不用做提交前质检")
+    return await watchdog.run_quality_gate(task_id)
 
 
 # ---------------- 队列顺序 ----------------

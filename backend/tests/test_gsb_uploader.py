@@ -60,21 +60,27 @@ def ready_task(tmp_db, tmp_path, monkeypatch):
 
 
 def _ready_to_submit(task_id, urls=("https://v.example/a", "https://v.example/b")):
-    """把题推到「录屏齐、提交前质检通过」，也就是允许提交的那个状态。
+    """把题推到「两道质检都放行、录屏也齐了」，也就是允许提交的那个状态。
 
-    单设录屏链接已经不够了：提交前质检是提交的必经一步（见 services/gsb_precheck），
-    没过质检的题在 upload_task 的第一道门就被回绝，后面的字段校验一条都走不到。
+    单设录屏链接远远不够：提交前有两道质检，事实核验判说的是不是真的、措辞质检判
+    读起来像不像人写的（见 services/gsb_factcheck 与 gsb_precheck），任何一道没过，
+    题在 upload_task 的第一道门就被回绝，后面的字段校验一条都走不到。
+
+    质检先设、录屏后设，顺序照着真实流程走：质检放行题才进待录屏，录屏是最后补的
+    那个参数。反过来设的话 sync_stage 会在质检还没过的时候被问一次，白跑一趟。
     """
     from app.db import session
     from app.services import gsb_precheck
 
     with session() as db:
         t = db.get(m.Task, task_id)
+        digest = gsb_precheck.reason_digest((t.gsb or {}).get("reason") or "")
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"mismatches": [], "reason_digest": digest}
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "issues": [], "reason_digest": digest}
         t.screencast = {"A": urls[0], "B": urls[1]}
         gsb_precheck.sync_stage(db, t)
-        t.precheck_status = m.PRECHECK_PASS
-        t.precheck = {"passed": True, "issues": [],
-                      "reason_digest": gsb_precheck.reason_digest((t.gsb or {}).get("reason") or "")}
 
 
 # ---------------- 字段映射 ----------------
@@ -384,3 +390,95 @@ def test_screencast_upload_records_returned_url(ready_task, monkeypatch, tmp_pat
     assert r["ok"] is True
     with session() as db:
         assert db.get(m.Task, task_id).screencast["A"] == "https://v.example/uploaded"
+
+
+# ---------------- 录屏交付 ----------------
+# 录屏在外部录完，路径五花八门（桌面、下载目录、某个临时文件夹）。原地传也能传，
+# 但那份文件随时会被清掉或改名，而重传要的就是同一个文件。
+
+def test_ingest_files_the_video_under_the_task_with_a_predictable_name(tmp_path):
+    """文件名按题号和侧别定死。沿用录屏软件给的时间戳名，两侧摆在一起分不出哪个是哪个。"""
+    src = tmp_path / "屏幕录制 2026-09-22 20.13.11.mov"
+    src.write_bytes(b"video")
+    kept = up.ingest_screencast("07", "B", src)
+    assert kept.name == "screencast-07-B.mov"
+    assert kept.read_bytes() == b"video"
+    assert src.exists()      # 拷贝不是移动：人桌面上那份还要留着
+
+
+def test_ingest_is_a_no_op_when_the_path_is_already_the_archived_one(tmp_path):
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"video")
+    kept = up.ingest_screencast("07", "A", src)
+    assert up.ingest_screencast("07", "A", kept) == kept
+
+
+def test_upload_refuses_a_file_that_is_not_a_video(ready_task, tmp_path):
+    """早拦一道。传上去平台才回一句格式不对，一个几百兆的文件已经上行完了。"""
+    task_id, _ = ready_task
+    bad = tmp_path / "notes.txt"
+    bad.write_text("x")
+    r = asyncio.run(up.upload_screencast(task_id, "A", bad))
+    assert r["ok"] is False and "不像是视频文件" in r["message"]
+
+
+def _video_client(url="https://v.example/uploaded"):
+    return _FakeClient({("POST", "/api/v1/submissions/upload"):
+                        _FakeResponse(200, {"url": url, "name": "v.mp4"})})
+
+
+def test_deliver_uploads_both_sides_then_submits(ready_task, monkeypatch, tmp_path):
+    """整条流水线到这里只剩一个人工动作，三步机械操作之间没有要人判断的地方。"""
+    from app.db import session
+
+    task_id, _ = ready_task
+    _ready_to_submit(task_id, urls=("", ""))
+    for side in ("a", "b"):
+        (tmp_path / f"{side}.mp4").write_bytes(b"v")
+    monkeypatch.setattr(up, "_client", _video_client)
+    submitted = []
+
+    async def fake_submit(tid):
+        submitted.append(tid)
+        return {"ok": True, "message": "提交成功", "submission_id": 9}
+
+    monkeypatch.setattr(up, "upload_task", fake_submit)
+
+    r = asyncio.run(up.deliver_screencasts(
+        task_id, {"A": str(tmp_path / "a.mp4"), "B": str(tmp_path / "b.mp4")}))
+    assert r["ok"] is True and submitted == [task_id]
+    with session() as db:
+        assert db.get(m.Task, task_id).screencast == {
+            "A": "https://v.example/uploaded", "B": "https://v.example/uploaded"}
+
+
+def test_deliver_keeps_the_videos_but_says_why_it_could_not_submit(ready_task, monkeypatch, tmp_path):
+    """提交被门禁挡住不算失败：录屏确实收下了，挡的是别的。那句话要原样带回去。"""
+    from app.db import session
+
+    task_id, _ = ready_task
+    for side in ("a", "b"):
+        (tmp_path / f"{side}.mp4").write_bytes(b"v")
+    monkeypatch.setattr(up, "_client", _video_client)
+    with session() as db:                       # 两道质检都没跑过
+        db.get(m.Task, task_id).status = m.ANALYZED
+
+    r = asyncio.run(up.deliver_screencasts(
+        task_id, {"A": str(tmp_path / "a.mp4"), "B": str(tmp_path / "b.mp4")}))
+    assert r["ok"] is True and r["submitted"] is None
+    assert "还不能提交" in r["message"]
+    with session() as db:                       # 收下的那两份没丢
+        assert db.get(m.Task, task_id).screencast["A"] == "https://v.example/uploaded"
+
+
+def test_deliver_does_not_submit_when_one_side_fails_to_upload(ready_task, monkeypatch, tmp_path):
+    task_id, _ = ready_task
+    _ready_to_submit(task_id, urls=("", ""))
+    (tmp_path / "a.mp4").write_bytes(b"v")
+    monkeypatch.setattr(up, "_client", _video_client)
+    submitted = []
+    monkeypatch.setattr(up, "upload_task", lambda tid: submitted.append(tid))
+
+    r = asyncio.run(up.deliver_screencasts(
+        task_id, {"A": str(tmp_path / "a.mp4"), "B": str(tmp_path / "missing.mp4")}))
+    assert r["ok"] is False and "文件不存在" in r["message"] and submitted == []

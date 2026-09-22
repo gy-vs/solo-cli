@@ -1,5 +1,7 @@
-import type { PrecheckStatus, RunStatus, Side, Status, Verdict } from './api'
+import type { FactcheckStatus, PrecheckStatus, RunStatus, Side, Status, Verdict } from './api'
 
+/** 质检排在录屏前面，所以 ANALYZED 是「等质检」、QC 是「质检过了等录屏」。
+ *  这两个的含义换过一次：早先按录屏齐不齐分，措辞一改就得重录。 */
 export const STATUS_LABEL: Record<Status, string> = {
   AVAILABLE: '待领取',
   CLAIMED: '已领取',
@@ -7,8 +9,8 @@ export const STATUS_LABEL: Record<Status, string> = {
   RUNNING: '运行中',
   RUN_DONE: '两侧跑完',
   ANALYZING: '对比中',
-  ANALYZED: '待录屏',
-  QC: '质检',
+  ANALYZED: '待质检',
+  QC: '待录屏',
   UPLOADED: '已上传',
   DONE: '已完成',
   NEEDS_ATTENTION: '需人工',
@@ -23,15 +25,15 @@ export const STATUS_COLOR: Record<Status, string> = {
   RUNNING: 'run',
   RUN_DONE: 'info',
   ANALYZING: 'run',
-  ANALYZED: 'ok',
-  QC: 'accent',
+  ANALYZED: 'accent',
+  QC: 'ok',
   UPLOADED: 'info',
   DONE: 'fg2',
   NEEDS_ATTENTION: 'err',
   DISCARDED: 'fg2',
 }
 
-/** 提交前质检。题级状态 QC 只说「在质检这一步」，走到哪一档看这里 */
+/** 措辞质检：理由读起来像不像一个人写的。 */
 export const PRECHECK_LABEL: Record<PrecheckStatus, string> = {
   IDLE: '待质检',
   RUNNING: '质检中',
@@ -42,6 +44,20 @@ export const PRECHECK_LABEL: Record<PrecheckStatus, string> = {
 }
 export const PRECHECK_COLOR: Record<PrecheckStatus, string> = {
   IDLE: 'fg1', RUNNING: 'run', PASS: 'ok', FAIL: 'warn', CONFIRMED: 'info', ERROR: 'err',
+}
+
+/** 事实核验：理由里关于执行结果的话和轨迹对不对得上。
+ *  PASS 含两种情形——本来就一致，或者不符处已经自动订正，两者都不用人再动手。 */
+export const FACTCHECK_LABEL: Record<FactcheckStatus, string> = {
+  IDLE: '待核验',
+  RUNNING: '核验中',
+  PASS: '与轨迹一致',
+  FAIL: '有出入待人工',
+  CONFIRMED: '已人工确认',
+  ERROR: '核验没跑完',
+}
+export const FACTCHECK_COLOR: Record<FactcheckStatus, string> = {
+  IDLE: 'fg1', RUNNING: 'run', PASS: 'ok', FAIL: 'err', CONFIRMED: 'info', ERROR: 'err',
 }
 
 /** 单侧运行状态 */

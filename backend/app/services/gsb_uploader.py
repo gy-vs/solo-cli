@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from pathlib import Path
 
 import httpx
@@ -189,13 +190,53 @@ async def _upload_file(c: httpx.AsyncClient, path: Path, kind: str = "") -> dict
     return r.json()
 
 
+VIDEO_SUFFIXES = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi")
+
+
+def ingest_screencast(task_no: str, side: str, src: Path) -> Path:
+    """把外部录好的视频收进这道题自己的目录，返回归档后的路径。
+
+    录屏是在宿主机上录完之后贴过来的，路径五花八门：桌面、下载目录、某个临时文件夹。
+    原地传也能传，但那份文件随时会被人清掉或改名，而重传（第一次被平台拒了、或者
+    链接过期）要的就是同一个文件。收进题目目录之后，这道题的产物、轨迹、录屏在一个
+    地方，人要回头找也只用看一个目录。
+
+    文件名按题号和侧别定死，不沿用原名。原名通常是录屏软件给的时间戳，两侧摆在一起
+    分不出哪个是哪个；而定死之后重录会直接覆盖上一份，不会在目录里堆出一串看不出
+    新旧的文件。
+
+    同一个文件重复收（人把已经归档过的路径又贴了一次）直接返回，不做无谓的拷贝。
+    """
+    dst = config.TaskPaths(task_no).analysis / f"screencast-{task_no}-{side.upper()}{src.suffix.lower()}"
+    if dst.exists() and src.resolve() == dst.resolve():
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # 拷贝而不是移动：源文件多半还在人的桌面上，他可能要自己留一份或者再看一遍。
+    # 录屏就几十上百兆，多存一份不值得为此冒「文件被搬走了找不到」的险。
+    shutil.copy2(src, dst)
+    return dst
+
+
 async def upload_screencast(task_id: int, side: str, path: Path) -> dict:
-    """代传本地录屏文件，把平台返回的 URL 记进题目。"""
+    """收下本地录屏文件、代传到平台，把返回的 URL 记进题目。"""
     if not path.exists():
         return {"ok": False, "message": f"文件不存在：{path}"}
+    if path.suffix.lower() not in VIDEO_SUFFIXES:
+        # 早拦一道。传上去平台才回一句格式不对的话，一个几百兆的文件已经上行完了。
+        return {"ok": False,
+                "message": f"{path.name} 不像是视频文件（认 {'、'.join(VIDEO_SUFFIXES)}）"}
+    with session() as db:
+        task = db.get(Task, task_id)
+        if task is None:
+            return {"ok": False, "message": "题目不存在"}
+        task_no = task.task_no
+    try:
+        kept = await asyncio.to_thread(ingest_screencast, task_no, side, path)
+    except OSError as exc:
+        return {"ok": False, "message": f"归档录屏失败：{exc}"}
     try:
         async with _client() as c:
-            ref = await _upload_file(c, path, kind="video")
+            ref = await _upload_file(c, kept, kind="video")
     except RuntimeError as exc:
         return {"ok": False, "message": str(exc)}
     except httpx.HTTPError as exc:
@@ -210,10 +251,52 @@ async def upload_screencast(task_id: int, side: str, path: Path) -> dict:
         sc = dict(task.screencast)
         sc[side.upper()] = url
         task.screencast = sc
-        # 和界面上手填链接走同一条路：第二侧代传完成，这道题就该进质检栏
+        # 和界面上手填链接走同一条路。录屏不再决定题落在哪一栏（那由质检决定），
+        # 但它决定提交门禁开不开，所以仍然要过一遍阶段投影把状态对齐。
         gsb_precheck.sync_stage(db, task)
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return {"ok": True, "url": url, "message": f"{side} 侧录屏已上传"}
+    return {"ok": True, "url": url, "path": str(kept),
+            "message": f"{side} 侧录屏已收下并上传"}
+
+
+async def deliver_screencasts(task_id: int, paths: dict[str, str],
+                              *, submit: bool = True) -> dict:
+    """交付录屏：两侧一起收下、代传，齐了就直接提交。
+
+    这是「我只提供录屏文件」那条路的落点。分侧调三次接口也能做到同样的事，但录屏是
+    整条流水线上最后一个人工动作，让它一次做完，人贴完路径就不用再管了。
+
+    提交只在两侧都齐了的时候发。缺一侧就发出去，平台会以「字段缺失」回绝，而那句话
+    在这里提前说更清楚。
+    """
+    results: dict[str, dict] = {}
+    for side in config.SIDES:
+        src = str(paths.get(side) or "").strip()
+        if not src:
+            continue
+        results[side] = await upload_screencast(task_id, side, Path(src).expanduser())
+
+    failed = [f"{s}：{r['message']}" for s, r in results.items() if not r["ok"]]
+    if failed:
+        return {"ok": False, "uploaded": results, "submitted": None,
+                "message": "；".join(failed)}
+
+    with session() as db:
+        task = db.get(Task, task_id)
+        if task is None:
+            return {"ok": False, "uploaded": results, "submitted": None,
+                    "message": "题目不存在"}
+        blocked = gsb_precheck.submit_block(task)
+
+    done = f"收下并上传了 {'、'.join(sorted(results)) or '零'} 侧的录屏"
+    if not submit:
+        return {"ok": True, "uploaded": results, "submitted": None, "message": done}
+    if blocked:
+        return {"ok": True, "uploaded": results, "submitted": None,
+                "message": f"{done}，但还不能提交：{blocked}"}
+    submitted = await upload_task(task_id)
+    return {"ok": submitted["ok"], "uploaded": results, "submitted": submitted,
+            "message": f"{done}；{submitted['message']}"}
 
 
 def _fail(task_id: int, record: dict, message: str, *,

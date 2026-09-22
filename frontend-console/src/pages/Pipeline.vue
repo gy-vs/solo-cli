@@ -23,7 +23,7 @@ const router = useRouter()
 const msg = useMessage()
 const dialog = useDialog()
 
-type TabKey = 'running' | 'failed' | 'pending' | 'screencast' | 'qc' | 'submitted'
+type TabKey = 'running' | 'failed' | 'pending' | 'qc' | 'screencast' | 'submitted'
 
 const TABS: {
   key: TabKey; label: string; statuses: Status[]; desc: string; empty: string
@@ -43,22 +43,23 @@ const TABS: {
   },
   {
     key: 'pending', label: '待分析', statuses: ['RUN_DONE', 'ANALYZING'],
-    desc: '两侧都正常跑完，等着推产物、写 GSB 结论、过质检。做完这一步题就进待录屏',
+    desc: '两侧都正常跑完，等着推产物、写 GSB 结论。结论一出题就进待质检',
     empty: '没有等着分析的题',
     pick: true,
   },
   {
-    key: 'screencast', label: '待录屏', statuses: ['ANALYZED'],
-    desc: '结论已出，还差录屏。录之前先把理由过一遍质检——措辞要改的话，这时候改还来得及，'
-      + '录完再改就得重录。两条链接齐了这道题自己就进质检栏',
-    empty: '没有等着录屏的题',
+    key: 'qc', label: '待质检', statuses: ['ANALYZED'],
+    desc: '结论已出，等两道提交前质检：事实核验拿轨迹对理由里说的执行结果，措辞质检看它'
+      + '读起来像不像人写的。两道都会直接改写理由，所以必须赶在录屏之前——录完再改就得重录。'
+      + '两道都放行这道题自己就进待录屏栏',
+    empty: '没有等着质检的题',
     pick: true,
   },
   {
-    key: 'qc', label: '质检', statuses: ['QC'],
-    desc: '录屏齐了，等提交。质检看的是理由读起来像不像人写的；'
-      + '判了「待人工改」的题去详情页改完再确认',
-    empty: '没有在质检这一步的题',
+    key: 'screencast', label: '待录屏', statuses: ['QC'],
+    desc: '质检放行了，理由不会再动，照着它录就行。录完把视频路径贴进详情页，'
+      + '系统收下、代传、直接提交',
+    empty: '没有等着录屏的题',
     pick: true,
   },
   {
@@ -151,16 +152,27 @@ function stage(t: TaskBrief): { text: string; cls: string } {
   if (t.analysis_status === 'FAILED') return { text: t.auto_error || '分析失败', cls: 'text-err' }
   if (t.status === 'RUN_DONE') return { text: t.auto_error || '等提交产物与分析', cls: 'text-fg1' }
   if (t.status === 'ANALYZED') {
-    const missing = SIDES.filter((s) => !t.screencast?.[s])
-    if (missing.length) return { text: `等 ${missing.join('、')} 侧录屏`, cls: 'text-warn' }
-    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 等进质检`, cls: 'text-fg1' }
+    // 事实那一道排在措辞前面，所以卡在哪一道就说哪一道，别笼统说「质检没过」——
+    // 两者该做的动作完全不同：一个是回去核对轨迹，一个是改句子
+    if (t.factcheck_status === 'FAIL') {
+      return { text: `事实核验有 ${t.factcheck_mismatches} 处与轨迹不符，改完确认`, cls: 'text-err' }
+    }
+    if (t.factcheck_status === 'ERROR') return { text: t.factcheck_summary || '事实核验没跑完', cls: 'text-err' }
+    if (t.precheck_status === 'FAIL') {
+      return { text: `质检挑出 ${t.precheck_issues} 处机械化表达，改完确认`, cls: 'text-warn' }
+    }
+    if (t.precheck_status === 'ERROR') return { text: t.precheck_summary || '措辞质检没跑完', cls: 'text-err' }
+    if (t.factcheck_status === 'RUNNING' || t.precheck_status === 'RUNNING') {
+      return { text: '提交前质检进行中', cls: 'text-run' }
+    }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 等提交前质检`, cls: 'text-fg1' }
   }
   if (t.status === 'QC') {
     if (t.verify_overall === 'block') return { text: t.auto_error || '自检有红项，改完才能提交', cls: 'text-err' }
     // precheck_block 是后端算的同一句话，提交按钮灰不灰也照它。这里直接把原话显出来，
     // 别在前端翻译一遍 —— 翻译的版本和点下去被回绝的理由对不上，人会以为是两个问题
     if (t.precheck_block) return { text: t.precheck_block, cls: 'text-warn' }
-    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 质检已过，可提交`, cls: 'text-ok' }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 录屏已齐，可提交`, cls: 'text-ok' }
   }
   if (t.status === 'UPLOADED') return { text: `已提交 #${t.submission_id ?? ''}`, cls: 'text-info' }
   if (t.status === 'DONE') return { text: '已完成并清理', cls: 'text-fg2' }
@@ -187,9 +199,9 @@ function badSides(t: TaskBrief): Side[] {
   })
 }
 const liveSides = (t: TaskBrief) => t.runs.filter((r) => r.status === 'RUNNING').map((r) => r.side)
-/** 待录屏和质检两栏都把「A/B 用时」那列换成质检结果：结论早写完了，这时候该横着比的
+/** 待质检和待录屏两栏都把「A/B 用时」那列换成质检结果：结论早写完了，这时候该横着比的
  *  是哪几道理由还要改 */
-const showPrecheck = computed(() => tab.value === 'screencast' || tab.value === 'qc')
+const showPrecheck = computed(() => tab.value === 'qc' || tab.value === 'screencast')
 /** 这一稿还没问过模型才值得再跑一次。判了待改的也算「已有结论」—— 理由没改就再问一遍，
  *  挑出来的还是那几处。ERROR 例外，那是没跑成，重跑正是该做的事。
  *

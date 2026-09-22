@@ -1667,14 +1667,17 @@ def test_a_side_flagged_abnormal_is_blocked_too(task_with_runs, monkeypatch):
 
 # ---------------- 质检闸门的次序 ----------------
 
-def test_quality_gate_prechecks_before_verifying(tmp_db, monkeypatch):
-    """理由质检会换掉理由正文，所以必须排在核验与平台质检之前。
+def test_quality_gate_checks_facts_then_wording_then_verifies(tmp_db, monkeypatch):
+    """两道质检都会整段换掉理由，所以都必须排在核验与平台质检之前，而且事实在前。
 
-    排在后面的话，核验读到的是改之前那一稿，而提交上去的是改之后的 —— 两边看的不是
-    同一段话，核验过了也说明不了提交的那一份合规。
+    事实必须先定下来：先把话说对，再把话说顺。反过来的话，措辞那一版打磨的是一段
+    事实还错着的话，事实核验接着又把它改一遍，前一次打磨白做，改完也没人再看措辞。
+
+    后两道排在最后，是因为它们读到的必须是最终要提交的那一段 —— 读的要是改之前那一稿，
+    核验过了也说明不了提交的那一份合规。
     """
     from app.db import session
-    from app.services import gsb_precheck, gsb_verifier, qa_bridge
+    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier, qa_bridge
 
     with session() as db:
         t = m.Task(task_no="07", prompt_hash="h", user_prompt="p", status=m.ANALYZED)
@@ -1684,6 +1687,10 @@ def test_quality_gate_prechecks_before_verifying(tmp_db, monkeypatch):
         tid = t.id
 
     order: list[str] = []
+
+    async def fake_factcheck(task_id, **kw):
+        order.append("factcheck")
+        return {"ok": True, "applied": True, "mismatches": 1}
 
     async def fake_precheck(task_id, **kw):
         order.append("precheck")
@@ -1697,20 +1704,25 @@ def test_quality_gate_prechecks_before_verifying(tmp_db, monkeypatch):
         order.append("qc")
         return {"ok": True, "passed": True, "summary": ""}
 
+    monkeypatch.setattr(gsb_factcheck, "run_factcheck", fake_factcheck)
     monkeypatch.setattr(gsb_precheck, "run_precheck", fake_precheck)
     monkeypatch.setattr(gsb_verifier, "run_verify", fake_verify)
     monkeypatch.setattr(qa_bridge, "gsb_qc", fake_qc)
 
     out = asyncio.run(wd.run_quality_gate(tid))
-    assert order == ["precheck", "verify", "qc"]
-    assert out["precheck"]["applied"]
+    assert order == ["factcheck", "precheck", "verify", "qc"]
+    assert out["precheck"]["applied"] and out["factcheck"]["applied"]
 
 
-def test_quality_gate_goes_on_when_precheck_fails(tmp_db, monkeypatch):
-    """理由质检是让文字更像人写的，不是判这道题成不成立。模型欠费或超时的时候
-    把整条闸门停掉，等于一道题都过不去。"""
+@pytest.mark.parametrize("dead", ["factcheck", "precheck"])
+def test_quality_gate_goes_on_when_a_model_backed_check_fails(tmp_db, monkeypatch, dead):
+    """前两道都在调模型。欠费或超时的时候把整条闸门停掉，等于一道题都过不去。
+
+    过不了的那一档会留在 ERROR 上，看门狗看到账单恢复会自己回来补，所以这里放行
+    并不会让一道没核过的题溜到提交 —— 提交门禁那边照样认 ERROR。
+    """
     from app.db import session
-    from app.services import gsb_precheck, gsb_verifier, qa_bridge
+    from app.services import gsb_factcheck, gsb_precheck, gsb_verifier, qa_bridge
 
     with session() as db:
         t = m.Task(task_no="07", prompt_hash="h", user_prompt="p", status=m.ANALYZED)
@@ -1721,8 +1733,12 @@ def test_quality_gate_goes_on_when_precheck_fails(tmp_db, monkeypatch):
 
     reached = []
 
-    async def dead_precheck(task_id, **kw):
+    async def dead_check(task_id, **kw):
         return {"ok": False, "message": "模型请求被拒"}
+
+    async def live_check(task_id, **kw):
+        reached.append("alive")
+        return {"ok": True}
 
     async def fake_verify(task_id):
         reached.append("verify")
@@ -1732,9 +1748,241 @@ def test_quality_gate_goes_on_when_precheck_fails(tmp_db, monkeypatch):
         reached.append("qc")
         return {"ok": True, "passed": True, "summary": ""}
 
-    monkeypatch.setattr(gsb_precheck, "run_precheck", dead_precheck)
+    monkeypatch.setattr(gsb_factcheck, "run_factcheck",
+                        dead_check if dead == "factcheck" else live_check)
+    monkeypatch.setattr(gsb_precheck, "run_precheck",
+                        dead_check if dead == "precheck" else live_check)
     monkeypatch.setattr(gsb_verifier, "run_verify", fake_verify)
     monkeypatch.setattr(qa_bridge, "gsb_qc", fake_qc)
 
     asyncio.run(wd.run_quality_gate(tid))
-    assert reached == ["verify", "qc"]
+    assert reached == ["alive", "verify", "qc"]
+
+
+# ---------------- 质检积压与模型恢复 ----------------
+# 分析跑完自动接一道质检，这条路走通了就不会有积压。会有积压是因为质检也在调模型：
+# 账单被拒、网关抽风、后端重启，任何一次没跑成，题就停在待质检上，而它已经过了配对
+# 扫描那一关（analysis_status 是 DONE），后面没有任何一步会再碰它。
+
+def _settled_task(db, task_no="30", *, status=m.ANALYZED, **over):
+    t = m.Task(task_no=task_no, prompt_hash="h", user_prompt="p", status=status)
+    t.gsb = {"verdict": "A", "reason": "A 侧改对了，B 侧没有。"}
+    for k, v in over.items():
+        setattr(t, k, v)
+    db.add(t)
+    db.flush()
+    return t
+
+
+def test_backlog_picks_up_a_task_whose_quality_gate_never_finished(tmp_db):
+    from app.db import session
+
+    with session() as db:
+        tid = _settled_task(db).id
+    assert wd._quality_backlog() == [tid]
+
+
+def test_backlog_leaves_a_task_whose_checks_both_settled(tmp_db):
+    """两道都有有效结论就别再排了：一道题一次调用，对着没动过的话再问一遍是白花。"""
+    from app.db import session
+    from app.services import gsb_precheck
+
+    with session() as db:
+        t = _settled_task(db)
+        digest = gsb_precheck.reason_digest(t.gsb["reason"])
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"reason_digest": digest}
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "reason_digest": digest}
+    assert wd._quality_backlog() == []
+
+
+def test_backlog_picks_up_a_check_that_errored_out(tmp_db):
+    """ERROR 是这道检查自己没跑成，重跑正是该做的事。"""
+    from app.db import session
+    from app.services import gsb_precheck
+
+    with session() as db:
+        t = _settled_task(db)
+        digest = gsb_precheck.reason_digest(t.gsb["reason"])
+        t.factcheck_status = m.FACTCHECK_ERROR
+        t.factcheck = {"error": "账号有未付账单", "reason_digest": digest}
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True, "reason_digest": digest}
+        tid = t.id
+    assert wd._quality_backlog() == [tid]
+
+
+def test_backlog_picks_up_legacy_data_that_only_ever_had_the_wording_check(tmp_db):
+    """历史数据的 precheck 早就是 PASS，而事实核验是后加的一道，一律还是 IDLE。
+
+    只问措辞那一道的话，这批最该核的题会整批漏掉，而 ready 列表和积压扫描还会各说
+    各的数 —— 两处必须是同一个口径。
+    """
+    from app.db import session
+    from app.services import gsb_precheck
+
+    with session() as db:
+        t = _settled_task(db, "35")
+        t.precheck_status = m.PRECHECK_PASS
+        t.precheck = {"passed": True,
+                      "reason_digest": gsb_precheck.reason_digest(t.gsb["reason"])}
+        t.factcheck_status = m.FACTCHECK_IDLE
+        tid = t.id
+    assert wd._quality_backlog() == [tid]
+    assert gsb_precheck.ready_ids() == [tid]
+
+
+def test_recovery_probes_nothing_when_no_task_is_blocked_on_the_model(tmp_db, monkeypatch):
+    """探测本身也是一次模型调用。没有积压时一次都不该探。"""
+    probes = []
+
+    async def probe():
+        probes.append(1)
+        return {"ok": True, "message": "pong"}
+
+    monkeypatch.setattr(wd.llm, "probe_ping", probe)
+    monkeypatch.setattr(wd, "_last_probe_at", 0.0)
+    assert asyncio.run(wd._scan_llm_recovery()) == 0
+    assert probes == []
+
+
+def test_recovery_puts_billing_blocked_tasks_back_once_the_model_answers(tmp_db, monkeypatch):
+    """账单结清之后这批题没有任何机制会自己回来，所以要主动探一下。"""
+    from app.db import session
+
+    with session() as db:
+        stuck = _settled_task(db, "31")
+        stuck.factcheck_status = m.FACTCHECK_ERROR
+        stuck.factcheck = {"error": "Cursor 账号有未付账单", "llm_error": True}
+        stuck.auto_error = "质检没跑完"
+        tid = stuck.id
+
+    async def probe():
+        return {"ok": True, "message": "claude-opus-5 · 1.2s · pong"}
+
+    monkeypatch.setattr(wd.llm, "probe_ping", probe)
+    monkeypatch.setattr(wd, "_last_probe_at", 0.0)
+    assert asyncio.run(wd._scan_llm_recovery()) == 1
+    from app.db import session as s2
+
+    with s2() as db:
+        t = db.get(m.Task, tid)
+        assert t.factcheck_status == m.FACTCHECK_IDLE and t.auto_error == ""
+    # 门一打开，积压扫描当轮就能挑到它
+    assert wd._quality_backlog() == [tid]
+
+
+def test_recovery_keeps_waiting_while_the_model_still_refuses(tmp_db, monkeypatch):
+    from app.db import session
+
+    with session() as db:
+        stuck = _settled_task(db, "32")
+        stuck.factcheck_status = m.FACTCHECK_ERROR
+        stuck.factcheck = {"error": "Cursor 账号有未付账单", "llm_error": True}
+        tid = stuck.id
+
+    async def probe():
+        return {"ok": False, "message": "Cursor 账号有未付账单"}
+
+    monkeypatch.setattr(wd.llm, "probe_ping", probe)
+    monkeypatch.setattr(wd, "_last_probe_at", 0.0)
+    assert asyncio.run(wd._scan_llm_recovery()) == 0
+    from app.db import session as s2
+
+    with s2() as db:
+        assert db.get(m.Task, tid).factcheck_status == m.FACTCHECK_ERROR
+
+
+def test_recovery_throttles_repeated_probes(tmp_db, monkeypatch):
+    """五分钟一轮巡检，每轮都探等于白烧调用。刚探过就跳过。"""
+    import time
+
+    from app.db import session
+
+    with session() as db:
+        stuck = _settled_task(db, "33")
+        stuck.factcheck_status = m.FACTCHECK_ERROR
+        stuck.factcheck = {"error": "Cursor 账号有未付账单", "llm_error": True}
+
+    probes = []
+
+    async def probe():
+        probes.append(1)
+        return {"ok": True, "message": "pong"}
+
+    monkeypatch.setattr(wd.llm, "probe_ping", probe)
+    monkeypatch.setattr(wd, "_last_probe_at", time.time())
+    assert asyncio.run(wd._scan_llm_recovery()) == 0
+    assert probes == []
+
+
+def test_recovery_leaves_a_check_that_failed_for_a_reason_the_model_cannot_fix(
+        tmp_db, monkeypatch):
+    """轨迹缺了多少次重跑还是缺。放回流程只会让它下一轮再报同样的错，从此每轮空转。"""
+    from app.db import session
+
+    with session() as db:
+        t = _settled_task(db, "36")
+        t.factcheck_status = m.FACTCHECK_ERROR
+        t.factcheck = {"error": "两侧都没有轨迹执行记录，无法核验"}
+        tid = t.id
+
+    probes = []
+
+    async def probe():
+        probes.append(1)
+        return {"ok": True, "message": "pong"}
+
+    monkeypatch.setattr(wd.llm, "probe_ping", probe)
+    monkeypatch.setattr(wd, "_last_probe_at", 0.0)
+    # 这道题压根不算「等模型恢复」，所以连探测都不该发起
+    assert asyncio.run(wd._scan_llm_recovery()) == 0
+    assert probes == []
+    from app.db import session as s2
+
+    with s2() as db:
+        assert db.get(m.Task, tid).factcheck_status == m.FACTCHECK_ERROR
+
+
+def test_recovery_still_rescues_rows_written_before_the_llm_error_flag(tmp_db, monkeypatch):
+    """标记是后加的。账单那阵子攒下的 ERROR 行拿不到它，一条都不放回去等于白做。"""
+    from app.db import session
+
+    with session() as db:
+        t = _settled_task(db, "37")
+        t.precheck_status = m.PRECHECK_ERROR
+        t.precheck = {"error": "Cursor 账号有未付账单，模型请求被拒"}
+        tid = t.id
+
+    async def probe():
+        return {"ok": True, "message": "pong"}
+
+    monkeypatch.setattr(wd.llm, "probe_ping", probe)
+    monkeypatch.setattr(wd, "_last_probe_at", 0.0)
+    assert asyncio.run(wd._scan_llm_recovery()) == 1
+    from app.db import session as s2
+
+    with s2() as db:
+        assert db.get(m.Task, tid).precheck_status == m.PRECHECK_IDLE
+
+
+def test_recovery_ignores_an_analysis_that_failed_for_a_non_model_reason(tmp_db, monkeypatch):
+    """分析失败的原因五花八门。拿「轨迹缺失」那种去触发探测，等于每十分钟白烧一次。"""
+    from app.db import session
+
+    with session() as db:
+        t = _settled_task(db, "34", status=m.NEEDS_ATTENTION)
+        t.analysis_status = m.ANALYSIS_FAILED
+        t.auto_error = "GSB 分析失败：两侧的运行记录不全"
+
+    probes = []
+
+    async def probe():
+        probes.append(1)
+        return {"ok": True, "message": "pong"}
+
+    monkeypatch.setattr(wd.llm, "probe_ping", probe)
+    monkeypatch.setattr(wd, "_last_probe_at", 0.0)
+    assert asyncio.run(wd._scan_llm_recovery()) == 0
+    assert probes == []
