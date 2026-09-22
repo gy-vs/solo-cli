@@ -221,3 +221,127 @@ def parse_trace(path: Path) -> dict:
 def write_index(summary: dict, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+# ---------------- 给模型读的全量步骤 ----------------
+# parse_trace 产出的索引是给程序用的，每一步的工具返回只留 300 字、摘要只留 300 字，
+# 够核验对文件名、数轮次，不够判断这一步到底发生了什么：一次 npm test 的返回被切在
+# 第 300 个字符，失败的用例名在第 400 个字符上，读索引的人只知道"跑了测试"。
+#
+# 这一份反过来，为「读完再下结论」服务：工具的完整输入、完整返回都留着，步数不设
+# 上限。它不进 prompt，落成文件让 agent 自己去读，所以体量大一点不要紧——真正的
+# 约束是单步别大到把一次读取撑爆，几 MB 的文件内容读回来对判断也没有额外帮助。
+DUMP_TEXT_LIMIT = 4000
+
+
+def _dump_text(content: Any) -> str:
+    """取文本，和 _text_of 同源，但一个字都不截。
+
+    限额只在 _clip 那一处施加。两边都截的话，内容正好被砍到 limit，_clip 再看时
+    长度没超，于是那句「还剩多少」不会打出来——读的人把半截返回当成了全部。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                elif block.get("type") == "tool_result":
+                    parts.append(_dump_text(block.get("content")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts).strip()
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _clip(text: str, limit: int = DUMP_TEXT_LIMIT) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…（这一步的内容还有 {len(text) - limit} 个字符，完整内容在 trace.jsonl 里）"
+
+
+def dump_steps(path: Path, limit: int = DUMP_TEXT_LIMIT) -> str:
+    """把一份轨迹 jsonl 摊成按顺序读的纯文本。
+
+    不用 markdown 记号分节：工具返回里本来就常带 # 和 ```，套在 markdown 里会互相
+    吃掉，读的人分不清哪一段是材料、哪一段是格式。改用一条横线加步号，纯文本，
+    原文照摆。
+    """
+    steps: list[dict] = []
+    by_tool_use: dict[str, dict] = {}
+    head: dict[str, str] = {}
+
+    with path.open("r", encoding="utf-8", errors="replace") as fp:
+        for raw in fp:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for key, field in (("session", "sessionId"), ("harness", "version"), ("cwd", "cwd")):
+                if not head.get(key) and obj.get(field):
+                    head[key] = str(obj[field])
+            typ = obj.get("type")
+            msg = obj.get("message") or {}
+            content = msg.get("content")
+            if typ == "user":
+                if isinstance(content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            step = by_tool_use.get(str(b.get("tool_use_id")))
+                            if step is not None:
+                                step["result"] = _dump_text(b.get("content"))
+                                step["is_error"] = bool(b.get("is_error"))
+                elif not obj.get("isSidechain"):
+                    steps.append({"kind": "human", "text": _dump_text(content)})
+            elif typ == "assistant":
+                head["model"] = msg.get("model") or head.get("model", "")
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use":
+                        inp = b.get("input")
+                        step = {
+                            "kind": "tool",
+                            "tool": str(b.get("name", "")),
+                            "input": json.dumps(inp, ensure_ascii=False, indent=1)
+                            if isinstance(inp, dict) else str(inp or ""),
+                            "result": "",
+                            "is_error": False,
+                        }
+                        steps.append(step)
+                        by_tool_use[str(b.get("id"))] = step
+                    elif b.get("type") == "text" and str(b.get("text", "")).strip():
+                        steps.append({"kind": "say", "text": str(b["text"]).strip()})
+
+    out = [f"轨迹全文 · 共 {len(steps)} 步",
+           f"session {head.get('session') or '—'} · 模型 {head.get('model') or '—'} "
+           f"· harness {head.get('harness') or '—'}",
+           "每一步之间用一条横线隔开。下面的内容全部是轨迹原文，引用时可以逐字照抄。"]
+    for i, s in enumerate(steps, 1):
+        out.append("-" * 60)
+        kind = s["kind"]
+        if kind == "human":
+            out.append(f"[{i}] 真人输入")
+            out.append(_clip(s["text"], limit))
+        elif kind == "say":
+            out.append(f"[{i}] 模型发言")
+            out.append(_clip(s["text"], limit))
+        else:
+            flag = "  ← 这一步报错了" if s["is_error"] else ""
+            out.append(f"[{i}] 调用 {s['tool']}{flag}")
+            out.append("入参：")
+            out.append(_clip(s["input"], limit))
+            out.append("返回：")
+            out.append(_clip(s["result"], limit) or "（空）")
+    return "\n".join(out) + "\n"

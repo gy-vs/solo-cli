@@ -152,6 +152,28 @@ def test_normalize_keeps_startup_commands_verbatim():
     assert got["a_startup"]["steps"] == ["先装依赖"]
 
 
+def test_normalize_keeps_evidence_quotes_verbatim():
+    """quote 一个字都不许洗，它的唯一用途是回材料里逐字比对。
+
+    洗过的那一版会吃掉 /** */ 的星号和模板字符串的反引号，还会把工具入参里的绝对
+    路径缩成文件名，洗完的句子在材料里必然找不到，回查于是把有据的引用判成编造。
+    """
+    obj = {"verdict": "A", "evidence": [
+        {"side": "A", "file": "src/index.ts",
+         "quote": "/** One-shot expansion; throws if any variable is missing. */"},
+        {"side": "B", "file": "test/rfc-check.ts",
+         "quote": "console.log(`RFC vectors: ${pass} pass, ${fail} fail`);"},
+        {"side": "A", "file": "tests/stub.py",
+         "quote": "Write /tmp/attrs-test-stubs/pytest/__init__.py"},
+    ]}
+    got = ga.normalize(obj, {})
+    assert [e["quote"] for e in got["evidence"]] == [
+        "/** One-shot expansion; throws if any variable is missing. */",
+        "console.log(`RFC vectors: ${pass} pass, ${fail} fail`);",
+        "Write /tmp/attrs-test-stubs/pytest/__init__.py",
+    ]
+
+
 def test_normalize_survives_garbage_field_types():
     obj = {"verdict": "A", "reason": None, "a_findings": "不是字典",
            "b_startup": ["不是字典"], "evidence": ["不是字典", {"side": "b", "file": "x.py"}]}
@@ -190,8 +212,7 @@ def test_extract_json_raises_without_verdict():
 def _material(side: str, **over) -> dict:
     m = {"side": side, "status": "FINISHED", "num_turns": 12,
          "diff_stat": f" src/{side}.ts | 3 +++", "files": [f"M\tsrc/{side}.ts"],
-         "patch": f"diff --git a/src/{side}.ts b/src/{side}.ts\n+改动{side}",
-         "steps": [f"Edit 改了 src/{side}.ts"], "counts": {}}
+         "patch": f"diff --git a/src/{side}.ts b/src/{side}.ts\n+改动{side}"}
     m.update(over)
     return m
 
@@ -268,10 +289,18 @@ def test_run_facts_carries_the_closing_words():
 
 
 def test_clip_keeps_both_ends_of_a_long_output():
-    """测试框架的结论落在输出头尾，中间是逐条用例的刷屏；从前面截会把「N failed」切掉。"""
+    """测试框架的结论落在输出头尾，中间是逐条用例的刷屏；从前面截会把「N failed」切掉。
+
+    中间那个省略号要留成 gsb_evidence 认的形状（单个、两边空格），否则模型照抄这段
+    输出当证据时，引用回查拆不出前后两截，一条本来有据的引用会被判成编造。
+    """
     out = ga._clip("开头" + "中间" * 400 + "3 failed")
-    assert out.startswith("开头") and out.endswith("3 failed") and "……" in out
-    assert len(out) <= ga.OUT_LIMIT + 4
+    assert out.startswith("开头") and out.endswith("3 failed") and " … " in out
+    assert len(out) <= ga.OUT_LIMIT + 3
+    # 拿回查那把尺子验一遍：拆开之后前后两段都能在原文里按顺序找到
+    from app.services import gsb_evidence as ge
+
+    assert ge._appears_in(ge._norm("开头" + "中间" * 400 + "3 failed"), out)
 
 
 def test_facts_block_spells_out_an_empty_record_instead_of_leaving_a_blank():
@@ -309,7 +338,6 @@ def test_prompt_shows_both_sides_and_bans_excluded_factors(tmp_db):
         text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
 
     assert "src/A.ts" in text and "src/B.ts" in text
-    assert "改动A" in text and "改动B" in text
     assert "做个解析器" in text
     # 三类被排除的因素必须写进 prompt，否则模型会拿耗时差异当理由
     assert "推理时长" in text
@@ -317,6 +345,23 @@ def test_prompt_shows_both_sides_and_bans_excluded_factors(tmp_db):
     assert "网络" in text
     # 不能暗示哪侧是基准
     assert "不要假设某一侧是基准" in text
+
+
+def test_prompt_inlines_the_materials_instead_of_pointing_at_files(tmp_db):
+    """材料要随 prompt 一起送进去，不靠模型自己去读文件。
+
+    送进去的一定在上下文里；「让它自己读」是在赌它愿意读，赌输了拿回来的是一份
+    照着概览编的结论，形状和真读过的一模一样。压缩前的原样落在证据目录里，
+    那份是给引用回查当底本的，不是给模型读的。
+    """
+    from app.db import session
+
+    with session() as db:
+        text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
+    assert "改动A" in text and "改动B" in text
+    assert "PATCH-A" in text and "PATCH-B" in text
+    # 不该出现「去读某某文件」这类指路，工作目录是空的 ASK_DIR
+    assert "steps.md" not in text and "trace.jsonl" not in text
 
 
 def test_prompt_is_symmetric_between_sides(tmp_db):
@@ -363,16 +408,18 @@ def test_prompt_asks_for_startup_instructions(tmp_db):
     assert "录屏" in text
 
 
-def test_prompt_marks_missing_trace_instead_of_dropping_the_section(tmp_db):
-    """没有轨迹时要写明「没有轨迹」，不能让那一段凭空消失。
+def test_prompt_marks_empty_diff_instead_of_dropping_the_section(tmp_db):
+    """一侧没改动时要写明「无改动」，不能让那一段凭空消失。
 
-    段落一旦缺失，两侧的结构就不对称了，模型会把缺失当成那一侧什么都没做。
+    段落一旦缺失，两侧的结构就不对称了，模型会把缺失当成那一侧什么都没做——
+    而「没改动」和「材料没给」是两回事。
     """
     from app.db import session
 
     with session() as db:
-        text = ga.build_prompt(_task(db), {"A": _material("A"), "B": _material("B", steps=[])})
-    assert "（没有轨迹）" in text
+        text = ga.build_prompt(_task(db), {"A": _material("A"),
+                                           "B": _material("B", diff_stat="", files=[])})
+    assert "（无改动）" in text
 
 
 # ---------------- 材料采集 ----------------
@@ -643,6 +690,58 @@ def test_polish_reason_cleans_the_rewrite_like_the_first_pass(monkeypatch):
     assert "**" not in text and "/workspace" not in text
     assert "lib/dumper.js" in text
     assert left == []
+
+
+def test_polish_reason_drops_a_rewrite_that_invents_a_file(monkeypatch):
+    """改写这几轮看不到材料，冒出来的文件名一定是编的，整版丢掉。
+
+    正文是要原样交给评审的，那个文件名会成为评审拿去对位置的落点，而它在两侧材料里
+    根本不存在。
+    """
+    calls: list[str] = []
+    invented = CLEAN_REASON.replace("B 侧只改了 writeNode",
+                                    "B 侧只改了 src/anchor_cache.js 里的 writeNode")
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([invented], calls))
+    long = CLEAN_REASON * 6
+    text, left = asyncio.run(ga.polish_reason(long, verdict="A", rounds=1))
+    assert text == long and left
+
+
+def test_polish_reason_measures_invention_against_the_first_draft(monkeypatch):
+    """基准取最初那一稿，不取上一版，否则落点会一轮一轮往外漂。
+
+    每一版单独看都只比上一版多一个文件名，四轮下来正文里就有四个材料里没有的落点。
+    """
+    calls: list[str] = []
+    step1 = CLEAN_REASON * 2 + "锚点用例的问题出在 lib/dumper.js 的分支上。"
+    step2 = step1.replace("lib/dumper.js 的分支", "lib/anchors.js 的分支")
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([step1, step2], calls))
+    text, _ = asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A", rounds=2))
+    assert "lib/anchors.js" not in text
+
+
+def test_polish_reason_allows_a_rewrite_that_only_drops_content(monkeypatch):
+    """删是允许的，只有增才拦。砍掉整个次要论点正是这一步要做的事。
+
+    改写稿用 CLEAN_REASON 本身：它是原文的一截，落点一个都不新增，篇幅也落在窗口里，
+    所以除了「删掉了内容」之外没有任何一条能挑。
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([CLEAN_REASON], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A"))
+    assert text == CLEAN_REASON and left == []
+
+
+def test_polish_findings_drops_a_rewrite_that_invents_a_file(monkeypatch):
+    calls: list[str] = []
+    invented = {"a_findings": {"good": ["标签在嵌套映射里透传下去了"], "bad": []},
+                "b_findings": {"good": [], "bad": ["src/ghost.js 里的标签变成了 undefined"]}}
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([json.dumps(invented, ensure_ascii=False)], calls))
+    a = {"good": ["它在第 12 步透传了标签"], "bad": []}
+    b = {"good": [], "bad": ["lib/dumper.js:30-40 的标签丢了"]}
+    got_a, got_b, left = asyncio.run(ga.polish_findings(a, b, rounds=1))
+    assert (got_a, got_b) == (a, b)
+    assert left
 
 
 def test_polish_reason_gives_up_after_the_round_limit(monkeypatch):

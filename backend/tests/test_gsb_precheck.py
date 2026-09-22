@@ -192,6 +192,37 @@ def test_vet_rewrite_cleans_instead_of_dropping_what_it_can_strip():
     assert text and not why and "第 12 步" not in text
 
 
+def test_vet_rewrite_drops_a_draft_that_invents_a_file():
+    """这一步手里只有正文，没有题面、diff 和轨迹，凭空冒出来的文件名一定是编的。
+
+    稿子过了质检就直接盖掉理由正文，那个文件名会原样交到评审手里，而两侧材料里
+    根本没有这个文件。
+    """
+    text, why = gp._vet_rewrite(
+        GOOD.replace("B 侧只回了一句解析失败", "B 侧在 src/depth_guard.py 里只回了一句解析失败"),
+        GOOD, "A")
+    assert text == "" and "src/depth_guard.py" in why
+
+
+def test_vet_rewrite_drops_a_draft_that_invents_a_symbol():
+    text, why = gp._vet_rewrite(
+        GOOD.replace("A 侧补了", "A 侧在 parseNested 里补了"), GOOD, "A")
+    assert text == "" and "parseNested" in why
+
+
+def test_vet_rewrite_allows_shortening_a_path_it_already_had():
+    """原文写 src/parser.py、稿子只留 parser.py，那是同一处被缩写了，不是新增。"""
+    origin = GOOD + "问题出在 src/parser.py 的入口判定上。"
+    text, why = gp._vet_rewrite(GOOD + "问题出在 parser.py 的入口判定上。", origin, "A")
+    assert text and not why
+
+
+def test_vet_rewrite_does_not_trip_on_ordinary_english_words():
+    """API、JSON 这类词在中文正文里本来就常见，认成落点会把每一版稿子都判成新增。"""
+    text, why = gp._vet_rewrite(GOOD + "两边返回的 JSON 结构一致，API 也没有变。", GOOD, "A")
+    assert text and not why
+
+
 # ---------------- 指纹与过期 ----------------
 
 def test_digest_ignores_whitespace_only_edits():

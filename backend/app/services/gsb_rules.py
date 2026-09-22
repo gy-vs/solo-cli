@@ -430,6 +430,45 @@ def opening_signature(text: str) -> str:
     return head[:OPENING_SIGNATURE_CHARS]
 
 
+# ---------------- 落点：文件名与代码符号 ----------------
+# 理由里的文件名和函数名是评审拿去对位置的东西，也是这段话里唯一能被逐字回查的
+# 部分。后面几轮改写只给正文不给材料，本来就是为了让模型没有素材去补新论点；但
+# 「不许新增原文里没有的事实」这一条只写在 prompt 里，它顺手把一个从没出现过的
+# 文件名写进去，程序原先一点都看不出来——改写稿盖回正文之后，那个文件名就成了
+# 交付给评审的落点，而它在两侧材料里根本不存在。
+#
+# 把落点抽成集合做比对，改写稿里冒出来的就是编的。
+#
+# 只认明确是代码的三类写法，不认裸英文词。API、JSON、Docker、CLI 这类在中文正文
+# 里本来就常出现，收进来会把每一版合格的改写稿都判成新增，四轮下来一个字都改不动。
+CODE_EXT = ("py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|rb|php|c|h|cc|cpp|hpp|cs|swift|kt"
+            "|json|ya?ml|toml|ini|cfg|md|txt|sh|sql|html|css|scss|vue|svelte")
+
+CODE_TOKEN = re.compile(
+    r"(?:[\w.\-]+/)+[\w.\-]+"                 # 带目录的路径
+    rf"|\b[\w\-]+\.(?:{CODE_EXT})\b"          # 带常见扩展名的文件名
+    r"|\b[A-Za-z_][A-Za-z0-9_]*(?=\(\))"      # 写成 foo() 的调用
+    r"|\b[a-z0-9]+(?:_[a-z0-9]+)+\b"          # snake_case
+    r"|\b[a-z]+(?:[A-Z][a-z0-9]*)+\b")        # camelCase
+
+
+def code_tokens(text: str) -> set[str]:
+    """文本里出现的落点：路径、文件名、代码符号。"""
+    return {m.group(0) for m in CODE_TOKEN.finditer(text or "")}
+
+
+def invented_tokens(new: str, old: str) -> list[str]:
+    """改写稿里冒出来、原文没有的落点。
+
+    按裸文件名兜一层：原文写 src/app.py、改写稿只留 app.py，那是同一处被缩写了，
+    不算新增；反过来补全成带目录的路径也一样。真正要拦的是凭空多出来的那一个。
+    """
+    known = code_tokens(old)
+    bare = {t.rsplit("/", 1)[-1] for t in known}
+    return sorted(t for t in code_tokens(new)
+                  if t not in known and t.rsplit("/", 1)[-1] not in bare)
+
+
 # ---------------- 只看理由文本的那些规则 ----------------
 # 这一组的判定只需要理由本身（外加结论和别的题的开头），所以生成时就能自查，
 # 不必等到上传前核验。两个地方共用这一个函数：分析生成完先拿它挑毛病、让模型
