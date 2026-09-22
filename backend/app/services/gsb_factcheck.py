@@ -18,6 +18,13 @@
 采信规则借 gsb_analyzer.vet_rewrite，和口语化质检共用一把尺子。改写稿过不了关就再问
 一次，把过不了关的原因一并告诉模型（FIX_ROUNDS）；连着几轮都交不出能用的稿子才判
 待人工——那时候留给人的至少是一份说清了「哪里不符、轨迹里是什么」的报告。
+
+「对得上轨迹」是按侧对的，不是按两侧并集对的。说 A 的事要在 A 的轨迹里找得到，说 B
+的事要在 B 的轨迹里找得到；把 B 的 removeNode 写成 A 的做法，这个词在「轨迹里」确实
+有，可它不在 A 的轨迹里，这就是不符。这一类程序能逐字判的交给 gsb_attribution，判
+出来的硬项不经模型点头：模型说没问题也照样算不符，改写稿里还留着也照样不采信。
+程序判不了的（过程里做过的事、做法归属、侧别从上下文推断的句子）交给模型，prompt 里
+给它两侧各自的过程记录和一张落点归属表，逐条对。
 """
 
 from __future__ import annotations
@@ -34,9 +41,13 @@ from app.models import (
     ANALYZED, FACTCHECK_CONFIRMED, FACTCHECK_ERROR, FACTCHECK_FAIL, FACTCHECK_IDLE,
     FACTCHECK_OK, FACTCHECK_PASS, FACTCHECK_RUNNING, PRECHECK_IDLE, QC, Task, utc_now,
 )
-from app.services import gsb_analyzer, gsb_rules, llm
+from app.services import gsb_analyzer, gsb_attribution, gsb_rules, llm
 
 log = logging.getLogger("gsb_factcheck")
+
+# 报告里带这个标记，才说明这份结论是按侧核过的。在这之前的 PASS 只对过执行结果，
+# 张冠李戴的句子照样能拿到 PASS，所以老结论一律不作数，要按新口径重核。
+ATTRIBUTION_VERSION = 1
 
 # 核验的 prompt 是一段理由加两侧执行记录，比 GSB 分析小一个量级，正常一两分钟就回。
 FACTCHECK_TIMEOUT_S = 900
@@ -162,24 +173,80 @@ def load_facts(task_no: str) -> dict[str, dict]:
             for s in config.SIDES}
 
 
+def load_corpora(task_no: str) -> dict[str, str]:
+    """两侧各自的轨迹全文，按侧核对落点用。"""
+    return gsb_attribution.load_corpora(task_no)
+
+
+def load_process(task_no: str) -> dict[str, dict]:
+    """两侧各自的过程：改过哪些文件、按顺序做了什么。
+
+    判「这件事是哪一侧做的」要看过程，执行记录只有命令和结果，写临时脚本、补用例、
+    对照上游实现这类事它不记。压缩口径和分析那边一致，一行一步。
+    """
+    out: dict[str, dict] = {}
+    for s in config.SIDES:
+        index = gsb_analyzer._load_trace_index(task_no, s)
+        edited: list[str] = []
+        for step in index.get("steps") or []:
+            if step.get("tool") in gsb_analyzer.SRC_EDIT_TOOLS:
+                for f in step.get("files") or []:
+                    if isinstance(f, str) and f.strip() and f.strip() not in edited:
+                        edited.append(f.strip())
+        out[s] = {"steps": gsb_analyzer._condense_steps(index), "edited": edited[:60]}
+    return out
+
+
 def _facts_text(facts: dict[str, dict]) -> str:
     return "\n\n".join(f"=== {s} 侧的实际执行记录 ===\n{gsb_analyzer.facts_block(facts.get(s) or {})}"
                        for s in config.SIDES)
 
 
+def _process_text(process: dict[str, dict]) -> str:
+    blocks = []
+    for s in config.SIDES:
+        p = process.get(s) or {}
+        edited = "\n".join(f"  {f}" for f in p.get("edited") or []) or "  （没有改过文件）"
+        steps = "\n".join(f"  {x}" for x in p.get("steps") or []) or "  （没有轨迹）"
+        blocks.append(f"=== {s} 侧的过程记录（只属于 {s} 侧）===\n"
+                      f"改过的文件：\n{edited}\n按先后顺序做了什么：\n{steps}")
+    return "\n\n".join(blocks)
+
+
 # ---------------- prompt ----------------
 
 def build_prompt(reason: str, facts: dict[str, dict], *, verdict: str = "",
-                 task_no: str = "", retry_note: str = "") -> str:
+                 task_no: str = "", retry_note: str = "",
+                 corpora: dict[str, str] | None = None,
+                 process: dict[str, dict] | None = None) -> str:
+    corpora = corpora or {}
     found = suspects(reason, facts)
     listed = "\n".join(f"  {i}. [{h['side']} 侧] 「{h['quote']}」\n     对不上的地方：{h['why']}"
                        for i, h in enumerate(found, 1))
     hint_block = (f"""
-【本地先摘出来的可疑断言】
+【本地先摘出来的可疑断言（执行结果类）】
 下面这几句我这边按规则先摘了出来，侧别是猜的，可能猜反，你按原文自己判。
 不一定都算问题，但每一条都要给出判断；漏在外面的也要报。
 {listed}
 """.rstrip() if found else "")
+
+    attr = gsb_attribution.check(reason, corpora) if any(corpora.values()) else []
+    hard = [h for h in attr if h["level"] == gsb_attribution.HARD]
+    soft = [h for h in attr if h["level"] != gsb_attribution.HARD]
+    hard_block = ("\n【程序按侧逐字查出来的不符（必须改，不许判成没问题）】\n"
+                  "下面这几处是拿正文里的名字回到那一侧自己的轨迹全文里逐字查的，查不到就是查不到。"
+                  "它们一定要出现在 mismatches 里，改写稿里也不许再留着：\n"
+                  + "\n".join(f"  {i}. 「{h['quote']}」\n     {h['why']}"
+                              for i, h in enumerate(hard, 1))) if hard else ""
+    soft_block = ("\n【侧别需要你判的落点】\n"
+                  "下面这几处的侧别是从上下文推断的，程序不下结论。按原文判它到底说的是哪一侧，"
+                  "说的那一侧轨迹里没有就算不符；每一条都要给出判断：\n"
+                  + "\n".join(f"  {i}. 「{h['quote']}」\n     {h['why']}"
+                              for i, h in enumerate(soft, 1))) if soft else ""
+    table_block = (f"\n【落点归属表】\n正文里每个文件名、代码符号分别在哪一侧的轨迹里出现过"
+                   f"（逐字查的两侧轨迹全文）：\n{gsb_attribution.table(reason, corpora)}"
+                   if any(corpora.values()) else "")
+    process_block = f"\n\n{_process_text(process)}" if process else ""
 
     lo, hi = gsb_rules.REASON_TARGET_MIN, gsb_rules.REASON_TARGET_MAX
     retry_block = f"""
@@ -192,45 +259,68 @@ def build_prompt(reason: str, facts: dict[str, dict], *, verdict: str = "",
 这段话马上要交给评审方，写错的事实会算到对方头上。
 
 【你唯一的事实来源】
-下面两块执行记录摘自两侧的运行轨迹，是这两次跑真实发生过的事。
-判断「跑没跑起来、编译过没过、测试过没过、报了什么错」只能依据它。
+下面的材料全部摘自两侧各自的运行轨迹，是这两次跑真实发生过的事。A 的材料只能证明
+A 做过什么，B 的材料只能证明 B 做过什么，两侧不能互相作证。
+- 执行记录：判断「跑没跑起来、编译过没过、测试过没过、报了什么错」只能依据它。
+- 过程记录：判断「这件事是哪一侧做的、改的是哪一侧的哪个文件」依据它。
+- 落点归属表：正文里每个名字在哪一侧的轨迹里真实出现过，是程序逐字查的。
 记录里没有的，就是没有依据；不要自己去推，也不要凭代码改动的样子想象运行结果。
 
-{_facts_text(facts)}
+{_facts_text(facts)}{process_block}
 
 【待核对的正文】
 题号 {task_no or '—'}，结论是 {verdict or '未给出'}。
 <<<REASON
 {reason}
 REASON>>>
+{table_block}
+{hard_block}
+{soft_block}
 {hint_block}
 {retry_block}
 
 【核对什么】
-逐句读正文，只挑关于执行结果的断言来对：跑没跑起来、构建编译过没过、测试跑没跑过、
-跑出了什么结果、报了什么错、是不是中途停下了。命中下面任何一条就算不符：
+逐句读正文，两类断言都要对。
 
-1. 说某一侧没跑过测试 / 没有验证，而执行记录里它改完代码之后跑过校验命令且成功了。
-2. 说某一侧戛然而止 / 中途放弃，而执行记录里它留下了完整的收尾总结。
-3. 说某一侧跑不起来 / 编译不过 / 构建失败，而执行记录里没有对应的失败命令或报错。
+一、侧别对应：说 A 的就要对得上 A 的轨迹，说 B 的就要对得上 B 的轨迹。
+正文里挂在某一侧名下的每一件具体的事，都必须在**那一侧自己**的轨迹里找得到：
+函数名、文件名、类名、用到的做法，以及过程中做过的事（写过临时脚本、补过用例、
+发现并修过某个缺陷、对照过某个实现、跑了多少条测试）。命中下面任何一条就算不符：
+1. 张冠李戴：把一侧的函数名、文件名、做法写到了另一侧名下。例如 removeNode 只在 B
+   的轨迹里出现，正文却说「A 依据 removeNode 的返回值更新 size」——哪怕 A 确实用了
+   同样的思路，它用的名字叫 deleteNode，这句话也是错的。
+2. 把一侧过程中发生的事写到了另一侧名下，或者把两侧的事揉进一句、记在同一侧头上。
+3. 正文里的名字或事件，两侧的轨迹里都找不到。
+4. 侧别含糊：一句话只点了一侧，里面说的却是另一侧的东西，读的人会记到点名的那一侧
+   头上。这也算不符，改的时候把侧别写明。
+「这个名字在轨迹里确实有」不等于对上了。它得在正文说的那一侧的轨迹里有才算。
+
+二、执行结果：跑没跑起来、构建编译过没过、测试跑没跑过、跑出了什么结果、报了什么错、
+是不是中途停下了。命中下面任何一条就算不符：
+5. 说某一侧没跑过测试 / 没有验证，而执行记录里它改完代码之后跑过校验命令且成功了。
+6. 说某一侧戛然而止 / 中途放弃，而执行记录里它留下了完整的收尾总结。
+7. 说某一侧跑不起来 / 编译不过 / 构建失败，而执行记录里没有对应的失败命令或报错。
    这一条最常见：它是从代码改动的样子推出来的，不是看出来的。
-4. 说跑出了某个结果、报了某个错，而执行记录里找不到这条输出。
-5. 反过来，执行记录里明明有失败的命令，正文却说这一侧验证充分。
+8. 说跑出了某个结果、报了某个错，而执行记录里找不到这条输出。
+9. 反过来，执行记录里明明有失败的命令，正文却说这一侧验证充分。
 
 不算不符的，一条都不要报：
-- 对产物本身的判断（需求点没实现、接口改坏了、边界没处理、用例写得不全）。
-  这些看代码就能定，执行记录反驳不了它们，不归你管。
+- 对产物好坏的判断本身（需求点没实现、接口改坏了、边界没处理、用例写得不全）。
+  这些看代码就能定，不归你管。但这个判断挂在哪一侧名下、用的名字对不对，归你管。
 - 措辞生硬、篇幅、结论判给谁。那是另外两道在管的事。
 - 正文说得比记录更概括。「跑过一轮验证」对应记录里的具体命令，这是正常的写法。
 
 【改法】
 只要报了不符，就必须交出改好之后的**整段**正文，直接可以替换原文：
-- 断言和记录反着的，按记录改。记录说改完跑通了，就写成跑通了，不要含糊成「验证不够」。
+- 张冠李戴的，按那一侧自己轨迹里的真实情况改：名字换成那一侧实际用的名字（在落点
+  归属表和过程记录里查），或者把主语改回真正做这件事的那一侧。两侧都查不到的，删掉。
+- 侧别含糊的，把侧别写明，例如「B 的 resolveTypeUrl 只取第一个斜杠」。
+- 断言和执行记录反着的，按记录改。记录说改完跑通了，就写成跑通了，不要含糊成「验证不够」。
 - 断言没有依据（推出来的），把这句话删掉或者降回它真正有依据的说法。
   例如「所以它跑不起来」，如果只是代码上看着有问题，就写成「代码上看这里会出问题」，
   不要保留任何关于运行结果的断言。
 - 只动有问题的那几句，别的句子逐字保留。这一步不是重写，是订正。
-- 不要新增任何原文和执行记录里都没有的事实。
+- 不要新增任何原文和两侧轨迹里都没有的事实。换进来的名字必须在对应那一侧的轨迹里查得到。
 - 结论不许变。原文判 A 更好，改完也必须落在 A 更好。
 - 改完保持在 {lo} 到 {hi} 字。删掉一句之后短了，就把原文已经点到、但没讲透的判断依据
   补足，不要靠加新论点凑字数。
@@ -243,9 +333,10 @@ REASON>>>
   "summary": "一句话总体判断，二十到五十字",
   "mismatches": [
     {{"quote": "原文片段，逐字照抄，不要改写",
-      "side": "A" 或 "B",
+      "side": "正文把这件事记在哪一侧名下：A 或 B",
+      "type": "侧别" 或 "执行结果",
       "claim": "这句话断言了什么",
-      "fact": "执行记录里实际是什么，指明是哪条命令或哪段输出",
+      "fact": "轨迹里实际是什么：哪一侧的哪条命令、哪段输出、哪个文件里的哪个名字",
       "fix": "这一处改成了什么"}}
   ],
   "rewrite": "订正后的整段正文，没有问题时留空串"
@@ -276,9 +367,11 @@ def normalize(obj: dict, *, reason: str) -> dict:
             dropped += 1
             continue
         side = str(raw.get("side") or "").upper()[:1]
+        kind = gsb_analyzer._clean(raw.get("type"))
         items.append({
             "quote": quote[:300],
             "side": side if side in config.SIDES else "",
+            "type": kind if kind in ("侧别", "执行结果") else "",
             "claim": gsb_analyzer._clean(raw.get("claim"))[:300],
             "fact": gsb_analyzer._clean(raw.get("fact"))[:400],
             "fix": gsb_analyzer._clean(raw.get("fix"))[:400],
@@ -289,7 +382,45 @@ def normalize(obj: dict, *, reason: str) -> dict:
             "summary": gsb_analyzer._clean(obj.get("summary"))[:300]}
 
 
-def notes_for(mismatches: list[dict], reason: str) -> list[str]:
+def merge_local(mismatches: list[dict], hard: list[dict]) -> list[dict]:
+    """把程序判出的侧别硬项并进模型报的不符里。
+
+    模型漏报的照样算数：这些是按侧逐字查出来的，不是推断。模型已经报过同一句的就
+    不重复开条目，免得同一处在报告里出现两次、人以为有两处要改。
+    """
+    out = list(mismatches)
+    for h in hard:
+        q = _squash(h["quote"])
+        if any(_squash(m["quote"]) in q or q in _squash(m["quote"]) for m in out):
+            continue
+        out.append({"quote": h["quote"], "side": h["side"], "type": "侧别",
+                    "claim": f"把 {h['ref']} 记在了 {h['side'] or '未标明的一'} 侧名下"
+                    if h["kind"] == gsb_attribution.CROSS else f"提到了 {h['ref']}",
+                    "fact": h["why"], "fix": "", "source": "local"})
+    return out[:MAX_MISMATCHES]
+
+
+def vet(rewrite: str, original: str, verdict: str,
+        corpora: dict[str, str]) -> tuple[str, str]:
+    """事实核验这一步的改写稿采信。在通用那把尺子上多两条：
+
+    - 换进来的名字只要在任一侧的轨迹里查得到，就不算编造。订正张冠李戴，往往就是把
+      removeNode 换成 A 自己的 deleteNode，而通用尺子拦的正是「原文没有的符号」，
+      不放开这一条，串侧的句子就只能删不能改。
+    - 改完之后按侧再查一遍，还有硬项就不采信。换对了名字却把主语换错，是同一种错。
+    """
+    fixed, why = gsb_analyzer.vet_rewrite(
+        rewrite, original, verdict,
+        grounded=(lambda t: gsb_attribution.grounded(t, corpora)) if any(corpora.values()) else None)
+    if not fixed:
+        return "", why
+    if left := gsb_attribution.hard(fixed, corpora):
+        return "", ("改写稿里仍有侧别对不上轨迹的地方：" +
+                    "；".join(f"「{h['quote'][:60]}」{h['why']}" for h in left[:3]))
+    return fixed, ""
+
+
+def notes_for(mismatches: list[dict], reason: str, *, applied: bool = True) -> list[str]:
     """把每一处订正折成一句人话，放进报告里给人看。
 
     这是这一步对外交付的东西之一。只给一段改好的正文，人没法知道动过哪里，
@@ -305,8 +436,14 @@ def notes_for(mismatches: list[dict], reason: str) -> list[str]:
         loc = next((f"第 {j} 段" for j, p in enumerate(paras, 1)
                     if _squash(m["quote"]) in _squash(p)), "正文")
         side = f"{m['side']} 侧" if m.get("side") else "未标明侧别"
-        out.append(f"第 {i} 处（{loc}，{side}）：原文「{m['quote']}」与轨迹不符。"
-                   f"轨迹里实际是：{m['fact']}。已改为：{m['fix']}")
+        kind = "侧别对不上" if m.get("type") == "侧别" else "与轨迹不符"
+        if applied:
+            tail = f"已改为：{m.get('fix') or '见订正后的正文'}"
+        else:
+            tail = (f"建议改为：{m['fix']}" if m.get("fix")
+                    else "需要按那一侧自己的轨迹改掉，或者把侧别写明")
+        out.append(f"第 {i} 处（{loc}，{side}）：原文「{m['quote']}」{kind}。"
+                   f"轨迹里实际是：{m['fact']}。{tail}")
     return out
 
 
@@ -370,9 +507,19 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
     from app.services import gsb_precheck
 
     facts = load_facts(task_no)
+    corpora = load_corpora(task_no)
+    process = load_process(task_no)
+    attribution = gsb_attribution.check(reason, corpora)
+    hard = [h for h in attribution if h["level"] == gsb_attribution.HARD]
     base = {"reason_digest": gsb_precheck.reason_digest(reason),
             "reason_chars": gsb_rules.visible_chars(reason),
-            "local_suspects": suspects(reason, facts),
+            "local_suspects": suspects(reason, facts) + [
+                {"quote": h["quote"], "side": h["side"],
+                 "why": ("[必须改] " if h["level"] == gsb_attribution.HARD else "[待判] ") + h["why"]}
+                for h in attribution],
+            "attribution": attribution,
+            "attribution_version": ATTRIBUTION_VERSION,
+            "attribution_sides": [s for s in config.SIDES if corpora.get(s)],
             "finished_at": utc_now().isoformat()}
     if not any((facts.get(s) or {}).get("steps_total") for s in config.SIDES):
         # 两侧都没有轨迹就核不了。判 ERROR 而不是 PASS：PASS 的意思是「对过了，没问题」，
@@ -393,7 +540,7 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
         try:
             r = await llm.ask(
                 build_prompt(text, facts, verdict=verdict, task_no=task_no,
-                             retry_note=retry_note),
+                             retry_note=retry_note, corpora=corpora, process=process),
                 purpose=f"事实核验 {task_no}", attempts=1, timeout_s=FACTCHECK_TIMEOUT_S)
             parsed = gsb_analyzer.extract_object(r.text, "mismatches", "事实核验 JSON")
         except (llm.LlmError, ValueError) as exc:
@@ -408,11 +555,13 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
 
         report = {**base, **normalize(parsed, reason=text), "model": r.model,
                   "rounds": rnd, "duration_s": round(time.time() - started)}
+        # 模型说没问题不作数：按侧逐字查出来的硬项照样记为不符，不改掉就过不了
+        report["mismatches"] = merge_local(report["mismatches"], hard)
         if not report["mismatches"]:
             break
         if not apply:
             break
-        fixed, why = gsb_analyzer.vet_rewrite(str(parsed.get("rewrite") or ""), text, verdict)
+        fixed, why = vet(str(parsed.get("rewrite") or ""), text, verdict, corpora)
         if fixed:
             report["notes"] = notes_for(report["mismatches"], text)
             report.update({"applied": True, "applied_at": utc_now().isoformat(),
@@ -427,6 +576,10 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
                     "message": f"事实核验订正了 {n} 处与轨迹不符的描述，理由已更新",
                     "reason": fixed}
         retry_note = why or "上一版没有交出可用的改写稿"
+        if not why and hard:
+            retry_note += ("，而程序按侧查出的那几处不符还在正文里："
+                           + "；".join(f"「{h['quote'][:60]}」{h['why']}" for h in hard[:3])
+                           + "。这几处必须改，给出整段订正稿")
         report["rewrite_dropped"] = retry_note
         log.warning("题 %s 事实核验第 %d 轮改写稿没采用：%s", task_no, rnd, retry_note)
 
@@ -439,7 +592,7 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
 
     # 报出了不符、却几轮都交不出能用的订正稿。留给人，但把话说清楚：哪一处、
     # 轨迹里是什么。人照着改比自己从头核对轨迹快得多。
-    report["notes"] = notes_for(report["mismatches"], text)
+    report["notes"] = notes_for(report["mismatches"], text, applied=False)
     _save(task_id, FACTCHECK_FAIL, report)
     n = len(report["mismatches"])
     log.warning("题 %s 事实核验挑出 %d 处但没能自动订正", task_no, n)
@@ -489,15 +642,20 @@ def reseal(task: Task, new_reason: str) -> bool:
     换了说法的话，结论必然和上一次一样。一百多道题就是一百多次白花的调用。
 
     过继不是无条件放行。措辞改写的约束是「不许新增原文里没有的事实」，但约束是劝，
-    劝不住的那部分要有人接住，所以这里拿本地那把确定性的尺子（suspects）在新文本上
-    再量一遍：量不出新的矛盾才过继，量得出就留着让它过期，看门狗会把整道核验补上。
+    劝不住的那部分要有人接住，所以这里拿本地那两把确定性的尺子在新文本上再量一遍：
+    执行结果（suspects）和侧别对应（gsb_attribution.hard）。措辞改写最容易出的侧别
+    问题是把「B 的 removeNode」和「A 的 setNode」并成一句、只留一个主语，名字一个
+    没改，归属却变了。量不出新的矛盾才过继，量得出就留着让它过期，重核一遍。
     这一遍不花模型调用，只是几条正则。
 
-    只有已经放行的结论才谈得上过继。判了待人工或者没跑成的，本来就该重跑。
+    只有已经放行、并且按侧核过的结论才谈得上过继。判了待人工、没跑成的、还是旧口径
+    的，本来就该重跑。
     """
-    if task.factcheck_status not in FACTCHECK_OK:
+    if task.factcheck_status not in FACTCHECK_OK or outdated(task):
         return False
     if suspects(new_reason, load_facts(task.task_no)):
+        return False
+    if gsb_attribution.hard(new_reason, load_corpora(task.task_no)):
         return False
     from app.services import gsb_precheck
 
@@ -517,9 +675,19 @@ def stale(task: Task) -> bool:
     return bool(digest) and digest != gsb_precheck.reason_digest((task.gsb or {}).get("reason") or "")
 
 
+def outdated(task: Task) -> bool:
+    """这份 PASS 是不是按侧核对之前的旧口径给的。
+
+    旧口径只对执行结果，张冠李戴的句子照样拿 PASS，这种结论不能再当放行用。
+    人工确认的不算：那是人看过之后自己拍板的。
+    """
+    return (task.factcheck_status == FACTCHECK_PASS
+            and int((task.factcheck or {}).get("attribution_version") or 0) < ATTRIBUTION_VERSION)
+
+
 def settled(task: Task) -> bool:
     """事实核验这一档过了没有。提交门禁与阶段推进都照它算。"""
-    return task.factcheck_status in FACTCHECK_OK and not stale(task)
+    return task.factcheck_status in FACTCHECK_OK and not stale(task) and not outdated(task)
 
 
 def factcheck_block(task: Task) -> str:
@@ -530,7 +698,11 @@ def factcheck_block(task: Task) -> str:
     老题被当成核验通过。
     """
     if task.factcheck_status in FACTCHECK_OK:
-        return "" if not stale(task) else "事实核验之后理由又改过，这份结论已经过期，重跑核验或人工确认"
+        if stale(task):
+            return "事实核验之后理由又改过，这份结论已经过期，重跑核验或人工确认"
+        if outdated(task):
+            return "这份事实核验是旧口径，没有按 A、B 两侧分别对照轨迹，重跑事实核验"
+        return ""
     if task.factcheck_status == FACTCHECK_RUNNING:
         return "事实核验正在跑，等它出结果"
     if task.factcheck_status == FACTCHECK_ERROR:
@@ -557,6 +729,6 @@ def skip_reason(task: Task) -> str:
     # ERROR 不在里面：那是核验自己没跑成（模型超时、账单被拒、输出解不开），重跑正是
     # 该做的事。FAIL 要挡——理由一个字没改就再问一遍，模型挑出来的还是那几处。
     if task.factcheck_status in (FACTCHECK_PASS, FACTCHECK_CONFIRMED, FACTCHECK_FAIL) \
-            and not stale(task):
+            and not stale(task) and not outdated(task):
         return "已有结论，理由没再改过"
     return ""

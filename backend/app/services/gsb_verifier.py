@@ -17,7 +17,9 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import Task, TaskRun
-from app.services import dockerx, gsb_analyzer, gsb_repo, gsb_rules, settings_store, trace
+from app.services import (
+    dockerx, gsb_analyzer, gsb_attribution, gsb_repo, gsb_rules, settings_store, trace,
+)
 from app.services.gsb_analyzer import VERDICTS
 
 log = logging.getLogger("gsb_verifier")
@@ -75,6 +77,13 @@ def verify(data: dict) -> dict:
         if missing:
             items.append(_item("reason_unknown_files", "block",
                                f"理由提到的文件在两侧的轨迹和产物里都找不到：{'、'.join(missing[:6])}"))
+
+    # ---- 说 A 的要对得上 A 的轨迹，说 B 的要对得上 B 的轨迹 ----
+    # 上面那条按两侧并集查，只管「存不存在」；这一条按侧查，管「记在谁名下」。
+    # 把 B 的 removeNode 写成 A 的做法，并集里查得到，平台的锚点核验却会打回。
+    for h in data.get("attribution") or []:
+        items.append(_item("reason_side_mismatch", "block",
+                           f"「{h['quote'][:80]}」{h['why']}"))
 
     # ---- 两侧的硬性材料 ----
     for side in config.SIDES:
@@ -211,6 +220,8 @@ async def collect(task_id: int) -> dict:
             "prompt": summary.get("prompt") or index.get("prompt") or "",
             "files": await _side_files(task_no, side, index),
         }
+
+    data["attribution"] = gsb_attribution.hard(data["reason"], gsb_attribution.load_corpora(task_no))
 
     image = settings_store.get("cc.image")
     data["image_version"] = await dockerx.claude_version(image) if image else ""

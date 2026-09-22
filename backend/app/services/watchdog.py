@@ -580,7 +580,16 @@ async def run_quality_gate(task_id: int) -> dict:
     elif fact.get("applied"):
         log.info("题 %d 事实核验订正了 %d 处后进入措辞质检", task_id, fact.get("mismatches", 0))
 
-    pre = await gsb_precheck.run_precheck(task_id)
+    # 事实核验没动正文、措辞那一档也还有效，就不再问一遍。按侧核对上线时整批旧 PASS
+    # 要回来重核，那批题的措辞早就放行过，重跑只是对着同一段话再花一次调用。
+    with session() as db:
+        t = db.get(Task, task_id)
+        wording_fresh = (t is not None and t.precheck_status in gsb_precheck.PRECHECK_OK
+                         and not gsb_precheck.stale(t))
+    if wording_fresh:
+        pre = {"ok": True, "passed": True, "skipped": True, "message": "理由没变，措辞质检沿用上一次的结论"}
+    else:
+        pre = await gsb_precheck.run_precheck(task_id)
     if not pre.get("ok"):
         log.warning("题 %d 措辞质检没跑成，继续走核验：%s", task_id, pre.get("message", ""))
 

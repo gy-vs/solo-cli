@@ -31,6 +31,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from app import config
@@ -106,6 +107,14 @@ FACT_REDLINE = """
    总结，就不许写「戛然而止」「中途放弃」。
 5. 两侧都按同一把尺子量。不要因为某一侧的执行记录更详细就默认它更可靠，也不要
    因为另一侧记录少就补一句推断出来的负面结论。
+
+【红线：说 A 的事只能出自 A 的材料，说 B 的事只能出自 B 的材料】
+6. 写到某一侧的函数名、文件名、做法、过程中做过的事，都必须出自那一侧自己的材料。
+   两侧思路相同、名字不同时，各写各的名字：A 叫 deleteNode 就写 deleteNode，
+   不能借用 B 的 removeNode。不许把两侧的名字揉进一句、记在同一侧头上。
+7. 一句话里的主语要和它说的东西在同一侧。「size 依据 removeNode 的返回值更新，
+   A 正是这样处理的」这种写法，读的人会把 removeNode 记到 A 头上；说的是 B 就写明
+   「B 的 removeNode」。
 """.strip()
 
 
@@ -872,7 +881,8 @@ async def polish_reason(reason: str, *, verdict: str, peer_openings: dict | None
 
 
 def vet_rewrite(rewrite: str, original: str, verdict: str,
-                repos: dict[str, Path] | None = None) -> tuple[str, str]:
+                repos: dict[str, Path] | None = None,
+                grounded: Callable[[str], bool] | None = None) -> tuple[str, str]:
     """决定一份整段改写稿要不要留。返回 (采信的稿子, 丢弃原因)，两者必有一个是空的。
 
     事实核验和口语化质检都会整段换掉理由，而它们都是自动落库、不等人点头的。所以
@@ -889,6 +899,10 @@ def vet_rewrite(rewrite: str, original: str, verdict: str,
       理由正文，那个文件名会原样交到评审手里。
     - 两侧都还在。结论翻没翻程序判不了，但一份只剩单侧的稿子必然是删过头了，
       而这恰好是 reason_both_sides 这条红项管的事，第二条已经覆盖。
+
+    grounded 是给手上有轨迹的那一步留的口子（事实核验）：新冒出来的名字在轨迹里查得
+    到就不算编。订正张冠李戴本来就要把 B 的名字换成 A 自己的名字，不放这个口子，
+    那种句子就只能删、不能改。
     """
     text = _clean(rewrite, repos)
     if not text:
@@ -907,7 +921,12 @@ def vet_rewrite(rewrite: str, original: str, verdict: str,
              if level == "block" and name not in before]
     if after:
         return "", f"改写稿引入了原文没有的红项：{'；'.join(after[:2])}"
-    if invented := gsb_rules.invented_tokens(text, original):
+    invented = gsb_rules.invented_tokens(text, original)
+    if grounded is not None:
+        invented = [t for t in invented if not grounded(t)]
+        if invented:
+            return "", (f"改写稿里冒出了两侧轨迹里都查不到的文件名或符号：{'、'.join(invented[:4])}")
+    elif invented:
         return "", (f"改写稿里冒出了原文没有的文件名或符号：{'、'.join(invented[:4])}，"
                     f"这一步看不到材料，编出来的落点无从查证")
     return text, ""

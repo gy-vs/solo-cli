@@ -74,20 +74,29 @@ def _task(task_id):
         return db.get(m.Task, task_id)
 
 
-def _stub(monkeypatch, *, text="", error=None, facts=None):
-    """换掉 llm.ask 与执行记录，并记下模型收到的 prompt。"""
+def _stub(monkeypatch, *, text="", error=None, facts=None, corpora=None, texts=None):
+    """换掉 llm.ask、执行记录和两侧轨迹全文，并记下模型收到的 prompt。
+
+    texts 给了就按轮次依次回，用来模拟「第一轮没改对、第二轮改对了」。
+    """
     seen: list[str] = []
 
     async def ask(prompt, **kw):
         seen.append(prompt)
         if error is not None:
             raise error
-        return LlmResult(text=text, model="stub-model")
+        body = texts[min(len(seen), len(texts)) - 1] if texts else text
+        return LlmResult(text=body, model="stub-model")
 
     monkeypatch.setattr(fc.llm, "ask", ask)
     monkeypatch.setattr(fc, "load_facts",
                         lambda task_no: facts if facts is not None
                         else {"A": _facts(), "B": _facts()})
+    monkeypatch.setattr(fc, "load_corpora",
+                        lambda task_no: corpora if corpora is not None else {"A": "", "B": ""})
+    monkeypatch.setattr(fc, "load_process",
+                        lambda task_no: {"A": {"steps": ["Edit src/map.ts"], "edited": ["src/map.ts"]},
+                                         "B": {"steps": ["Edit src/index.ts"], "edited": ["src/index.ts"]}})
     return seen
 
 
@@ -147,8 +156,11 @@ def test_prompt_carries_both_execution_records_and_the_local_suspects(analyzed_t
     assert "=== A 侧的实际执行记录 ===" in seen[0]
     assert "=== B 侧的实际执行记录 ===" in seen[0]
     assert "本地先摘出来的可疑断言" in seen[0]
-    # 产物判断不归这一步管，必须在 prompt 里写明，否则它会顺手报一堆代码问题
-    assert "对产物本身的判断" in seen[0]
+    # 产物好坏不归这一步管，必须在 prompt 里写明，否则它会顺手报一堆代码问题；
+    # 但好坏挂在哪一侧名下归它管
+    assert "对产物好坏的判断本身" in seen[0]
+    assert "说 A 的就要对得上 A 的轨迹" in seen[0]
+    assert "=== A 侧的过程记录（只属于 A 侧）===" in seen[0]
 
 
 # ---------------- 采信与订正 ----------------
@@ -225,6 +237,114 @@ def test_a_failed_model_call_is_an_error_and_is_marked_as_one(analyzed_task, mon
     assert "未付账单" in t.factcheck["error"] and t.factcheck["llm_error"] is True
 
 
+# ---------------- 侧别对应 ----------------
+# 7130 被打回的那一句：removeNode 只在 B 的轨迹里，正文却记到了 A 头上。这个词在
+# 两侧并集里查得到，按并集查永远是通过——这一节守的就是「按侧查」。
+
+CROSS_SENT = "size 应依据 setNode 和 removeNode 返回的插入删除结果更新，A 的实现正是这样处理的。"
+CROSSED = CLAIMED.replace("综合看 A 更贴题目要求。", CROSS_SENT + "综合看 A 更贴题目要求。")
+UNCROSSED = CROSSED.replace(CROSS_SENT,
+                            "size 应依据 setNode 和 deleteNode 返回的插入删除结果更新，A 的实现正是这样处理的。")
+CORPORA = {"A": '{"input": "function setNode() {}\\nfunction deleteNode() {}"}',
+           "B": '{"input": "function setNode() {}\\nfunction removeNode() {}"}'}
+
+
+def _crossed_task():
+    from app.db import session
+
+    with session() as db:
+        t = m.Task(task_no="7130", prompt_hash="h7130", user_prompt="p", status=m.ANALYZED)
+        t.gsb = {"verdict": "A", "reason": CROSSED}
+        db.add(t)
+        db.flush()
+        return t.id
+
+
+def test_the_model_saying_ok_does_not_let_a_cross_side_claim_through(tmp_db, monkeypatch):
+    """程序按侧查出来的硬项，模型说没问题也照样算不符。"""
+    tid = _crossed_task()
+    seen = _stub(monkeypatch, text=_report(), corpora=CORPORA)
+    r = asyncio.run(fc.run_factcheck(tid))
+    t = _task(tid)
+    assert r["passed"] is False and t.factcheck_status == m.FACTCHECK_FAIL
+    assert t.gsb["reason"] == CROSSED
+    item = t.factcheck["mismatches"][0]
+    assert item["side"] == "A" and item["type"] == "侧别" and "removeNode" in item["fact"]
+    assert "侧别对不上" in t.factcheck["notes"][0]
+    # 两轮都把这一处点名给了模型，第二轮还把「为什么上一版不行」带上了
+    assert "程序按侧逐字查出来的不符" in seen[0] and "removeNode：出现在 B 侧" in seen[0]
+    assert "removeNode" in seen[1] and "上一版改写稿没被采用" in seen[1]
+    assert "与轨迹不符" in fc.factcheck_block(t)
+
+
+def test_swapping_in_the_sides_own_name_is_accepted(tmp_db, monkeypatch):
+    """订正张冠李戴就是把名字换成那一侧自己的。deleteNode 原文里没有，但 A 的轨迹里有。"""
+    tid = _crossed_task()
+    _stub(monkeypatch, corpora=CORPORA, text=_report(
+        mismatches=[{"quote": CROSS_SENT, "side": "A", "type": "侧别",
+                     "fact": "A 的轨迹里叫 deleteNode", "fix": "换成 deleteNode"}],
+        rewrite=UNCROSSED))
+    r = asyncio.run(fc.run_factcheck(tid))
+    t = _task(tid)
+    assert r["applied"] is True and t.factcheck_status == m.FACTCHECK_PASS
+    assert t.gsb["reason"] == UNCROSSED
+    assert t.factcheck["attribution_version"] == fc.ATTRIBUTION_VERSION
+
+
+def test_a_rewrite_that_still_crosses_sides_is_refused(tmp_db, monkeypatch):
+    tid = _crossed_task()
+    still = CROSSED.replace("结果更新", "结果来更新")
+    seen = _stub(monkeypatch, corpora=CORPORA, texts=[
+        _report(mismatches=[{"quote": CROSS_SENT, "side": "A", "fact": "x", "fix": "y"}],
+                rewrite=still),
+        _report(mismatches=[{"quote": CROSS_SENT, "side": "A", "fact": "x", "fix": "y"}],
+                rewrite=UNCROSSED)])
+    r = asyncio.run(fc.run_factcheck(tid))
+    assert "仍有侧别对不上轨迹" in seen[1]
+    assert r["applied"] is True and _task(tid).gsb["reason"] == UNCROSSED
+
+
+def test_a_name_found_in_neither_trace_is_still_refused_in_a_rewrite(tmp_db, monkeypatch):
+    tid = _crossed_task()
+    made_up = CROSSED.replace("removeNode", "dropEntry")
+    _stub(monkeypatch, corpora=CORPORA, text=_report(
+        mismatches=[{"quote": CROSS_SENT, "side": "A", "fact": "x", "fix": "y"}],
+        rewrite=made_up))
+    r = asyncio.run(fc.run_factcheck(tid))
+    assert r["passed"] is False
+    assert "两侧轨迹里都查不到" in _task(tid).factcheck["rewrite_dropped"]
+
+
+def test_an_old_pass_that_never_checked_sides_no_longer_counts(analyzed_task):
+    """旧口径的 PASS 只对过执行结果，张冠李戴照样拿 PASS，不能再当放行用。"""
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, analyzed_task)
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"reason_digest": gp.reason_digest(CLAIMED)}
+        assert fc.outdated(t) and not fc.settled(t)
+        assert "旧口径" in fc.factcheck_block(t)
+    assert fc.skip_reason(_task(analyzed_task)) == ""
+
+
+def test_a_wording_rewrite_that_crosses_sides_is_not_carried_forward(tmp_db, monkeypatch):
+    tid = _crossed_task()
+    monkeypatch.setattr(fc, "load_facts", lambda task_no: {"A": _facts(), "B": _facts()})
+    monkeypatch.setattr(fc, "load_corpora", lambda task_no: CORPORA)
+    from app.db import session
+
+    good = FIXED.replace("综合看", UNCROSSED.split("综合看")[0].rsplit("。", 2)[-2] + "。综合看")
+    bad = FIXED.replace("综合看", CROSS_SENT + "综合看")
+    with session() as db:
+        t = db.get(m.Task, tid)
+        t.factcheck_status = m.FACTCHECK_PASS
+        t.factcheck = {"reason_digest": gp.reason_digest(good),
+                       "attribution_version": fc.ATTRIBUTION_VERSION}
+        assert fc.reseal(t, good) is True
+        assert fc.reseal(t, bad) is False
+
+
 # ---------------- 阶段与门禁 ----------------
 
 def test_passing_both_checks_moves_the_task_on_to_recording(analyzed_task, monkeypatch):
@@ -295,7 +415,7 @@ def test_the_gate_asks_for_the_recording_once_both_checks_are_clear(analyzed_tas
         t.status = m.QC
         digest = gp.reason_digest(CLAIMED)
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"reason_digest": digest}
+        t.factcheck = {"reason_digest": digest, "attribution_version": fc.ATTRIBUTION_VERSION}
         t.precheck_status = m.PRECHECK_PASS
         t.precheck = {"passed": True, "reason_digest": digest}
         t.screencast = {"A": "u", "B": ""}
@@ -307,12 +427,14 @@ def test_the_gate_asks_for_the_recording_once_both_checks_are_clear(analyzed_tas
 def test_a_wording_rewrite_carries_the_factcheck_verdict_forward(analyzed_task, monkeypatch):
     """不过继的话每道题都要核两遍，而第二遍核的是一段只换了说法的话。"""
     monkeypatch.setattr(fc, "load_facts", lambda task_no: {"A": _facts(), "B": _facts()})
+    monkeypatch.setattr(fc, "load_corpora", lambda task_no: {"A": "", "B": ""})
     from app.db import session
 
     with session() as db:
         t = db.get(m.Task, analyzed_task)
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"reason_digest": gp.reason_digest(CLAIMED)}
+        t.factcheck = {"reason_digest": gp.reason_digest(CLAIMED),
+                       "attribution_version": fc.ATTRIBUTION_VERSION}
         # 换正文和过继指纹在同一个事务里，顺序和 gsb_precheck._save 一致
         t.gsb = {**t.gsb, "reason": FIXED}
         assert fc.reseal(t, FIXED) is True
@@ -357,7 +479,8 @@ def test_skip_reason_turns_down_a_fresh_pass(analyzed_task):
     with session() as db:
         t = db.get(m.Task, analyzed_task)
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"reason_digest": gp.reason_digest(CLAIMED)}
+        t.factcheck = {"reason_digest": gp.reason_digest(CLAIMED),
+                       "attribution_version": fc.ATTRIBUTION_VERSION}
     assert "没再改过" in fc.skip_reason(_task(analyzed_task))
 
 

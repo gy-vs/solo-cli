@@ -12,6 +12,7 @@ import pytest
 
 from app import models as m
 from app.services import gsb_uploader as up
+from app.services.gsb_factcheck import ATTRIBUTION_VERSION
 
 
 def _schema(*keys, required=True, fingerprint="fp1"):
@@ -76,7 +77,8 @@ def _ready_to_submit(task_id, urls=("https://v.example/a", "https://v.example/b"
         t = db.get(m.Task, task_id)
         digest = gsb_precheck.reason_digest((t.gsb or {}).get("reason") or "")
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"mismatches": [], "reason_digest": digest}
+        t.factcheck = {"mismatches": [], "reason_digest": digest,
+                       "attribution_version": ATTRIBUTION_VERSION}
         t.precheck_status = m.PRECHECK_PASS
         t.precheck = {"passed": True, "issues": [], "reason_digest": digest}
         t.screencast = {"A": urls[0], "B": urls[1]}
@@ -374,6 +376,27 @@ def test_upload_refuses_when_a_trace_missing(ready_task):
         db.get(m.TaskRun, ids["B"]).trace_file = ""
     r = asyncio.run(up.upload_task(task_id))
     assert r["ok"] is False and "B 侧的轨迹文件缺失" in r["message"]
+
+
+def test_upload_refuses_a_reason_that_credits_one_side_with_the_others_code(ready_task):
+    """最后一道按侧核对，核的是马上要交出去的那两份轨迹。前面几道的结论都是存下来的，
+    中间理由被手改过就可能对不上；串侧交上去，平台的锚点核验必然打回。"""
+    from pathlib import Path
+
+    from app.db import session
+
+    task_id, ids = ready_task
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.gsb = {"verdict": "A", "reason": "A 依据 removeNode 的返回值更新 size。"}
+        Path(db.get(m.TaskRun, ids["A"]).trace_file).write_text(
+            '{"input": "function deleteNode() {}"}', encoding="utf-8")
+        Path(db.get(m.TaskRun, ids["B"]).trace_file).write_text(
+            '{"input": "function removeNode() {}"}', encoding="utf-8")
+    _ready_to_submit(task_id)
+    r = asyncio.run(up.upload_task(task_id))
+    assert r["ok"] is False
+    assert "对应那一侧的轨迹对不上" in r["message"] and "removeNode" in r["message"]
 
 
 def test_screencast_upload_records_returned_url(ready_task, monkeypatch, tmp_path):

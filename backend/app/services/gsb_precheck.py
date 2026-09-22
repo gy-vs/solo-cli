@@ -310,6 +310,18 @@ def local_defects(reason: str, verdict: str = "") -> list[str]:
             if level == "block" or name in ("reason_too_long", "reason_wording")]
 
 
+def side_defects(reason: str, task_no: str) -> list[str]:
+    """改写稿里按侧对不上轨迹的地方。
+
+    这一步只改措辞，可把「B 的 removeNode」「A 的 setNode」并成一句、只留一个主语，
+    名字一个没动，归属就变了。事实核验已经放行过的一段话，不能在这里被改成张冠李戴。
+    """
+    from app.services import gsb_attribution
+
+    return [f"「{h['quote'][:60]}」{h['why']}"
+            for h in gsb_attribution.hard(reason, gsb_attribution.load_corpora(task_no))]
+
+
 def normalize(obj: dict, *, reason: str, verdict: str = "") -> dict:
     """把模型输出洗成可入库的质检报告。
 
@@ -591,7 +603,7 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
         # 有改写稿就直接落到理由上。改完之后本地规则要重新判一遍：模型偶尔只改了被
         # 点名的那几句，篇幅或者别的说法还留着，那种稿子换上去只是把问题换了个位置。
         if report["rewrite"]:
-            left = local_defects(report["rewrite"], verdict)
+            left = local_defects(report["rewrite"], verdict) + side_defects(report["rewrite"], task_no)
             if not left:
                 applied, new_reason = True, report["rewrite"]
                 report.update({

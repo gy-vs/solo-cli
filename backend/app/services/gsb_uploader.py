@@ -18,7 +18,7 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import UPLOADED, Task, TaskRun, utc_now
-from app.services import dockerx, gate, gsb_precheck, gsb_repo, settings_store
+from app.services import dockerx, gate, gsb_attribution, gsb_precheck, gsb_repo, settings_store
 from app.services.gsb_analyzer import VERDICT_LABEL
 
 log = logging.getLogger("gsb_uploader")
@@ -335,6 +335,14 @@ async def upload_task(task_id: int) -> dict:
     for side in config.SIDES:
         if side not in traces or not traces[side].exists():
             return {"ok": False, "message": f"{side} 侧的轨迹文件缺失，无法上传"}
+
+    # 最后一道：拿马上要交出去的这两份轨迹，对马上要交出去的这段理由按侧再核一遍。
+    # 前面几道的结论都是存下来的，中间理由被人手改过、轨迹被重跑换过，都可能让那份
+    # 结论和这一刻交出去的东西对不上；而串侧一旦交上去，平台的锚点核验必然打回。
+    if left := gsb_attribution.hard(values.get("gsb_reason") or "",
+                                    gsb_attribution.corpora_from_files(traces)):
+        detail = "；".join(f"「{h['quote'][:50]}」{h['why']}" for h in left[:3])
+        return {"ok": False, "message": f"理由里有 {len(left)} 处与对应那一侧的轨迹对不上：{detail}"}
 
     record: dict = {"started_at": utc_now().isoformat(), "steps": []}
     try:

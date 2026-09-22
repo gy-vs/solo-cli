@@ -14,6 +14,7 @@ import pytest
 
 from app import models as m
 from app.services import gsb_precheck as gp
+from app.services.gsb_factcheck import ATTRIBUTION_VERSION
 from app.services.llm import LlmError, LlmResult
 
 # 各条测试共用的一段「像人写的」理由。够长，不会先撞上字数下限
@@ -43,7 +44,8 @@ def qc_task(tmp_db):
         t.gsb = {"verdict": "A", "reason": GOOD}
         t.screencast = {"A": "https://v.example/a", "B": "https://v.example/b"}
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"mismatches": [], "reason_digest": gp.reason_digest(GOOD)}
+        t.factcheck = {"mismatches": [], "reason_digest": gp.reason_digest(GOOD),
+                       "attribution_version": ATTRIBUTION_VERSION}
         db.add(t)
         db.flush()
         return t.id
@@ -283,7 +285,8 @@ def test_both_checks_cleared_moves_task_on_to_recording(tmp_db):
         t = m.Task(task_no="08", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
         t.gsb = {"verdict": "A", "reason": GOOD}
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"reason_digest": gp.reason_digest(GOOD)}
+        t.factcheck = {"reason_digest": gp.reason_digest(GOOD),
+                       "attribution_version": ATTRIBUTION_VERSION}
         t.precheck_status = m.PRECHECK_PASS
         t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
         db.add(t)
@@ -313,7 +316,8 @@ def test_reason_edited_after_the_gate_sends_the_task_back(tmp_db):
         t = m.Task(task_no="08", prompt_hash="h", user_prompt="x", status=m.QC)
         t.gsb = {"verdict": "A", "reason": GOOD + "补一句。"}
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"reason_digest": gp.reason_digest(GOOD)}
+        t.factcheck = {"reason_digest": gp.reason_digest(GOOD),
+                       "attribution_version": ATTRIBUTION_VERSION}
         t.precheck_status = m.PRECHECK_PASS
         t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
         db.add(t)
@@ -619,7 +623,8 @@ def test_run_precheck_promotes_a_task_whose_factcheck_already_passed(tmp_db, mon
         t = m.Task(task_no="09", prompt_hash="h", user_prompt="x", status=m.ANALYZED)
         t.gsb = {"verdict": "A", "reason": GOOD}
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"reason_digest": gp.reason_digest(GOOD)}
+        t.factcheck = {"reason_digest": gp.reason_digest(GOOD),
+                       "attribution_version": ATTRIBUTION_VERSION}
         db.add(t)
         db.flush()
         tid = t.id

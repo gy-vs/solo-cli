@@ -1764,13 +1764,14 @@ def test_backlog_picks_up_a_task_whose_quality_gate_never_finished(tmp_db):
 def test_backlog_leaves_a_task_whose_checks_both_settled(tmp_db):
     """两道都有有效结论就别再排了：一道题一次调用，对着没动过的话再问一遍是白花。"""
     from app.db import session
-    from app.services import gsb_precheck
+    from app.services import gsb_factcheck, gsb_precheck
 
     with session() as db:
         t = _settled_task(db)
         digest = gsb_precheck.reason_digest(t.gsb["reason"])
         t.factcheck_status = m.FACTCHECK_PASS
-        t.factcheck = {"reason_digest": digest}
+        t.factcheck = {"reason_digest": digest,
+                       "attribution_version": gsb_factcheck.ATTRIBUTION_VERSION}
         t.precheck_status = m.PRECHECK_PASS
         t.precheck = {"passed": True, "reason_digest": digest}
     assert wd._quality_backlog() == []
