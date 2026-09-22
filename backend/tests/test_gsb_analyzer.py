@@ -190,8 +190,7 @@ def test_extract_json_raises_without_verdict():
 def _material(side: str, **over) -> dict:
     m = {"side": side, "status": "FINISHED", "num_turns": 12,
          "diff_stat": f" src/{side}.ts | 3 +++", "files": [f"M\tsrc/{side}.ts"],
-         "patch": f"diff --git a/src/{side}.ts b/src/{side}.ts\n+改动{side}",
-         "steps": [f"Edit 改了 src/{side}.ts"], "counts": {}}
+         "patch": f"diff --git a/src/{side}.ts b/src/{side}.ts\n+改动{side}"}
     m.update(over)
     return m
 
@@ -215,7 +214,6 @@ def test_prompt_shows_both_sides_and_bans_excluded_factors(tmp_db):
         text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
 
     assert "src/A.ts" in text and "src/B.ts" in text
-    assert "改动A" in text and "改动B" in text
     assert "做个解析器" in text
     # 三类被排除的因素必须写进 prompt，否则模型会拿耗时差异当理由
     assert "推理时长" in text
@@ -223,6 +221,34 @@ def test_prompt_shows_both_sides_and_bans_excluded_factors(tmp_db):
     assert "网络" in text
     # 不能暗示哪侧是基准
     assert "不要假设某一侧是基准" in text
+
+
+def test_prompt_keeps_patch_and_trace_out_of_the_text(tmp_db):
+    """补丁和轨迹不能内联回 prompt。
+
+    材料一旦摆在眼前，模型就用眼前这一份，不会再去读证据目录里的全文——而内联那份
+    是压缩过的，写出来的评价没有一处能回查。这条断言是防回退用的。
+    """
+    from app.db import session
+
+    with session() as db:
+        text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
+    assert "改动A" not in text and "改动B" not in text
+    assert "diff --git" not in text
+
+
+def test_prompt_points_at_the_evidence_files(tmp_db):
+    """要读哪些文件必须逐个点名，只说「材料在工作目录里」它不会去翻。"""
+    from app.db import session
+
+    with session() as db:
+        text = ga.build_prompt(_task(db), {s: _material(s) for s in ("A", "B")})
+    for name in ("A/steps.md", "B/steps.md", "A/diff.patch", "B/diff.patch",
+                 "A/trace.jsonl", "B/trace.jsonl"):
+        assert name in text
+    assert "整份读完" in text
+    # 引用会被程序拿回原文核对，这件事要让它知道，否则它会转述
+    assert "逐字复制" in text
 
 
 def test_prompt_is_symmetric_between_sides(tmp_db):
@@ -267,16 +293,18 @@ def test_prompt_asks_for_startup_instructions(tmp_db):
     assert "录屏" in text
 
 
-def test_prompt_marks_missing_trace_instead_of_dropping_the_section(tmp_db):
-    """没有轨迹时要写明「没有轨迹」，不能让那一段凭空消失。
+def test_prompt_marks_empty_diff_instead_of_dropping_the_section(tmp_db):
+    """一侧没改动时要写明「无改动」，不能让那一段凭空消失。
 
-    段落一旦缺失，两侧的结构就不对称了，模型会把缺失当成那一侧什么都没做。
+    段落一旦缺失，两侧的结构就不对称了，模型会把缺失当成那一侧什么都没做——
+    而「没改动」和「材料没给」是两回事。
     """
     from app.db import session
 
     with session() as db:
-        text = ga.build_prompt(_task(db), {"A": _material("A"), "B": _material("B", steps=[])})
-    assert "（没有轨迹）" in text
+        text = ga.build_prompt(_task(db), {"A": _material("A"),
+                                           "B": _material("B", diff_stat="", files=[])})
+    assert "（无改动）" in text
 
 
 # ---------------- 材料采集 ----------------
@@ -301,44 +329,8 @@ def test_short_patch_is_not_truncated():
     assert ga._truncate_patch(patch, budget=600) == (patch, False)
 
 
-def test_condensed_steps_drop_step_numbers():
-    """轨迹压缩后不能带步号。
-
-    理由里禁止出现步数说法，材料里摆着步号模型就会照抄。
-    """
-    index = {"steps": [{"tool": "Edit", "summary": "改了 src/a.ts", "index": 38},
-                       {"tool": "Bash", "summary": "npm test", "is_error": True}]}
-    steps = ga._condense_steps(index)
-    assert steps == ["Edit 改了 src/a.ts", "Bash [报错] npm test"]
-    assert not any("38" in s for s in steps)
-
-
-def test_condensed_steps_keep_every_error_when_over_limit():
-    """超限抽样时报错步一个都不能丢，失败过程正是判断依据。"""
-    steps = [{"tool": "Read", "summary": f"读 {i}"} for i in range(400)]
-    steps += [{"tool": "Bash", "summary": f"炸了 {i}", "is_error": True} for i in range(5)]
-    got = ga._condense_steps({"steps": steps})
-    assert len(got) <= ga.STEP_LIMIT
-    assert sum("[报错]" in s for s in got) == 5
-
-
-def test_condensed_steps_keep_late_errors_that_exceed_the_budget():
-    """报错集中在末尾、而且数量逼近上限时，也不能被截断切掉。
-
-    「先抽样再截断」会在这种形状上把末尾的报错整批切没，于是一次全程失败的运行
-    在材料里看起来一切正常。
-    """
-    steps = [{"tool": "Read", "summary": f"读 {i}"} for i in range(400)]
-    steps += [{"tool": "Bash", "summary": f"炸了 {i}", "is_error": True} for i in range(300)]
-    got = ga._condense_steps({"steps": steps})
-    assert len(got) <= ga.STEP_LIMIT
-    assert sum("[报错]" in s for s in got) == ga.STEP_LIMIT
-
-
-def test_condensed_steps_preserve_original_order():
-    index = {"steps": [{"tool": "Read", "summary": "一"}, {"tool": "Edit", "summary": "二"},
-                       {"tool": "Bash", "summary": "三"}]}
-    assert ga._condense_steps(index) == ["Read 一", "Edit 二", "Bash 三"]
+# 轨迹不再压成摘要进 prompt，压缩与抽样那一套跟着删了。过程材料现在由
+# gsb_evidence 摊成全文交给 agent 读，对应的用例在 test_gsb_evidence.py。
 
 
 # ---------------- 生成时收口 ----------------
@@ -516,6 +508,56 @@ def test_polish_reason_cleans_the_rewrite_like_the_first_pass(monkeypatch):
     assert "**" not in text and "/workspace" not in text
     assert "lib/dumper.js" in text
     assert left == []
+
+
+def test_polish_reason_drops_a_rewrite_that_invents_a_file(monkeypatch):
+    """改写这几轮看不到材料，冒出来的文件名一定是编的，整版丢掉。
+
+    正文是要原样交给评审的，那个文件名会成为评审拿去对位置的落点，而它在两侧材料里
+    根本不存在。
+    """
+    calls: list[str] = []
+    invented = CLEAN_REASON.replace("B 侧只改了 writeNode",
+                                    "B 侧只改了 src/anchor_cache.js 里的 writeNode")
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([invented], calls))
+    long = CLEAN_REASON * 6
+    text, left = asyncio.run(ga.polish_reason(long, verdict="A", rounds=1))
+    assert text == long and left
+
+
+def test_polish_reason_measures_invention_against_the_first_draft(monkeypatch):
+    """基准取最初那一稿，不取上一版，否则落点会一轮一轮往外漂。
+
+    每一版单独看都只比上一版多一个文件名，四轮下来正文里就有四个材料里没有的落点。
+    """
+    calls: list[str] = []
+    step1 = CLEAN_REASON * 2 + "锚点用例的问题出在 lib/dumper.js 的分支上。"
+    step2 = step1.replace("lib/dumper.js 的分支", "lib/anchors.js 的分支")
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([step1, step2], calls))
+    text, _ = asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A", rounds=2))
+    assert "lib/anchors.js" not in text
+
+
+def test_polish_reason_allows_a_rewrite_that_only_drops_content(monkeypatch):
+    """删是允许的，只有增才拦。砍掉整个次要论点正是这一步要做的事。"""
+    calls: list[str] = []
+    trimmed = ("A 侧 lib/dumper.js 的 writeNode 改成返回对象，标签在嵌套映射里透传下去了；"
+               "B 侧只改了 writeNode，锚点用例里 tag 变成 undefined，所以选 A。")
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([trimmed], calls))
+    text, left = asyncio.run(ga.polish_reason(CLEAN_REASON * 6, verdict="A"))
+    assert text == trimmed and left == []
+
+
+def test_polish_findings_drops_a_rewrite_that_invents_a_file(monkeypatch):
+    calls: list[str] = []
+    invented = {"a_findings": {"good": ["标签在嵌套映射里透传下去了"], "bad": []},
+                "b_findings": {"good": [], "bad": ["src/ghost.js 里的标签变成了 undefined"]}}
+    monkeypatch.setattr(ga.llm, "ask", _fake_ask([json.dumps(invented, ensure_ascii=False)], calls))
+    a = {"good": ["它在第 12 步透传了标签"], "bad": []}
+    b = {"good": [], "bad": ["lib/dumper.js:30-40 的标签丢了"]}
+    got_a, got_b, left = asyncio.run(ga.polish_findings(a, b, rounds=1))
+    assert (got_a, got_b) == (a, b)
+    assert left
 
 
 def test_polish_reason_gives_up_after_the_round_limit(monkeypatch):

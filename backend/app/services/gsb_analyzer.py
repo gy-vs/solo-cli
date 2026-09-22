@@ -1,9 +1,23 @@
-"""GSB 对比分析：在本地把两侧材料摆齐，问一次模型，拿回谁更好与理由。
+"""GSB 对比分析：把两侧材料摆进一个只读目录，让模型读完它，拿回谁更好与理由。
 
-原先这里是放一个 agent 进两份产物副本里自己漫游：拷仓库、装依赖、跑测试、来回读代码，
-一次四十到九十分钟，失败原因散在几百次工具调用里，重试等于再赌一小时。现在换成确定性
-采集：git 负责给出产物差异，轨迹索引负责给出过程，两样都是现成的、可复现的，拼进一个
-prompt 问一次就够。副作用也一并没了——不再拷几百兆的副本，不再在副本里装依赖。
+这里的做法变过两次，中间那一版的教训值得记着。
+
+最早是放一个 agent 进两份产物副本里自己漫游：拷仓库、装依赖、跑测试、来回读代码，
+一次四十到九十分钟，失败原因散在几百次工具调用里，重试等于再赌一小时。于是改成
+确定性采集——git 给产物差异，轨迹索引给过程，全部拼进一个 prompt 问一次就够。快是
+快了，可拼进去的东西必须先过预算：补丁截到 40000 字符，轨迹压成一行一步、每步 120
+字、最多 140 步。模型看到的过程因此是有洞的：工具返回被切在第 120 个字符，失败的
+用例名在第 400 个字符上，步数过百的还要等距抽样。拿这种材料判「哪一侧绕了远路」，
+判得再认真也只是在归纳摘要。
+
+现在是第三版：材料落进 reports/<题号>/evidence/，工作目录钉在那儿，模型自己去读。
+和最早那版漫游的区别在于它读不到仓库本体——ask 模式不放开 shell，目录里只有我们摆
+进去的轨迹、补丁和题面，没有依赖可装，没有测试可跑，所以既拿回了完整材料，又没有
+把四十分钟和几百兆副本一起拿回来。
+
+配套的是 evidence 逐字回查（gsb_evidence.check_quotes）。材料从 prompt 里拿走之后，
+不读文件是写不出能对上原文的引用的，所以「一条都对不上」直接判这次分析失败。这道
+回查是整条链路上唯一能程序化判定编造的地方，别把它当成可选的质量提示。
 
 材料要对称。A 和 B 是同一个模型、同一份配置、同一个起点跑两次，差异只来自随机性，
 所以两侧给的材料种类、顺序、截断口径必须一模一样，也不能透露哪侧是「先跑的」——
@@ -26,7 +40,7 @@ from app.models import (
     ANALYSIS_DONE, ANALYSIS_FAILED, ANALYSIS_RUNNING, ANALYZED, ANALYZING,
     NEEDS_ATTENTION, PRECHECK_IDLE, Task, TaskRun, utc_now,
 )
-from app.services import dockerx, gsb_repo, gsb_rules, llm, trace
+from app.services import dockerx, gsb_evidence, gsb_repo, gsb_rules, llm, trace
 
 log = logging.getLogger("gsb_analyzer")
 
@@ -35,13 +49,14 @@ log = logging.getLogger("gsb_analyzer")
 VERDICT_LABEL = {"A": "A 更好", "B": "B 更好", "Same": "Same"}
 VERDICTS = tuple(VERDICT_LABEL)
 
-# 单侧材料的字符预算。补丁最占地方，但它也是判断产物好坏的唯一依据，所以给得最宽；
-# 超了就按文件截断并说明，而不是整段砍掉——半截补丁比没有补丁更容易让人误判。
-# 预算不能再放宽：两侧补丁加轨迹曾经到过 190KB，Opus 生成加上 HTTP/2 长流，
-# 容器里经常 15 分钟被掐掉再整段重跑。
-DIFF_BUDGET = 40000
-STEP_LIMIT = 140
-STEP_TEXT_LIMIT = 120
+# 补丁的字符预算。补丁不再进 prompt，而是落进证据目录由 agent 自己读，所以这个数
+# 可以给得比塞进一次请求时宽得多——原先卡在 40000 是因为两侧补丁加轨迹到过 190KB，
+# 容器里经常十几分钟被掐断再整段重跑，那是请求体的限制，不是判断需要的上限。
+#
+# 但也不能不设上限。锁文件、快照测试、误提交的构建产物，单个文件就能有几十兆，
+# 读完既判断不出什么，又把 agent 的上下文占满。超了按文件边界截断并写明还剩几个，
+# 而不是整段砍掉——半截补丁比没有补丁更容易让人误判。
+DIFF_BUDGET = 400000
 
 # 这三类差异不反映模型能力，写进理由等于拿环境问题给模型定罪，平台也不认。
 EXCLUDED_FACTORS = """
@@ -108,43 +123,14 @@ async def collect_side(task_no: str, side: str, run: TaskRun, snapshot: str) -> 
         material["files"] = []
         material["patch"] = ""
 
-    index = _load_trace_index(task_no, side)
-    material["steps"] = _condense_steps(index)
-    material["counts"] = index.get("counts") or {}
+    # 过程材料不再从索引里取——它每步只留 120 个字符，判不了这一步到底发生了什么，
+    # 现在由 agent 去读证据目录里的轨迹全文。索引还是要保证在：核验那一步拿它列
+    # 「轨迹碰过哪些文件」，运行中断时 runner 可能没来得及写。
+    _ensure_trace_index(task_no, side)
     return material
 
 
-def _condense_steps(index: dict) -> list[str]:
-    """把轨迹索引压成一行一步。
-
-    过程的判断依据是「做了什么、哪里错了、有没有绕圈」，所以每步只留工具名、对象和
-    是否报错。步号不进这份材料——理由里禁止出现步数说法，材料里摆着它，模型就会照抄。
-    """
-    steps = list(index.get("steps") or [])
-    if len(steps) > STEP_LIMIT:
-        # 超限时先保住报错步，剩下的名额再从正常步里等距取，最后按原顺序排回去。
-        # 不能「先抽样再截断」：报错如果集中在末尾，截断会把它们整批切掉，
-        # 而恰恰是失败过程决定了这一侧好不好。
-        keep = {i for i, s in enumerate(steps) if s.get("is_error")}
-        if len(keep) > STEP_LIMIT:
-            keep = set(sorted(keep)[:STEP_LIMIT])
-        room = STEP_LIMIT - len(keep)
-        if room > 0:
-            plain = [i for i, s in enumerate(steps) if not s.get("is_error")]
-            stride = max(1, len(plain) // room)
-            keep.update(plain[::stride][:room])
-        steps = [s for i, s in enumerate(steps) if i in keep]
-
-    out = []
-    for s in steps:
-        kind = s.get("tool") or s.get("kind") or "step"
-        summary = " ".join(str(s.get("summary") or "").split())[:STEP_TEXT_LIMIT]
-        flag = " [报错]" if s.get("is_error") else ""
-        out.append(f"{kind}{flag} {summary}".strip())
-    return out
-
-
-def _load_trace_index(task_no: str, side: str) -> dict:
+def _ensure_trace_index(task_no: str, side: str) -> dict:
     paths = config.TaskPaths(task_no, side)
     if paths.trace_index.exists():
         try:
@@ -163,12 +149,22 @@ def _load_trace_index(task_no: str, side: str) -> dict:
 # ---------------- prompt ----------------
 
 def build_prompt(task: Task, materials: dict[str, dict]) -> str:
-    """组对比 prompt。两侧材料对称摆开，不给任何一侧多余的上下文。"""
+    """组对比 prompt。两侧材料对称摆开，不给任何一侧多余的上下文。
+
+    prompt 里只留元信息：结束状态、轮次、改动统计、文件清单。过程与补丁一律不内联，
+    它们在证据目录的文件里，由 agent 自己去读。
+
+    这一条是刻意的。材料内联的时候模型永远会先用眼前这一份——步骤摘要每步只有 120
+    个字符，够它写出一段读着通顺的过程评价，于是它就不去读全文了，而那段评价里的
+    细节没有一处能回查。把过程和补丁从 prompt 里拿走，它要么去读文件，要么就交不出
+    能通过回查的 evidence，两种结果都比"看着像样但没根据"好。
+
+    附带的好处是 prompt 从几百 KB 掉回几 KB。两侧补丁加轨迹曾经到过 190KB，
+    Opus 生成叠上 HTTP/2 长流，容器里经常十几分钟被掐掉再整段重跑。
+    """
 
     def block(side: str) -> str:
         m = materials.get(side) or {}
-        steps = m.get("steps") or []
-        step_text = "\n".join(f"  {s}" for s in steps) or "  （没有轨迹）"
         untracked = m.get("untracked") or []
         extra = ("\n未跟踪的新增文件：\n" + "\n".join(f"  {f}" for f in untracked)) if untracked else ""
         return (
@@ -177,8 +173,6 @@ def build_prompt(task: Task, materials: dict[str, dict]) -> str:
             f"改动统计：\n{m.get('diff_stat') or '（无改动）'}\n"
             f"改动文件：\n" + ("\n".join(f"  {f}" for f in (m.get('files') or [])) or "  （无）") +
             f"{extra}\n"
-            f"过程（按先后顺序，每行一步）：\n{step_text}\n"
-            f"代码改动：\n<<<PATCH-{side}\n{m.get('patch') or '（无改动）'}\nPATCH-{side}>>>\n"
         )
 
     return f"""你是资深工程师，正在对比同一道题的两次自动做题过程与产物，判断哪一次更好。
@@ -195,21 +189,41 @@ def build_prompt(task: Task, materials: dict[str, dict]) -> str:
 {task.user_prompt}
 PROMPT>>>
 
-【两侧的材料】
-下面给出的就是全部材料，没有别的地方可查。产物看代码改动，过程看那一行行的步骤记录。
-判断需求有没有真的实现，以代码改动为准，不要凭步骤记录里的说法下结论。
+【材料在哪】
+材料不在这段话里，在你当前工作目录下的文件里。先读一遍 README.md，再按下面的顺序读：
+
+  A/steps.md    A 侧的轨迹全文，一步一步按顺序记着它调了什么工具、传了什么参数、
+                返回了什么。工具的入参和返回都是完整的，没有压缩过。
+  B/steps.md    B 侧的同一份东西。
+  A/diff.patch  A 侧的完整补丁，没有截断。
+  B/diff.patch  B 侧的完整补丁。
+  A/trace.jsonl 原始轨迹。steps.md 里单步过长的内容会被折掉一截，
+  B/trace.jsonl 需要逐字核对那一段时查这两份。
+
+这两侧的轨迹要整份读完，不要只读开头几步或者跳着抽看。判断"哪里卡住了、哪里
+反复试错、哪里绕了远路"靠的就是这些步骤之间的先后关系，抽着看必然看错。
+
+【元信息概览】
+下面这点东西只是索引，用来让你知道改动的大致规模，不能拿它代替读文件。
 
 {block('A')}
 {block('B')}
 
 【工作步骤】
 1. 先读原始 prompt，把需求拆成可核验的功能点与约束清单。
-2. 对着两侧的代码改动逐条核验，看功能点是不是真的实现了、约束有没有被破坏。
-3. 再看两侧的过程，判断各自哪里顺、哪里卡、哪里绕了远路或者反复试错。
+2. 读两侧的 diff.patch，对着清单逐条核验，看功能点是不是真的实现了、约束有没有
+   被破坏。判断需求有没有实现一律以补丁里的代码为准，不要凭轨迹里模型自己的说法
+   下结论——它说"已修复"和它真的改对了是两回事。
+3. 读两侧的 steps.md 全文，判断各自哪里顺、哪里卡、哪里绕了远路或者反复试错。
 4. 逐项对比，给出哪一侧更好，或者确实等价。核验做得细是对的，但写的时候只挑
    一到两个真正影响结论的点展开，别把核验清单原样交出去。
 5. 另外分别给出两侧产物的启动方式，要让人照着就能把项目跑起来录屏；
    材料不足以给出完整步骤时，在对应的 note 里写清缺什么。
+
+【结论必须有据】
+理由里写到的每一处事实，都要能在上面那些文件里找到出处。想不起来在哪读到的，
+就回去翻一遍再写；翻不到的，那一句不要写。宁可少写一个论点，也不要写一句
+查不到出处的话。
 
 【不许纳入判断的因素】
 {EXCLUDED_FACTORS}
@@ -226,11 +240,18 @@ PROMPT>>>
   "b_findings": {{"good": ["…"], "bad": ["…"]}},
   "a_startup": {{"steps": ["…"], "commands": ["…"], "note": "给不出完整步骤时写原因，否则空串"}},
   "b_startup": {{"steps": ["…"], "commands": ["…"], "note": ""}},
-  "evidence": [{{"side": "A", "file": "src/x.ts", "quote": "代码或过程记录里的原文片段"}}],
+  "evidence": [{{"side": "A", "file": "src/x.ts", "quote": "从材料文件里逐字复制的原文片段"}}],
   "remark": "被排除的那三类情况如果出现就写在这里，否则空串"
 }}
-evidence 里的 side 必须是 A 或 B，file 必须是那一侧真实出现过的路径，
-quote 必须是材料里的原文片段（可截断）。evidence 不要填步号。
+
+evidence 这一项会被程序拿回文件里逐字核对，所以它的要求和别的字段不一样：
+
+- quote 必须是你从 steps.md、diff.patch 或 trace.jsonl 里**逐字复制**的一段原文，
+  不要转述、不要概括、不要把几处拼成一句。换行和缩进对不上没关系，字要对得上。
+- 对不上原文的会被整条丢掉；丢到一条不剩，这次分析判定失败重来。
+- 每一侧至少给两条，并且要覆盖你在理由里真正用来支撑结论的那几个点。
+- side 必须是 A 或 B，file 填这段原文所在的那个文件的路径。
+- 不要填步号。
 """
 
 
@@ -571,8 +592,14 @@ async def polish_reason(reason: str, *, verdict: str, peer_openings: dict | None
     forced 用来重写那些查不出毛病、但笔法还停在核对清单上的。这时基准分要故意
     记差一档，否则原文是满分，任何改写都「没有变好」，四轮全被丢弃，等于没跑。
     记差一档之后，只有改完自身挑不出毛病的那一版才会被采信。
+
+    另外每一版都要查落点。这几轮只给正文不给材料，模型手里没有 diff 也没有轨迹，
+    它写下的任何一个新文件名都无从查证，而正文是要原样交给评审的。基准取最初那一
+    稿而不是上一版：上一版已经过了这道关，它的落点本来就能追到第一轮核对过的材料，
+    拿它当基准等于允许落点一轮一轮往外漂。
     """
     text = reason
+    origin = reason
     defects, score = _reason_score(text, verdict=verdict, peer_openings=peer_openings)
     if not defects and forced:
         defects, score = [GRANULARITY_DEFECT], (0, 1, 0)
@@ -594,6 +621,10 @@ async def polish_reason(reason: str, *, verdict: str, peer_openings: dict | None
         if not fixed:
             log.warning("%s 理由改写返回空，保留上一版", purpose or "GSB")
             break
+        if invented := gsb_rules.invented_tokens(fixed, origin):
+            log.warning("%s 第 %d 轮改写冒出了原文没有的落点（%s），丢弃这一版",
+                        purpose or "GSB", rnd, "、".join(invented[:4]))
+            continue
         left, new_score = _reason_score(fixed, verdict=verdict, peer_openings=peer_openings)
         if new_score >= score:
             log.warning("%s 第 %d 轮改写没有变好（%s %d 字 → %s %d 字），丢弃这一版",
@@ -611,6 +642,12 @@ async def polish_reason(reason: str, *, verdict: str, peer_openings: dict | None
 def _findings_defects(a: dict, b: dict) -> list[str]:
     return (gsb_rules.findings_checks(a, label="a_findings.")
             + gsb_rules.findings_checks(b, label="b_findings."))
+
+
+def _findings_text(a: dict, b: dict) -> str:
+    """把两侧条目拼成一段，只用来比对落点。"""
+    return "\n".join(str(t) for d in (a, b) for kind in ("good", "bad")
+                     for t in ((d or {}).get(kind) or []))
 
 
 def build_findings_fix_prompt(a: dict, b: dict, defects: list[str]) -> str:
@@ -643,8 +680,10 @@ async def polish_findings(a: dict, b: dict, *, repos: dict[str, Path] | None = N
     """把两侧 findings 改到符合写作规范。返回 (a, b, 还没修掉的毛病)。
 
     两侧一起改，一次调用就够：分开改要两次，而两侧的措辞本来就该统一。
-    采信规则和理由那边一样，只在毛病确实减少时才换，改不动就留着并回报。
+    采信规则和理由那边一样，只在毛病确实减少时才换，改不动就留着并回报；落点也
+    照理由那边查，这一轮同样看不到材料，多出来的文件名一律是编的。
     """
+    origin = _findings_text(a, b)
     defects = _findings_defects(a, b)
     if not defects:
         return a, b, []
@@ -667,6 +706,10 @@ async def polish_findings(a: dict, b: dict, *, repos: dict[str, Path] | None = N
                 or [len(fixed_b[k]) for k in ("good", "bad")] != [len(b[k]) for k in ("good", "bad")]:
             log.warning("%s 第 %d 轮改写改动了条目数量，丢弃这一版", purpose or "GSB", rnd)
             continue
+        if invented := gsb_rules.invented_tokens(_findings_text(fixed_a, fixed_b), origin):
+            log.warning("%s 第 %d 轮 findings 改写冒出了原文没有的落点（%s），丢弃这一版",
+                        purpose or "GSB", rnd, "、".join(invented[:4]))
+            continue
         left = _findings_defects(fixed_a, fixed_b)
         if len(left) >= len(defects):
             log.warning("%s 第 %d 轮 findings 改写没有减少毛病（%d → %d），丢弃这一版",
@@ -677,6 +720,37 @@ async def polish_findings(a: dict, b: dict, *, repos: dict[str, Path] | None = N
             log.info("%s findings 第 %d 轮改写后合规", purpose or "GSB", rnd)
             return a, b, []
     return a, b, defects
+
+
+def _require_evidence(task_no: str, kept: list[dict], dropped: list[dict],
+                      analysis_dir: Path) -> None:
+    """回查结果不达标就让这次分析失败。
+
+    这道门槛真正判的不是「证据够不够多」，而是「它到底有没有去读材料」。材料已经
+    从 prompt 里拿走了，手里只剩题面和几行改动统计，不读文件是写不出能对上原文的
+    引用的——所以一条都对不上，基本可以断定它照着概览编了一份读起来像样的结论。
+    这种结果必须当场失败，让上层重试或者转人工，不能落库：它带着完整的 verdict 和
+    理由，界面上和一份真读过的分析长得一模一样，人分不出来。
+
+    丢掉几条不算失败。模型转抄时偶尔会顺手改两个字，那是引用不规范，不是编造；
+    这种只记进留痕，让人能翻。
+    """
+    (analysis_dir / "gsb_evidence_check.json").write_text(
+        json.dumps({"kept": kept, "dropped": dropped}, ensure_ascii=False, indent=1),
+        encoding="utf-8")
+    if dropped:
+        log.warning("GSB %s 有 %d 条引用在材料里找不到原文：%s", task_no, len(dropped),
+                    "；".join(str(d.get("quote"))[:40] for d in dropped[:3]))
+    if not kept:
+        raise RuntimeError(
+            f"分析给出的 {len(dropped)} 条引用没有一条能在材料原文里找到，"
+            f"判定它没有真的去读证据目录里的轨迹和补丁")
+    have = gsb_evidence.sides_with_material(task_no)
+    cited = {str(e.get("side") or "").upper()[:1] for e in kept}
+    if missing := sorted(have - cited):
+        raise RuntimeError(
+            f"{'、'.join(missing)} 侧有材料，但分析没给出一条能对上原文的引用，"
+            f"这一侧的判断没有依据")
 
 
 def peer_openings(db, task_id: int) -> dict[str, str]:
@@ -720,15 +794,24 @@ async def analyze_task(task_id: int) -> dict:
             runs = {r.side: r for r in db.query(TaskRun).filter(TaskRun.task_id == task_id).all()}
             materials = {s: await collect_side(task_no, s, runs[s], snapshot) for s in config.SIDES}
             prompt_text = build_prompt(t, materials)
+            evidence_dir = gsb_evidence.build(task_no, t.user_prompt, materials)
 
         analysis_dir.mkdir(parents=True, exist_ok=True)
         (analysis_dir / "gsb_prompt.md").write_text(prompt_text, encoding="utf-8")
-        log.info("GSB %s prompt %d 字符，开始调用模型", task_no, len(prompt_text))
+        log.info("GSB %s prompt %d 字符，材料在 %s，开始调用模型",
+                 task_no, len(prompt_text), evidence_dir)
 
-        result = await llm.ask(prompt_text, purpose=f"GSB {task_no}", attempts=2)
+        # 工作目录钉在证据目录上：材料要让它自己读，但能读到的只有我们摆进去的
+        # 那几份。ask 模式不放开 shell，它出不去这个目录，看不到仓库本体和别的题。
+        result = await llm.ask(prompt_text, purpose=f"GSB {task_no}", attempts=2,
+                               cwd=evidence_dir)
         (analysis_dir / "gsb_raw.txt").write_text(result.text, encoding="utf-8")
 
         parsed = extract_json(result.text)
+        parsed["evidence"], dropped = gsb_evidence.check_quotes(
+            task_no, parsed.get("evidence") or [])
+        _require_evidence(task_no, parsed["evidence"], dropped, analysis_dir)
+
         workspaces = {s: config.TaskPaths(task_no, s).workspace for s in config.SIDES}
         gsb = normalize(parsed, workspaces)
         if not gsb["verdict"]:
@@ -757,6 +840,9 @@ async def analyze_task(task_id: int) -> dict:
                 # 改了两轮还没改动的地方，界面上的核验会用同一份规则再报一次
                 "reason_defects": left,
                 "findings_defects": findings_left,
+                # 回查丢掉的引用。留空说明每一条都在材料里对上了原文，非空就是
+                # 它转抄时改了字，界面上能翻出来是哪几句
+                "evidence_dropped": dropped,
                 "raw": parsed,
             }
             t.gsb = gsb

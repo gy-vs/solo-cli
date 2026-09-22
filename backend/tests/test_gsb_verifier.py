@@ -161,6 +161,14 @@ def test_unknown_file_reference_is_blocked():
     assert "reason_unknown_files" in _names(r)
 
 
+def test_citations_that_did_not_match_the_material_are_flagged():
+    """转抄时改了字的引用要在提交前露个面，那是这段理由里唯一对不上原文的地方。"""
+    r = gv.verify(_data(evidence_dropped=[{"side": "A", "quote": "改了两个字的那句话"}]))
+    assert "evidence_unverified" in _names(r, "warn")
+    # 只提示不拦：分析那一步已经拦掉了「一条都对不上」的情况
+    assert r["blocked"] == 0
+
+
 def test_known_file_reference_passes():
     r = gv.verify(_data(reason=GOOD_REASON + "package.json 没动"))
     assert "reason_unknown_files" not in _names(r)

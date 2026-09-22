@@ -120,6 +120,15 @@ def verify(data: dict) -> dict:
         items.append(_item("prompt_mismatch", "block",
                            "轨迹里的 prompt 与题块记录的不一致（规则 G4）"))
 
+    # ---- 引用回查 ----
+    # 分析那一步已经拦掉了「一条都对不上」的情况，能走到这里的都还剩有效引用。
+    # 剩下这些是转抄时改了字的，算不上编造，但它们是这段理由里唯一对不上原文的
+    # 地方，人在提交前该看一眼。
+    if dropped := (data.get("evidence_dropped") or []):
+        quotes = "、".join(str(d.get("quote") or "")[:20] for d in dropped[:3])
+        items.append(_item("evidence_unverified", "warn",
+                           f"分析给出的引用里有 {len(dropped)} 条在材料原文里没对上（{quotes}）"))
+
     # ---- 提示项 ----
     iv, hv = data.get("image_version"), data.get("harness_version")
     if iv and hv and _ver(iv) != _ver(hv):
@@ -167,6 +176,7 @@ async def collect(task_id: int) -> dict:
             "env_snapshot_sha": gsb_repo.snapshot_sha(task.env_snapshot),
             "harness_version": task.harness_version,
             "peer_openings": gsb_analyzer.peer_openings(db, task_id),
+            "evidence_dropped": (task.analysis or {}).get("evidence_dropped") or [],
             "sides": {},
         }
         task_no = task.task_no

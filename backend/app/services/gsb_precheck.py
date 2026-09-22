@@ -288,11 +288,17 @@ def _vet_rewrite(rewrite: str, original: str, verdict: str) -> tuple[str, str]:
     每一份合格的稿子都判成「删掉了论点」。改成按绝对下限判：低于写作规范的下限才算
     删过头，中间随便压。
 
-    三道关：
+    四道关：
     - 篇幅落在规范的窗口里（下限防删过头，上限防它只换说法不压篇幅）；
     - 不能引入原文没有的核验红项；
+    - 不能冒出原文没有的文件名或代码符号；
     - 两侧都要还在。结论翻没翻这件事程序判不了，但一份只剩单侧的稿子必然是删过头了，
-      而这恰好是 reason_both_sides 这条红项管的事，上一条已经覆盖。
+      而这恰好是 reason_both_sides 这条红项管的事，第二条已经覆盖。
+
+    落点那一关是这里唯一防编造的手段。这一步手里只有正文，没有题面、没有 diff、
+    也没有轨迹，本意是让它没有素材去补新论点；但换句话说，它凭空写下的任何一个
+    文件名都无从查证，而这份稿子质检跑完就直接盖掉理由正文，那个文件名会原样交到
+    评审手里。所以凡是原文里没出现过的落点，整份丢掉。
     """
     text = _clean(rewrite)
     if not text:
@@ -311,6 +317,9 @@ def _vet_rewrite(rewrite: str, original: str, verdict: str) -> tuple[str, str]:
              if level == "block" and name not in before]
     if after:
         return "", f"改写稿引入了原文没有的红项：{'；'.join(after[:2])}"
+    if invented := gsb_rules.invented_tokens(text, original):
+        return "", (f"改写稿里冒出了原文没有的文件名或符号：{'、'.join(invented[:4])}，"
+                    f"这一步看不到材料，编出来的落点无从查证")
     return text, ""
 
 
