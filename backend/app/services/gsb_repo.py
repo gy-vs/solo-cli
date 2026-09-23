@@ -176,8 +176,14 @@ async def probe_branches(repo_url: str) -> BranchProbe:
         parts.append(f"缺少 {', '.join(missing)}")
     if extra:
         parts.append(f"多出 {', '.join(extra)}")
+    hint = ""
+    if any(n.startswith("dependabot/") for n in extra):
+        hint = ("。dependabot/* 是 GitHub Dependabot 按仓库里的 .github/dependabot.yml 自动建的，"
+                "要删掉这些分支、关闭对应 PR，并从基线里去掉该配置后重建 A、B")
+    elif extra:
+        hint = "。多出的分支若不是人建的，多半是上游 .github/workflows 在 push 后自动建的，需关闭仓库 Actions 后删除"
     return BranchProbe(False, names, main,
-                       f"分支不合规（{'；'.join(parts)}），实际分支：{', '.join(names)}")
+                       f"分支不合规（{'；'.join(parts)}），实际分支：{', '.join(names)}{hint}")
 
 
 async def _git(ws: Path, *args: str, timeout: float = 60) -> dockerx.CmdResult:
@@ -207,13 +213,21 @@ async def clone_side(task_no: str, repo_url: str, side: str) -> dict:
     ws.parent.mkdir(parents=True, exist_ok=True)
     # --single-branch：这一侧只关心自己的分支，A 目录里不该看得到 B 的提交
     # URL 用干净地址，凭据走临时 helper，clone 落盘的 origin 从头就不带 token
-    r = await dockerx.run(
-        ["git", *credential_args(repo_url), "clone", "--branch", side, "--single-branch",
-         repo_url, str(ws)], timeout=600,
-    )
+    # 分支已经探测过存在，这里的失败多是 GitHub 连接抖动，重试一次再报
+    for attempt in range(2):
+        if ws.exists():
+            await asyncio.to_thread(shutil.rmtree, ws, True)
+        r = await dockerx.run(
+            ["git", *credential_args(repo_url), "clone", "--branch", side, "--single-branch",
+             repo_url, str(ws)], timeout=600,
+        )
+        if r.ok:
+            break
+        log.warning("clone %s 侧第 %d 次失败：%s", side, attempt + 1, push_failure(r))
     if not r.ok:
         # stderr 里可能带着 git 回显的凭据信息，不能原样返回
-        return {"ok": False, "reused": False, "message": f"clone {side} 分支失败，检查分支是否存在与 Token 权限"}
+        return {"ok": False, "reused": False,
+                "message": f"clone {side} 分支失败（重试后仍失败）：{push_failure(r).replace('推送', '拉取')}"}
     return {"ok": True, "reused": False, "message": f"已 clone {side} 分支到 {ws.name}"}
 
 

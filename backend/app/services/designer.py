@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 from collections import Counter
@@ -339,11 +340,92 @@ async def resolve_upstream_head(upstream: str) -> tuple[str, str]:
     return (sha, "") if sha else ("", f"{upstream} 没有解析出 HEAD 的 40 位 SHA")
 
 
+# 模型在容器里能读每个文件、能跑 git log、能联网，下面这些都能直接指向答案：
+# 上游历史里的功能与修复提交、变更记录、设计提案、写给 AI 的架构说明、指回上游 issue 的链接。
+# `.github/` 还是 Dependabot 与上游 workflow 自己往远端建分支的源头，Dependabot 会绕过 Actions 禁用，
+# 只能删配置。rfcs/wiki 只删根目录那一份，子包里同名目录可能是项目自身的功能模块
+_LEAK_DIRS = {".github", ".gitlab", ".cursor", ".claude", ".changeset"}
+_LEAK_ROOT_DIRS = {"rfcs", "wiki"}
+_LEAK_FILE_RE = re.compile(
+    r"^(?:(?:changelog|changes|history|news|releases|migration|upgrading|roadmap|todo|contributing"
+    r"|code_of_conduct|security|funding|support)(?:\.(?:md|mdx|rst|txt|yml|yaml))?"
+    r"|(?:agents|claude|gemini)\.md|\.cursorrules|\.windsurfrules)$", re.I)
+_README_RE = re.compile(r"^readme(?:\.(?:md|mdx|rst|txt))?$", re.I)
+_UPSTREAM_KEYS = ("repository", "bugs", "homepage")
+
+
+def _strip_package_json(path: Path) -> None:
+    raw = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(data, dict) or not any(k in data for k in _UPSTREAM_KEYS):
+        return
+    for k in _UPSTREAM_KEYS:
+        data.pop(k, None)
+    indent: int | str = "\t" if re.search(r"^\t", raw, re.M) else 2
+    path.write_text(json.dumps(data, indent=indent, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _strip_manifest_urls(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if path.name == "pyproject.toml":
+        new = re.sub(r"(?ms)^\[project\.urls\]\n.*?(?=^\[|\Z)", "", text)
+    else:
+        new = re.sub(r"(?m)^(?:repository|homepage|documentation)\s*=.*\n", "", text)
+    if new != text:
+        path.write_text(new, encoding="utf-8")
+
+
+def strip_to_standalone(root: Path, project_name: str) -> list[str]:
+    """把上游 checkout 变成一个没有来路的独立项目，返回删掉的相对路径。
+
+    只处理能按名字确定的一类泄露；按本题关键词的定向清理需要读懂题目，不在这里做。
+    """
+    removed: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        for d in list(dirnames):
+            if d == ".git" or d in _LEAK_DIRS or (here == root and d in _LEAK_ROOT_DIRS):
+                shutil.rmtree(here / d, ignore_errors=True)
+                dirnames.remove(d)
+                removed.append(str((here / d).relative_to(root)))
+            elif d == "node_modules":
+                dirnames.remove(d)
+        for f in filenames:
+            p = here / f
+            if f == ".git" or f == ".gitmodules" or _LEAK_FILE_RE.match(f):
+                p.unlink(missing_ok=True)
+                removed.append(str(p.relative_to(root)))
+            elif _README_RE.match(f):
+                title = project_name if here == root else here.name
+                p.write_text(f"# {title}\n", encoding="utf-8")
+            elif f == "package.json":
+                _strip_package_json(p)
+            elif f in ("pyproject.toml", "Cargo.toml"):
+                _strip_manifest_urls(p)
+    return removed
+
+
+async def silence_repo_automation(slug: str) -> dict:
+    """关掉会往远端加分支的仓库自动化。Actions 必须关成功，Dependabot 告警关不掉不致命。"""
+    rr = await _sh(["gh", "api", "-X", "PUT", f"repos/{slug}/actions/permissions",
+                    "-F", "enabled=false"], timeout=120)
+    if not rr.ok:
+        return {"ok": False, "message": f"关闭 {slug} 的 Actions 失败：{(rr.err or rr.out).strip()[:300]}"}
+    for path in ("automated-security-fixes", "vulnerability-alerts"):
+        r2 = await _sh(["gh", "api", "-X", "DELETE", f"repos/{slug}/{path}"], timeout=120)
+        if not r2.ok:
+            log.warning("关闭 %s 的 %s 失败：%s", slug, path, (r2.err or r2.out).strip()[:200])
+    return {"ok": True}
+
+
 async def land_repo(task_no: str, c: dict, owner: str) -> dict:
     """把一道题的仓库建起来：main 冻结在基线，A、B 从 main 切出。
 
-    第二步的断开上游不能省：clone 会把上游全部分支的对象带下来，`refs/remotes/origin/*`
-    留在本地就等于把基线之后的上游提交一起交给模型，Bug 修复题的答案会直接暴露。
+    上游 `.git` 整个丢掉再重新 init，而不是删分支加 gc：只要上游的 commit 对象还在，
+    模型在容器里 `git log` 就能翻到功能提交和修复提交，Bug 修复题的答案会直接暴露。
     """
     staging = config.CODER_ROOT_MOUNT / STAGING_DIR / task_no
     if staging.exists():
@@ -358,42 +440,74 @@ async def land_repo(task_no: str, c: dict, owner: str) -> dict:
     r = await _sh(["git", "clone", "--no-tags", upstream, str(staging)], timeout=900)
     if not r.ok:
         return {"ok": False, "message": f"clone 上游失败：{r.err.strip()[:300]}"}
-    steps = [
-        ["git", "checkout", "-B", MAIN_BRANCH, sha],
-        ["git", "remote", "remove", "origin"],
-    ]
-    for args in steps:
-        rr = await _sh(args, cwd=str(staging), timeout=300)
+    rr = await _sh(["git", "checkout", "-q", "--detach", sha], cwd=str(staging), timeout=300)
+    if not rr.ok:
+        return {"ok": False, "message": f"checkout {sha[:12]} 失败：{rr.err.strip()[:300]}"}
+    if (staging / ".gitmodules").is_file():
+        rr = await _sh(["git", "submodule", "update", "--init", "--recursive"],
+                       cwd=str(staging), timeout=900)
         if not rr.ok:
-            return {"ok": False, "message": f"{' '.join(args[:3])} 失败：{rr.err.strip()[:300]}"}
+            return {"ok": False, "message": f"拉取子模块失败：{rr.err.strip()[:300]}"}
 
-    # 删掉除 main 以外的本地分支，再把不可达对象清干净
-    br = await _sh(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"],
-                   cwd=str(staging), timeout=120)
-    for name in [b.strip() for b in br.out.splitlines() if b.strip() and b.strip() != MAIN_BRANCH]:
-        await _sh(["git", "branch", "-D", name], cwd=str(staging), timeout=120)
-    await _sh(["git", "reflog", "expire", "--expire=now", "--all"], cwd=str(staging), timeout=300)
-    await _sh(["git", "gc", "--prune=now"], cwd=str(staging), timeout=900)
+    # 上游有被自己 .gitignore 忽略却仍在跟踪的文件（fixture、生成产物），重建后 add -A 会漏掉，
+    # 基线就不再等于上游那个 commit，所以删 .git 之前先记下清单，重建后按清单强制补回
+    ls = await _sh(["git", "ls-files", "-z", "--recurse-submodules"], cwd=str(staging), timeout=300)
+    if not ls.ok:
+        return {"ok": False, "message": f"读取上游文件清单失败：{ls.err.strip()[:300]}"}
+    tracked = [f for f in ls.out.split("\0") if f]
 
     repo_name = str(c["repo_name"]).strip()
-    rr = await _sh(["gh", "repo", "create", repo_name, "--public", "--source=.",
-                    "--remote=origin", "--push"], cwd=str(staging), timeout=900)
+    removed = await asyncio.to_thread(strip_to_standalone, staging, repo_name)
+    log.info("题 %s 清理泄露面，删除 %d 项：%s", task_no, len(removed), ", ".join(removed[:40]))
+    rr = await _sh(["git", "init", "-q", "-b", MAIN_BRANCH], cwd=str(staging), timeout=120)
     if not rr.ok:
-        return {"ok": False, "message": f"建仓库 {repo_name} 失败：{(rr.err or rr.out).strip()[:300]}"}
-    for args in (["git", "branch", "A"], ["git", "branch", "B"],
-                 ["git", "push", "-u", "origin", "A", "B"]):
+        return {"ok": False, "message": f"git init 失败：{rr.err.strip()[:300]}"}
+    keep = [f for f in tracked if (staging / f).is_file() or (staging / f).is_symlink()]
+    listing = staging.parent / f".{task_no}.tracked"
+    listing.write_text("\0".join(keep), encoding="utf-8")
+    for args in (["git", "add", "-A"],
+                 ["git", "--literal-pathspecs", "add", "-f", f"--pathspec-from-file={listing}",
+                  "--pathspec-file-nul"],
+                 ["git", "-c", f"user.name={owner}",
+                  "-c", f"user.email={owner}@users.noreply.github.com",
+                  "commit", "-q", "-m", "Initial commit"]):
         rr = await _sh(args, cwd=str(staging), timeout=600)
         if not rr.ok:
+            listing.unlink(missing_ok=True)
             return {"ok": False, "message": f"{' '.join(args[:3])} 失败：{rr.err.strip()[:300]}"}
+    listing.unlink(missing_ok=True)
+    head = await _sh(["git", "rev-parse", "HEAD"], cwd=str(staging), timeout=60)
+    snapshot = head.out.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", snapshot):
+        return {"ok": False, "message": "取不到本地基线的 40 位 SHA"}
 
     repo_url = f"https://github.com/{owner}/{repo_name}"
+    # 建仓库和推送必须拆开：上游 workflow 在收到 push 的瞬间就会跑，有的会自己往远端建分支
+    # （datasette 的 stable-docs 建 stable），所以 Actions 要在第一次 push 之前关掉
+    rr = await _sh(["gh", "repo", "create", repo_name, "--public"], timeout=300)
+    if not rr.ok:
+        return {"ok": False, "message": f"建仓库 {repo_name} 失败：{(rr.err or rr.out).strip()[:300]}"}
+    quiet = await silence_repo_automation(f"{owner}/{repo_name}")
+    if not quiet["ok"]:
+        return quiet
+
+    cred = gsb_repo.credential_args(repo_url)
+    for args in (["git", "remote", "add", "origin", repo_url],
+                 ["git", *cred, "push", "-u", "origin", MAIN_BRANCH],
+                 ["git", "branch", "A"], ["git", "branch", "B"],
+                 ["git", *cred, "push", "-u", "origin", "A", "B"]):
+        rr = await _sh(args, cwd=str(staging), timeout=600)
+        if not rr.ok:
+            step = " ".join(a for a in args if not a.startswith(("-c", "credential.")))[:40]
+            return {"ok": False, "message": f"{step} 失败：{gsb_repo.push_failure(rr)}"}
+
     # 分支必须恰好三个，且 main 的 HEAD 就是基线：这两条平台会卡（规则 G2 / G3），
     # 等提交被打回才发现就白跑了两个容器
     probe = await gsb_repo.probe_branches(repo_url)
     if not probe.ok:
         return {"ok": False, "message": f"仓库建好了但分支不合规：{probe.message}"}
-    return {"ok": True, "repo_url": repo_url, "snapshot": sha,
-            "message": f"{repo_name} 已落地，基线 {sha[:12]}"}
+    return {"ok": True, "repo_url": repo_url, "snapshot": snapshot, "upstream_sha": sha,
+            "message": f"{repo_name} 已落地，基线 {snapshot[:12]}"}
 
 
 # ---------------- 写题面（Phase 6，固定模板） ----------------
@@ -406,12 +520,15 @@ def next_task_no(taken: set[str]) -> str:
 
 
 def render_draft(task_no: str, c: dict, repo_url: str, snapshot: str,
-                 harness_version: str) -> str:
+                 harness_version: str, upstream_sha: str = "") -> str:
     upstream = str(c.get("upstream") or "").strip()
     reason = str(c.get("origin_reason") or "").strip()
     if upstream:
-        origin_note = f"上游 {upstream} ，选定 commit {snapshot}。选择理由：{reason}"
-        base_id = f"{gsb_repo.repo_slug(upstream)}@{snapshot}"
+        base_sha = upstream_sha or snapshot
+        origin_note = f"上游 {upstream} ，选定 commit {base_sha}。选择理由：{reason}"
+        if base_sha != snapshot:
+            origin_note += "。新仓库丢弃了上游历史并清理了泄露面，快照为新仓库唯一的一条提交"
+        base_id = f"{gsb_repo.repo_slug(upstream)}@{base_sha}"
     else:
         origin_note = f"自行设计。{reason}"
         base_id = "自行设计"
@@ -565,11 +682,13 @@ async def run_design(run_id: int) -> None:
                 _append_log(run_id, f"题 {task_no} 落地失败 · {landed['message']}")
                 continue
             taken.add(task_no)
-            text = render_draft(task_no, c, landed["repo_url"], landed["snapshot"], harness_version)
+            text = render_draft(task_no, c, landed["repo_url"], landed["snapshot"], harness_version,
+                                landed.get("upstream_sha", ""))
             path = config.CODER_ROOT_MOUNT / config.PROMPTS_ARCHIVE_DIR / f"{task_no}.md"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
-            base_id = (f"{gsb_repo.repo_slug(c.get('upstream', ''))}@{landed['snapshot']}"
+            base_id = (f"{gsb_repo.repo_slug(c.get('upstream', ''))}"
+                       f"@{landed.get('upstream_sha') or landed['snapshot']}"
                        if c.get("upstream") else "自行设计")
             append_index(task_no, c, base_id, landed["snapshot"])
             written.append(path)

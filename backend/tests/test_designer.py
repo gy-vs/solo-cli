@@ -239,3 +239,157 @@ async def test_resolve_upstream_head_reports_unreachable_repo(monkeypatch, tmp_d
     monkeypatch.setattr(dockerx, "run", fake_run)
     sha, err = await designer.resolve_upstream_head("https://github.com/a/nope")
     assert sha == "" and "读不到上游" in err
+
+
+# ---------------- 落地：GitHub 不能自己往仓库里加分支 ----------------
+
+def _local_upstream(tmp_path, with_dependabot: bool):
+    import subprocess
+
+    up = tmp_path / "upstream"
+    (up / ".github").mkdir(parents=True)
+    (up / "README.md").write_text("x\n")
+    if with_dependabot:
+        (up / ".github" / "dependabot.yml").write_text("version: 2\nupdates: []\n")
+    git = ["git", "-C", str(up), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", "-b", "main", str(up)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    return up, head
+
+
+@pytest.fixture
+def fake_github(monkeypatch, tmp_path):
+    """git 本地命令真跑，碰 GitHub 的 gh / push 只记下来。"""
+    from app import config
+    from app.services import dockerx, gsb_repo
+
+    monkeypatch.setattr(config, "CODER_ROOT_MOUNT", tmp_path / "coder")
+    monkeypatch.setattr(gsb_repo, "credential_args", lambda url: [])
+
+    async def ok_probe(url):
+        return gsb_repo.BranchProbe(True, ["A", "B", "main"], "main", "ok")
+
+    monkeypatch.setattr(gsb_repo, "probe_branches", ok_probe)
+    state = {"calls": [], "upstream": None}
+
+    async def fake_sh(args, *, cwd=None, timeout=300):
+        state["calls"].append(args)
+        if args[:2] == ["git", "ls-remote"]:
+            return dockerx.CmdResult(0, f"{state['head']}\tHEAD\n", "")
+        if args[0] == "gh" or "push" in args or args[:3] == ["git", "remote", "add"]:
+            return dockerx.CmdResult(0, "", "")
+        if args[:2] == ["git", "clone"]:
+            args = [a if a != state["url"] else str(state["upstream"]) for a in args]
+        return await dockerx.run(args, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(designer, "_sh", fake_sh)
+    return state
+
+
+def _git_out(repo, *args) -> str:
+    import subprocess
+
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.mark.asyncio
+async def test_land_repo_drops_all_upstream_history(fake_github, tmp_path):
+    """上游 commit 对象只要还在，模型 git log 就能翻到功能提交和修复提交。"""
+    import subprocess
+
+    up, base = _local_upstream(tmp_path, with_dependabot=True)
+    (up / "src.ts").write_text("fixed\n")
+    subprocess.run(["git", "-C", str(up), "add", "src.ts"], check=True)
+    subprocess.run(["git", "-C", str(up), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", "fix: the answer"], check=True)
+    fake_github.update(upstream=up, head=base, url="https://github.com/a/up")
+    got = await designer.land_repo("07", _candidate(upstream="https://github.com/a/up"), "me")
+
+    assert got["ok"], got["message"]
+    staging = tmp_path / "coder" / designer.STAGING_DIR / "07"
+    assert _git_out(staging, "rev-list", "--all", "--count") == "1"
+    assert _git_out(staging, "log", "--all", "--format=%an %s") == "me Initial commit"
+    assert got["upstream_sha"] == base and got["snapshot"] != base
+    assert not (staging / "src.ts").exists()
+
+
+@pytest.mark.asyncio
+async def test_land_repo_keeps_ignored_but_tracked_upstream_files(fake_github, tmp_path):
+    """上游被 .gitignore 忽略却仍在跟踪的 fixture 必须还在，否则基线就不等于上游了。"""
+    import subprocess
+
+    up, _ = _local_upstream(tmp_path, with_dependabot=False)
+    (up / ".gitignore").write_text("*.out\n")
+    (up / "case.out").write_text("expected\n")
+    git = ["git", "-C", str(up), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", ".gitignore"], check=True)
+    subprocess.run([*git, "add", "-f", "case.out"], check=True)
+    subprocess.run([*git, "commit", "-qm", "fixture"], check=True)
+    head = _git_out(up, "rev-parse", "HEAD")
+    fake_github.update(upstream=up, head=head, url="https://github.com/a/up")
+    got = await designer.land_repo("07", _candidate(upstream="https://github.com/a/up"), "me")
+
+    assert got["ok"], got["message"]
+    staging = tmp_path / "coder" / designer.STAGING_DIR / "07"
+    assert "case.out" in _git_out(staging, "ls-files").split("\n")
+
+
+def test_strip_to_standalone_removes_leak_surface(tmp_path):
+    import json
+
+    root = tmp_path / "p"
+    for rel, body in {
+        "CHANGELOG.md": "v2 fixes the cycle bug", "AGENTS.md": "a", "CLAUDE.md": "c",
+        "CONTRIBUTING.md": "c", "FUNDING.yml": "f", ".github/workflows/ci.yml": "x",
+        ".github/dependabot.yml": "d", "rfcs/0001.md": "design", "wiki/Home.md": "w",
+        "packages/core/CHANGELOG.md": "c", "packages/core/README.md": "# core, see issue #12",
+        "README.md": "# Zod\nbadges and links", "src/security.ts": "code",
+        "packages/app/wiki/page.ts": "feature module", ".cursorrules": "r",
+        "pyproject.toml": "[project]\nname='x'\n\n[project.urls]\nHome='https://g/x'\n\n[tool.x]\na=1\n",
+    }.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(body)
+    (root / "package.json").write_text(json.dumps(
+        {"name": "zod", "repository": "colinhacks/zod", "bugs": "b", "homepage": "h",
+         "scripts": {"test": "vitest"}}, indent=2))
+
+    designer.strip_to_standalone(root, "graph-parse-core")
+
+    for gone in ("CHANGELOG.md", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "FUNDING.yml",
+                 ".github", "rfcs", "wiki", "packages/core/CHANGELOG.md", ".cursorrules"):
+        assert not (root / gone).exists(), gone
+    for kept in ("src/security.ts", "packages/app/wiki/page.ts"):
+        assert (root / kept).exists(), kept
+    assert (root / "README.md").read_text() == "# graph-parse-core\n"
+    assert (root / "packages/core/README.md").read_text() == "# core\n"
+    pkg = json.loads((root / "package.json").read_text())
+    assert pkg == {"name": "zod", "scripts": {"test": "vitest"}}
+    toml = (root / "pyproject.toml").read_text()
+    assert "project.urls" not in toml and "[tool.x]" in toml
+
+
+@pytest.mark.asyncio
+async def test_land_repo_disables_actions_before_first_push(fake_github, tmp_path):
+    """上游 workflow 收到 push 就跑，datasette 的 stable-docs 会自己建 stable 分支。"""
+    up, head = _local_upstream(tmp_path, with_dependabot=False)
+    fake_github.update(upstream=up, head=head, url="https://github.com/a/up")
+    got = await designer.land_repo("07", _candidate(upstream="https://github.com/a/up"), "me")
+    assert got["ok"], got["message"]
+
+    calls = fake_github["calls"]
+    assert not any("--push" in c for c in calls)
+    actions = next(i for i, c in enumerate(calls) if any("actions/permissions" in a for a in c))
+    first_push = next(i for i, c in enumerate(calls) if c[0] == "git" and "push" in c)
+    assert actions < first_push
+
+
+def test_rendered_draft_records_upstream_commit_not_the_standalone_commit():
+    other = "b" * 40
+    text = designer.render_draft("07", _candidate(), "https://github.com/me/x", other, "1.2.3",
+                                 upstream_sha=SHA)
+    assert f"csstree/csstree@{SHA}" in text
+    assert f"https://github.com/me/x/commit/{other}" in text
