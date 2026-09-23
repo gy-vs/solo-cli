@@ -8,6 +8,7 @@ import { NButton, NInput, useDialog, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { api, type PrecheckReport, type PrecheckStatus, type TaskDetail } from '../api'
 import { fmtTime, HEX } from '../status'
+import DeliveryQc from './DeliveryQc.vue'
 import PrecheckPill from './PrecheckPill.vue'
 
 const props = defineProps<{
@@ -153,6 +154,8 @@ function confirm() {
       <div v-else-if="r.rewrite_dropped" class="text-[12px] text-fg2">
         模型给的整段改写稿被丢掉了（{{ r.rewrite_dropped }}），照上面的逐条改法自己改。
       </div>
+
+      <DeliveryQc :report="r.delivery" />
 
       <!-- 放行 -->
       <div v-if="!readonly" class="pt-2 border-t border-line space-y-2">

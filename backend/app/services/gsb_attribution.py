@@ -322,6 +322,44 @@ def hard(reason: str, corpora: dict[str, str]) -> list[dict]:
     return [h for h in check(reason, corpora) if h["level"] == HARD]
 
 
+def side_check(text: str, side: str, corpora: dict[str, str]) -> list[dict]:
+    """一侧自己的文字（交付完整性描述）里的落点，逐个拿回这一侧的轨迹里对。
+
+    描述整段都只说这一侧，不点侧别，所以不走 attributions 那套判侧：每个落点一律
+    记在这一侧名下。这一侧没有轨迹时一条都不报，理由和 check 一样——缺材料不是
+    轨迹里没这回事。说「没有 X」「X 未改」的照样降成软项交给模型。
+    """
+    body = corpora.get(side) or ""
+    if not body:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in _SEG.findall(text or ""):
+        seg = raw.strip()
+        for c_raw in _CLAUSE.finditer(seg):
+            clause = c_raw.group(0)
+            for ref, pos in refs_in(clause):
+                if ref in seen or found_in(ref, body):
+                    continue
+                seen.add(ref)
+                other = next((s for s in config.SIDES if s != side
+                              and found_in(ref, corpora.get(s) or "")), "")
+                kind = CROSS if other else MISSING
+                why = (f"{ref} 只在 {other} 侧的轨迹里出现，{side} 侧的轨迹里没有" if other
+                       else f"{ref} 在 {side} 侧的轨迹里搜不到")
+                level = HARD
+                if _negated(clause, pos, ref):
+                    level = SOFT
+                    why += "（这句说的是它不存在或没改，按代码确认说法对不对）"
+                out.append({"quote": seg[:200], "side": side, "ref": ref,
+                            "kind": kind, "level": level, "why": why})
+    return out
+
+
+def side_hard(text: str, side: str, corpora: dict[str, str]) -> list[dict]:
+    return [h for h in side_check(text, side, corpora) if h["level"] == HARD]
+
+
 def table(reason: str, corpora: dict[str, str]) -> str:
     """落点归属表：正文里每个落点分别在哪一侧的轨迹里出现过。给模型对照用。"""
     rows: list[str] = []

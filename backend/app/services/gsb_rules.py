@@ -644,6 +644,258 @@ def findings_checks(findings: dict, *, label: str = "") -> list[str]:
     return out
 
 
+# ---------------- 交付完整性：评分与描述 ----------------
+# 平台给两侧各加了一对字段：交付完整性评分（1 到 5）和交付完整性描述。它和理由是两回事：
+# 理由是 A、B 两侧对比着说谁更好，这一对是给每一侧单独打的绝对分，只看这一侧自己的
+# 需求点做没做完、代码能不能跑、有没有虚假成功。
+#
+# 分数和描述必须互相印证，这是底线。质检最常打回的就是「打了 4 分，描述却写着非常完整」
+# 「满分，理由里却写着这一侧漏了某个需求」这两种。前一种程序能按词判出来，后一种要把
+# 理由里说这一侧的句子摘出来看，两种都在 delivery_checks 里。
+
+DELIVERY_SCORES = (1, 2, 3, 4, 5)
+DELIVERY_TARGET_MIN = 80
+DELIVERY_TARGET_MAX = 220
+DELIVERY_MIN_CHARS = 40
+DELIVERY_SOFT_MAX_CHARS = 320
+
+DELIVERY_RUBRIC = """
+交付完整性只看这一侧自己：需求功能点是否完整实现、代码能不能跑、有没有虚假成功
+（宣称做完了实际没改或改错）。不和另一侧比，另一侧做得再差也不能给这一侧加分。
+
+5 分：一次性完美跑通。实现了所有明示需求，还主动补全了隐性需求（如边界处理），零虚假成功。
+4 分：基本完美。达成所有主要需求，代码可运行，但有极少量的细节遗漏，无虚假成功。
+3 分：勉强达标。核心功能可跑，但有明显 Bug 需人工微调；或存在轻微的虚假成功（如某个非核心文件没保存）。
+2 分：未达成主要需求。代码因逻辑或依赖问题无法运行；或存在较大比例的虚假成功（如宣称改了五个文件，实际只改了两个）。
+1 分：完全失败。代码严重编译报错完全不可运行；答非所问；或出现极其恶劣的虚假成功（满口答应但一行代码没写）。
+""".strip()
+
+DELIVERY_WRITING_RULES = f"""
+交付完整性描述怎么写（a_delivery.desc、b_delivery.desc 都按这个来）：
+
+1. 篇幅 {DELIVERY_TARGET_MIN} 到 {DELIVERY_TARGET_MAX} 字，只写这一侧，不要出现另一侧，也不要拿另一侧来比。
+2. 描述里要指明具体的文件、报错信息或没实现的需求点。判定虚假成功时，写清模型宣称改了
+   什么、实际改了什么。
+3. 分数和描述必须严格对应，缺口有多大就打多少分、写多重的话：
+   - 5 分：描述里不能出现任何交付层面的缺陷；同时理由和这一侧的不足清单里，也不能有
+     「没实现某个需求」「某处跑不起来」「宣称改了实际没改」这类交付问题。理由里写了，
+     就不能给满分。
+   - 4 分：整体可用，但必须写清具体扣在哪一处（哪个文件、哪个细节、哪条隐性需求没补）。
+     不许写「非常完整」「完美」「无可挑剔」这种满分的话。
+   - 3 分、2 分：描述要让人读出缺陷有多重——哪个核心功能有明显 Bug、哪个主要需求没达成、
+     哪些文件宣称改了实际没改。不许用「极少量」「小瑕疵」「基本完美」这种轻描淡写的词。
+   - 1 分：写清为什么完全不可用（答非所问、一行代码没写、执行记录里的编译报错原文）。
+4. 可以和理由在事实上重合，但不能整句照抄理由。理由讲的是两侧对比和判断依据，描述讲的
+   是这一侧自己交付到了什么程度，换个角度用自己的话写，不要把理由里的句子搬过来。
+5. 不要照抄上面评分表里的档位原文，要结合这一侧的实际证据写。
+6. 事实红线和理由一样：跑没跑起来、编译过没过、测试过没过，只能来自这一侧的执行记录；
+   说 A 的事只能出自 A 的材料，说 B 的事只能出自 B 的材料。
+7. 措辞要求和理由一样：不用比喻、俚语、公文腔，不写步数、工具调用次数、耗时、行号，
+   不用 markdown、表情符号和固定分栏，不要「表现一般」「基本可用」这种无法核验的话。
+""".strip()
+
+# 满分才说得出口的话。前面带否定的（「谈不上完美」「并不完整」）不算；「基本完美」是评分表里
+# 4 分那一档自己的说法，留给 MILD_WORDS 去管 3 分及以下的轻描淡写。
+PERFECT_WORDS = re.compile(r"(?<!基本)(?<!近乎)(?<!接近)完美|非常完整|十分完整|完全完整|毫无遗漏|无可挑剔|无懈可击|零缺陷"
+                           r"|没有任何(?:问题|缺陷|遗漏)|挑不出(?:任何)?(?:问题|毛病)|全部需求(?:均|都)已?(?:完整)?实现")
+# 交付层面的缺陷说法。前面带否定的（「没有遗漏」「零虚假成功」「无报错」）不算。
+DEFECT_WORDS = re.compile(r"缺陷|遗漏|漏掉|漏了|未实现|没有实现|没实现|未完成|没有完成|缺失|缺少|缺了"
+                          r"|[Bb]ug|报错|跑不起来|无法运行|不能运行|运行失败|编译失败|编译不过|构建失败"
+                          r"|虚假成功|宣称|没保存|未保存|不足|扣分|扣在|问题在于|有问题|不正确|错误地|写错|改错"
+                          r"|瑕疵|不完整|不一致|没有处理|未处理|没处理|没有覆盖|未覆盖|没有考虑|没考虑|未考虑"
+                          r"|忽略了|需人工|需要人工|偏差|不够")
+# 严重到 4 分装不下的说法：4 分的前提是「代码可运行、无虚假成功」。
+SEVERE_WORDS = re.compile(r"无法运行|不能运行|跑不起来|完全不可用|编译(?:失败|不过|报错)|构建失败"
+                          r"|核心功能(?:没有|未|没)实现|主要需求(?:没有|未|没)(?:达成|实现)"
+                          r"|一行代码(?:都)?没写|答非所问|虚假成功")
+# 轻描淡写到配不上 3 分及以下的说法
+MILD_WORDS = re.compile(r"极少量|极个别|小瑕疵|细微瑕疵|基本完美|近乎完美|瑕不掩瑜|无伤大雅")
+_NEGATION_BEFORE = re.compile(r"(?:不|未|没|没有|无|零|并非|并不|谈不上|算不上|称不上|不存在|未见|并无|不够)\s*$")
+_OTHER_SIDE = {s: re.compile(rf"(?<![A-Za-z0-9_]){o}(?![A-Za-z0-9_])\s*(?:侧|那边|这边|的实现|的做法)"
+                             rf"|(?:比|不如|优于|相比|相较|较)\s*{o}(?![A-Za-z0-9_])")
+               for s, o in (("A", "B"), ("B", "A"))}
+_DELIVERY_SENT = re.compile(r"[^。！？；;\n]+[。！？；;]?")
+# 照抄的判法：描述里有一整句（去空白后不短于这个长度）原样出现在理由里，
+# 或者描述里超过这个比例的字落在与理由共有的长片段上。
+COPY_SENTENCE_CHARS = 16
+COPY_SHINGLE = 8
+COPY_RATIO = 0.6
+
+
+def _hits(pattern: re.Pattern, text: str) -> list[str]:
+    """pattern 在 text 里没有被否定的命中。"""
+    out = []
+    for m in pattern.finditer(text or ""):
+        if not _NEGATION_BEFORE.search(text[max(0, m.start() - 4):m.start()]):
+            out.append(m.group(0))
+    return out
+
+
+def parse_score(value) -> int | None:
+    """模型给的分数可能是 4、"4"、"4 分"、4.0。认不出或越界就返回 None，不猜。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = int(value)
+        return n if n == value and n in DELIVERY_SCORES else None
+    m = re.fullmatch(r"\s*([1-5])(?:\.0)?\s*分?\s*", str(value or ""))
+    return int(m.group(1)) if m else None
+
+
+def copied_from(desc: str, reason: str) -> str:
+    """描述里照抄理由的地方。返回被抄的那一句（或前一段），没抄返回空串。
+
+    允许语义重合，所以不按意思判，只按字面判：整句原样搬过来，或者大半篇幅是和理由
+    共有的长片段拼成的，这两种才是照抄。
+    """
+    body = re.sub(r"\s+", "", reason or "")
+    if not body or not desc:
+        return ""
+    for raw in _DELIVERY_SENT.findall(desc):
+        sent = re.sub(r"\s+", "", raw).rstrip("。！？；;，,")
+        if len(sent) >= COPY_SENTENCE_CHARS and sent in body:
+            return raw.strip()[:80]
+    text = re.sub(r"\s+", "", desc)
+    if len(text) < COPY_SHINGLE * 2:
+        return ""
+    grams = {body[i:i + COPY_SHINGLE] for i in range(len(body) - COPY_SHINGLE + 1)}
+    covered = [False] * len(text)
+    for i in range(len(text) - COPY_SHINGLE + 1):
+        if text[i:i + COPY_SHINGLE] in grams:
+            for j in range(i, i + COPY_SHINGLE):
+                covered[j] = True
+    return text[:40] if sum(covered) / len(text) > COPY_RATIO else ""
+
+
+def side_statements(text: str, side: str) -> list[str]:
+    """理由里说的是这一侧的那些句子。只点了这一侧的句子算，代词句沿用上一句的侧别。
+
+    这是给「满分却在理由里写了交付问题」那条判用的，判的口径要宽：宁可把一句两侧都点了
+    的比较句漏掉，也不能把说另一侧的句子算到这一侧头上，那样满分会被无端挡下。
+    """
+    tok = re.compile(r"(?<![A-Za-z0-9_])([AB])(?![A-Za-z0-9_])")
+    out: list[str] = []
+    for para in (text or "").split("\n"):
+        carry = ""
+        for raw in _DELIVERY_SENT.findall(para):
+            sent = raw.strip()
+            if not sent:
+                continue
+            sides = set(tok.findall(sent))
+            if len(sides) == 1:
+                carry = sides.pop()
+            elif sides:
+                carry = ""
+            if carry == side and len(sides) <= 1:
+                out.append(sent)
+    return out
+
+
+def delivery_checks(delivery: dict, *, side: str, reason: str = "",
+                    bad_findings: list | None = None) -> list[tuple[str, str, str]]:
+    """查一侧的交付完整性评分与描述。返回 (核验项名, 轻重, 给人看的说法)。
+
+    block 是分数与描述对不上、写法会被平台打回的；warn 是篇幅、措辞这类读起来不像
+    人写的。生成时自查不分轻重，列出来的都要改。
+    """
+    d = delivery if isinstance(delivery, dict) else {}
+    score = parse_score(d.get("score"))
+    desc = str(d.get("desc") or "").strip()
+    who = f"{side} 侧交付完整性"
+    out: list[tuple[str, str, str]] = []
+
+    if score is None:
+        out.append(("delivery_score", "block", f"{who}评分缺失或不是 1 到 5 的整数（{d.get('score')!r}）"))
+    n = visible_chars(desc)
+    if not desc:
+        out.append(("delivery_desc", "block", f"{who}描述是空的"))
+        return out
+    if n < DELIVERY_MIN_CHARS:
+        out.append(("delivery_too_short", "block",
+                    f"{who}描述只有 {n} 字，不足 {DELIVERY_MIN_CHARS} 字，写不清具体的文件和需求点"))
+    elif n > DELIVERY_SOFT_MAX_CHARS:
+        out.append(("delivery_too_long", "warn",
+                    f"{who}描述 {n} 字，超过 {DELIVERY_SOFT_MAX_CHARS} 字（目标 "
+                    f"{DELIVERY_TARGET_MIN} 到 {DELIVERY_TARGET_MAX} 字），只留影响打分的那几处"))
+
+    # ---- 分数与描述对得上 ----
+    if score is not None:
+        perfect = _hits(PERFECT_WORDS, desc)
+        defects = _hits(DEFECT_WORDS, desc)
+        if score < 5 and perfect:
+            out.append(("delivery_score_mismatch", "block",
+                        f"{who}打了 {score} 分，描述却写着「{perfect[0]}」，分数和描述对不上"))
+        if score == 5 and defects:
+            out.append(("delivery_score_mismatch", "block",
+                        f"{who}打了满分，描述里却有「{defects[0]}」这类缺陷说法，"
+                        f"有缺陷就不该给满分，没有就别这么写"))
+        if score <= 4 and not defects:
+            out.append(("delivery_no_deduction", "block",
+                        f"{who}打了 {score} 分，描述里却看不出扣在哪里，"
+                        f"要写清是哪个文件、哪个需求点或哪处细节没做好"))
+        if score == 4 and (severe := _hits(SEVERE_WORDS, desc)):
+            out.append(("delivery_score_mismatch", "block",
+                        f"{who}打了 4 分，描述却写着「{severe[0]}」，4 分的前提是代码能跑、没有虚假成功"))
+        if score <= 3 and (mild := _hits(MILD_WORDS, desc)):
+            out.append(("delivery_score_mismatch", "block",
+                        f"{who}打了 {score} 分，描述却用「{mild[0]}」轻描淡写，读不出缺陷有多重"))
+        if score == 5:
+            said = side_statements(reason, side) + [str(t) for t in (bad_findings or [])]
+            for sent in said:
+                if hit := _hits(SEVERE_WORDS, sent) or _hits(
+                        re.compile(r"未实现|没有实现|没实现|漏掉|漏了|遗漏|缺失|没有处理|未处理"), sent):
+                    out.append(("delivery_reason_conflict", "block",
+                                f"{who}打了满分，但 GSB 理由或不足清单里写着这一侧「{sent[:60]}」"
+                                f"（{hit[0]}），满分和这句话只能留一个"))
+                    break
+
+    # ---- 单侧、不照抄 ----
+    if m := (_OTHER_SIDE[side].search(desc) if side in _OTHER_SIDE else None):
+        out.append(("delivery_other_side", "block",
+                    f"{who}描述里写到了另一侧（{m.group(0).strip()}），交付完整性只评这一侧自己"))
+    if hit := copied_from(desc, reason):
+        out.append(("delivery_copied", "block",
+                    f"{who}描述照抄了 GSB 理由（「{hit}」），事实可以重合，但要换成这一侧交付情况的角度重写"))
+
+    # ---- 写法：和 findings 同一批，交付描述不查数字密度与增删统计，
+    # 「宣称改了五个文件，实际只改了两个」正是规范要它写的东西 ----
+    for name, label, pattern in MACHINE_METRICS:
+        if name == "reason_diff_stat":
+            continue
+        if m := pattern.search(desc):
+            out.append((name.replace("reason_", "delivery_"), "block",
+                        f"{who}描述里有{label}（{m.group(0).strip()[:40]}）"))
+    if chunk := symbol_run(desc):
+        out.append(("delivery_symbol_dump", "block", f"{who}描述里连着罗列了一串符号名（{chunk}）"))
+    if m := TERMINAL_DUMP.search(desc):
+        out.append(("delivery_terminal_dump", "block", f"{who}描述里有终端输出原文（{m.group(0).strip()[:40]}）"))
+    if m := SECTION_LABEL.search(desc):
+        out.append(("delivery_section_label", "block", f"{who}描述里有固定分栏（{m.group(0).strip()[:20]}）"))
+    if MD_ANY.search(desc):
+        out.append(("delivery_markdown", "block", f"{who}描述里有 markdown 记号"))
+    if EMOJI.search(desc):
+        out.append(("delivery_emoji", "block", f"{who}描述里有表情符号"))
+    if hit := next((p for p in SELF_REFERENCE if p in desc), ""):
+        out.append(("delivery_self_reference", "block", f"{who}描述里有 AI 自指（{hit}）"))
+    if hit := next((p for p in CHAT_SCAFFOLD if p in desc), ""):
+        out.append(("delivery_chat_scaffold", "block", f"{who}描述里有对话腔（{hit}）"))
+    if m := ABS_PATH.search(desc):
+        out.append(("delivery_abs_path", "block", f"{who}描述里有绝对路径（{m.group(0)[:40]}）"))
+    if substance_ratio(desc) < SUBSTANCE_RATIO:
+        out.append(("delivery_hollow", "block", f"{who}描述删掉空话后不足一半，没有落到具体事实上"))
+    if swaps := word_swap_hits(desc):
+        word, suggest = swaps[0]
+        out.append(("delivery_wording", "warn",
+                    f"{who}描述里有「{word}」这类比喻、口语或公文说法，改成{suggest}"))
+    return out
+
+
+def delivery_defects(delivery: dict, *, side: str, reason: str = "",
+                     bad_findings: list | None = None) -> list[str]:
+    return [msg for _, _, msg in delivery_checks(delivery, side=side, reason=reason,
+                                                 bad_findings=bad_findings)]
+
+
 # ---------------- 写进 prompt 的规范 ----------------
 # 只讲怎么写，不讲我们内部怎么核验。
 

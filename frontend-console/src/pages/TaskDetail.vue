@@ -230,11 +230,20 @@ const save = () => act('save', async () => {
   const r = await api.saveGsb(id, {
     verdict: gsb.value.verdict, reason: gsb.value.reason,
     a_startup: gsb.value.a_startup, b_startup: gsb.value.b_startup, remark: gsb.value.remark,
+    a_delivery: gsb.value.a_delivery, b_delivery: gsb.value.b_delivery,
   })
   dirty.value = false
   verifyReport.value = r.verify
   return r
 }, '结论已保存并完成自检')
+/** 交付完整性字段上线前分析完的题，按轨迹只补这两对字段，补完会重新过两道质检 */
+function backfillDelivery() {
+  if (dirty.value) {
+    msg.warning('结论还有没保存的改动，先保存再补写，否则补写结果会把改动覆盖掉')
+    return
+  }
+  return act('delivery', () => api.backfillDelivery(id), '已补上交付完整性，这道题会重新进入质检')
+}
 const upload = () => act('upload', () => api.upload(id), '已提交到 GSB 平台')
 function complete() {
   const t = task.value!
@@ -318,6 +327,12 @@ const payloadPreview = computed<[string, string][]>(() => {
     ['a_screencast', t.screencast?.A || ''], ['b_screencast', t.screencast?.B || ''],
     ['gsb_verdict', t.gsb_verdict ? VERDICT_LABEL[t.gsb_verdict] : ''],
     ['gsb_reason', t.gsb_reason_chars ? `${t.gsb_reason_chars} 字` : ''],
+    ...(['A', 'B'] as Side[]).flatMap((s): [string, string][] => {
+      const d = (t.gsb as Gsb | undefined)?.[s === 'A' ? 'a_delivery' : 'b_delivery']
+      const low = s.toLowerCase()
+      return [[`${low}_score_delivery`, d?.score ? `${d.score} 分` : ''],
+        [`${low}_desc_delivery`, d?.desc ? `${d.desc.replace(/\s/g, '').length} 字` : '']]
+    }),
     ['validity', (task.value?.gsb as any)?.validity || '有效'],
     ['user_prompt', `${t.user_prompt.length} 字`],
   ]
@@ -563,7 +578,8 @@ const payloadPreview = computed<[string, string][]>(() => {
               <div class="text-err text-sm font-medium">分析没跑完</div>
               <div class="text-fg1 text-xs leading-5">{{ task.analysis?.error || task.auto_error || '未知原因' }}</div>
             </div>
-            <GsbEditor :gsb="gsb" :readonly="locked" @update="onGsb" @jump="jump" />
+            <GsbEditor :gsb="gsb" :readonly="locked" :backfilling="busy === 'delivery'"
+              @update="onGsb" @jump="jump" @backfill-delivery="backfillDelivery" />
             <VerifyBar :report="verifyReport" />
           </template>
         </template>

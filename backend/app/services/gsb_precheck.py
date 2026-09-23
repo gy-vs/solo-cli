@@ -289,6 +289,32 @@ def reason_digest(reason: str) -> str:
     return hashlib.sha256(_squash(reason).encode("utf-8")).hexdigest()[:16]
 
 
+def delivery_digest(gsb: dict) -> str:
+    """两侧交付完整性（分数加描述）的指纹。两侧都没有这对字段时是空串。
+
+    和理由分开记：理由指纹一改，历史上所有质检结论都会一起过期；分开之后，只有交付
+    完整性被人改过、或者老题刚补上这对字段的，才会回到质检队列。
+    """
+    parts = []
+    for key in ("a_delivery", "b_delivery"):
+        d = (gsb or {}).get(key) or {}
+        if d.get("score") is None and not str(d.get("desc") or "").strip():
+            continue
+        parts.append(f"{key}:{d.get('score')}:{_squash(str(d.get('desc') or ''))}")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16] if parts else ""
+
+
+def delivery_stale(report: dict, gsb: dict) -> bool:
+    """这份结论之后交付完整性又变过。
+
+    口径和理由指纹一样：没记过这个键的老结论当没改过，否则整批历史结论会一起显示
+    过期。老题补上交付完整性时由补的那一步把两份报告的这个键显式记成空串（见
+    gsb_analyzer.backfill_delivery），于是它们对不上、回到质检队列。
+    """
+    report = report or {}
+    return "delivery_digest" in report and report["delivery_digest"] != delivery_digest(gsb)
+
+
 def _vet_rewrite(rewrite: str, original: str, verdict: str) -> tuple[str, str]:
     """决定这份整段改写稿要不要留。返回 (采信的稿子, 丢弃原因)。
 
@@ -367,6 +393,191 @@ def normalize(obj: dict, *, reason: str, verdict: str = "") -> dict:
         "rewrite": rewrite,
         "rewrite_dropped": why_dropped,
     }
+
+
+# ---------------- 交付完整性描述 ----------------
+# 和理由同一套判断基准、同一份规则表，只是对象换成两侧各自的一小段描述。单独问一次，
+# 不塞进理由那份 prompt：理由那份的篇幅口径、改写约束都是按三四百字的对比正文调的，
+# 混进两段一两百字的单侧描述，模型会拿同一把篇幅尺子去量它们。
+#
+# 这一步只改措辞，分数一律不动。分数对不对是事实核验那一道的事，它排在前面、已经对过
+# 轨迹；在这里让模型顺手改分，等于让一个看不到轨迹的调用去推翻看过轨迹的那一个。
+
+def delivery_local_defects(gsb: dict, side: str) -> list[str]:
+    """一侧交付完整性描述在规则层面还剩的毛病。口径和 local_defects 一致：红项加篇幅与措辞。"""
+    d = (gsb or {}).get(f"{side.lower()}_delivery") or {}
+    checks = gsb_rules.delivery_checks(
+        d, side=side, reason=(gsb or {}).get("reason") or "",
+        bad_findings=((gsb or {}).get(f"{side.lower()}_findings") or {}).get("bad"))
+    return [msg for name, level, msg in checks
+            if level == "block" or name in ("delivery_too_long", "delivery_wording")]
+
+
+def build_delivery_prompt(gsb: dict, sides: list[str], *, task_no: str = "",
+                          retry_note: str = "") -> str:
+    blocks = []
+    for s in sides:
+        d = (gsb or {}).get(f"{s.lower()}_delivery") or {}
+        desc = str(d.get("desc") or "")
+        found = hints(desc)
+        local = delivery_local_defects(gsb, s)
+        extra = ""
+        if found:
+            extra += ("\n  本地按词表先摘出来的疑似处（不一定都算问题，漏在外面的也要报）：\n"
+                      + "\n".join(f"    「{h['word']}」在这一句里：{h['quote']}" for h in found[:8]))
+        if local:
+            extra += "\n  程序查出来的毛病（rewrite 里必须改掉）：\n" + "\n".join(f"    {m}" for m in local)
+        blocks.append(f"=== {s} 侧：{d.get('score')} 分，这一步不改分 ===\n"
+                      f"<<<DELIVERY-{s}\n{desc}\nDELIVERY-{s}>>>{extra}")
+    retry_block = f"""
+【上一版改写稿没被采用】
+{retry_note}
+这一轮要在改掉措辞问题的同时避开上面这个毛病。
+""".rstrip() if retry_note else ""
+    lo, hi = gsb_rules.DELIVERY_TARGET_MIN, gsb_rules.DELIVERY_TARGET_MAX
+    fields = ",\n".join(
+        f'  "{s}": {{"verdict": "pass" 或 "revise", "issues": [{{"quote": "原文片段", "kind": "类别", '
+        f'"why": "为什么不像人写的", "suggest": "改写后的句子"}}], "rewrite": "改好的整段描述，没有问题时留空串"}}'
+        for s in sides)
+    return f"""你在给一份双跑对比里的交付完整性描述做最后一道文字质检。这几段话马上要和评审理由一起交给
+评审方。你要做两件事：把不像人写的地方挑出来，并且直接交出改好之后的整段描述。
+
+【判断基准】
+{JUDGE_BASELINE}
+
+【逐条规则】
+{TONE_RULES}
+
+【对比理由（只当参照，不检它，也不要照着它的句子写）】
+<<<REASON
+{(gsb or {}).get('reason') or ''}
+REASON>>>
+
+【待检的交付完整性描述】
+题号 {task_no or '—'}。
+{chr(10).join(blocks)}
+{retry_block}
+
+【rewrite 的硬约束】
+- 分数不许变，描述和分数的对应关系也不许改坏：原文写到的扣分点、缺陷的严重程度一处都
+  不能删轻，满分的描述不能改出缺陷，低分的描述不能改成「非常完整」「小瑕疵」。
+- 不许新增原文里没有的事实、文件名或函数名。删可以，编不行。
+- 只写这一侧，不要出现另一侧；不要整句照抄上面的对比理由。
+- 篇幅 {lo} 到 {hi} 字，一段写完，不要 markdown 记号、步号、绝对路径、表情符号。
+
+【怎么报】
+1. 一处一条，quote 必须是那一侧描述里的原文片段，逐字照抄。
+2. kind 只能从这十个里选：{'、'.join(KINDS)}。
+3. 措辞上确实没有问题、程序也没查出毛病的那一侧，给 pass，issues 留空、rewrite 留空串。
+4. 只要报了问题或者程序查出了毛病，就必须给这一侧的 rewrite。
+
+【输出格式】
+只输出一个 JSON 对象，不要任何前后说明，不要代码块围栏，只包含上面列出的那几侧：
+{{
+{fields}
+}}"""
+
+
+def vet_delivery_rewrite(rewrite: str, gsb: dict, side: str) -> tuple[str, str]:
+    """交付完整性描述改写稿的采信。返回 (采信的描述, 丢弃原因)。
+
+    分数原样带过去再量一遍：分数与描述对不上、照抄理由、写到另一侧这几类红项，
+    改写稿不许引入原来没有的；文件名和符号不许多出来，这一步看不到轨迹。
+    """
+    key = f"{side.lower()}_delivery"
+    old = (gsb or {}).get(key) or {}
+    text = _clean(rewrite)
+    if not text:
+        return "", ""
+    n = gsb_rules.visible_chars(text)
+    if n < gsb_rules.DELIVERY_MIN_CHARS:
+        return "", f"改写稿只有 {n} 字，不足 {gsb_rules.DELIVERY_MIN_CHARS} 字，删过头了"
+    if n > gsb_rules.DELIVERY_SOFT_MAX_CHARS:
+        return "", f"改写稿 {n} 字，超过 {gsb_rules.DELIVERY_SOFT_MAX_CHARS} 字的上限"
+    kw = {"side": side, "reason": (gsb or {}).get("reason") or "",
+          "bad_findings": ((gsb or {}).get(f"{side.lower()}_findings") or {}).get("bad")}
+    before = {name for name, level, _ in gsb_rules.delivery_checks(old, **kw) if level == "block"}
+    after = [msg for name, level, msg in gsb_rules.delivery_checks({**old, "desc": text}, **kw)
+             if level == "block" and name not in before]
+    if after:
+        return "", f"改写稿引入了原文没有的红项：{'；'.join(after[:2])}"
+    if invented := gsb_rules.invented_tokens(text, str(old.get("desc") or "")):
+        return "", f"改写稿里冒出了原文没有的文件名或符号：{'、'.join(invented[:4])}"
+    return text, ""
+
+
+async def precheck_delivery(gsb: dict, *, task_no: str, apply: bool = True) -> dict:
+    """对两侧交付完整性描述做措辞质检。返回 {status, sides, fixed, model}。
+
+    status：skipped（老题没有这对字段）、ok、fixed（改写稿已采信）、fail（有毛病但没拿到
+    能用的改写稿）。模型没答上来直接抛，由调用方记 ERROR。
+    """
+    from app.services import gsb_attribution, gsb_factcheck
+
+    sides = gsb_factcheck.delivery_sides(gsb)
+    if not sides:
+        return {"status": "skipped", "sides": {}, "fixed": {}}
+    cur = dict(gsb)
+    corpora = gsb_attribution.load_corpora(task_no)
+    result: dict[str, dict] = {}
+    pending = list(sides)
+    retry: list[str] = []
+    model = ""
+    for rnd in range(1, PRECHECK_FIX_ROUNDS + 1):
+        r = await llm.ask(build_delivery_prompt(cur, pending, task_no=task_no, retry_note="；".join(retry)),
+                          purpose=f"交付完整性质检 {task_no}", attempts=1, timeout_s=PRECHECK_TIMEOUT_S)
+        model = r.model
+        parsed = gsb_analyzer.extract_object(r.text, pending[0], "交付完整性质检 JSON")
+        retry = []
+        for s in list(pending):
+            key = f"{s.lower()}_delivery"
+            desc = str((cur.get(key) or {}).get("desc") or "")
+            obj = parsed.get(s) if isinstance(parsed.get(s), dict) else {}
+            body = _squash(desc)
+            issues = []
+            for raw in obj.get("issues") or []:
+                if not isinstance(raw, dict):
+                    continue
+                quote = _clean(raw.get("quote"))
+                if not quote or _squash(quote) not in body:
+                    continue
+                kind = str(raw.get("kind") or "").strip()
+                issues.append({"quote": quote[:200], "kind": kind if kind in KINDS else OTHER_KIND,
+                               "why": _clean(raw.get("why"))[:200],
+                               "suggest": _clean(raw.get("suggest"))[:400]})
+            defects = delivery_local_defects(cur, s)
+            entry = {"issues": issues[:MAX_ISSUES], "local_defects": defects, "rounds": rnd}
+            if not issues and not defects:
+                result[s] = {**entry, "status": "ok"}
+                pending.remove(s)
+                continue
+            if not apply:
+                result[s] = {**entry, "status": "fail"}
+                pending.remove(s)
+                continue
+            text, why = vet_delivery_rewrite(str(obj.get("rewrite") or ""), cur, s)
+            if text:
+                trial = {**cur, key: {**(cur.get(key) or {}), "desc": text}}
+                left = delivery_local_defects(trial, s) + [
+                    f"{h['ref']}（{h['why']}）" for h in gsb_attribution.side_hard(text, s, corpora)]
+                if not left:
+                    result[s] = {**entry, "status": "fixed", "desc_before": desc, "desc_after": text}
+                    cur = trial
+                    pending.remove(s)
+                    continue
+                why = "改完之后仍然有这些毛病：" + "；".join(left[:2])
+            why = why or "上一版只列了问题，没有给出改好之后的整段描述"
+            result[s] = {**entry, "status": "fail", "rewrite_dropped": why}
+            retry.append(f"{s} 侧：{why}")
+            log.info("题 %s %s 侧交付完整性质检第 %d 轮没拿到能用的改写稿：%s", task_no, s, rnd, why[:120])
+        if not pending:
+            break
+
+    states = {v["status"] for v in result.values()}
+    status = "fail" if "fail" in states else ("fixed" if "fixed" in states else "ok")
+    return {"status": status, "sides": result, "model": model,
+            "fixed": {f"{s.lower()}_delivery": cur[f"{s.lower()}_delivery"]
+                      for s in sides if (result.get(s) or {}).get("status") == "fixed"}}
 
 
 # ---------------- 阶段投影 ----------------
@@ -463,7 +674,8 @@ def stale(task: Task) -> bool:
     一直显示结论过期。
     """
     digest = (task.precheck or {}).get("reason_digest") or ""
-    return bool(digest) and digest != reason_digest((task.gsb or {}).get("reason") or "")
+    return (bool(digest) and digest != reason_digest((task.gsb or {}).get("reason") or "")) \
+        or delivery_stale(task.precheck or {}, task.gsb or {})
 
 
 def submit_block(task: Task) -> str:
@@ -497,10 +709,18 @@ def submit_block(task: Task) -> str:
             return f"提交前质检没跑完（{report.get('error', '原因不明')}），重跑或人工确认后再提交"
         if status == PRECHECK_FAIL:
             n = len(report.get("issues") or [])
+            failed = [s for s, v in ((report.get("delivery") or {}).get("sides") or {}).items()
+                      if v.get("status") == "fail"]
+            if failed and report.get("reason_passed"):
+                return f"{'、'.join(failed)} 侧交付完整性描述的措辞质检没过，改掉并确认后才能提交"
             return f"质检挑出 {n} 处机械化表达，改掉并确认后才能提交"
         return "还没做提交前质检"
     if stale(task):
-        return "质检之后理由又改过，这份结论已经过期，重跑质检或人工确认"
+        return "质检之后理由或交付完整性又改过，这份结论已经过期，重跑质检或人工确认"
+    # 平台把两侧的交付完整性评分与描述设成了必填。这对字段上线之前分析完的题没有它们，
+    # 质检照样能过，所以得在这里单独拦，不然要等平台回一句「字段缺失」才知道。
+    if not gsb_analyzer.delivery_complete(task.gsb or {}):
+        return "还没有两侧的交付完整性评分与描述，先补一次交付完整性再提交"
     return ""
 
 
@@ -510,8 +730,9 @@ def submittable(task: Task) -> bool:
 
 # ---------------- 跑一遍 ----------------
 
-def _save(task_id: int, status: str, report: dict, *, reason: str = "") -> None:
-    """落库。给了 reason 就连理由正文一起换掉。
+def _save(task_id: int, status: str, report: dict, *, reason: str = "",
+          delivery: dict | None = None) -> None:
+    """落库。给了 reason 就连理由正文一起换掉，给了 delivery 就连那一侧交付完整性一起换掉。
 
     两件事必须在同一个事务里做完：换正文、把指纹改成新正文的。分两次写的话，中间
     那一瞬间库里是「新正文 + 旧指纹」，而 stale() 正是拿这两样比的，这时候读一次就会
@@ -526,13 +747,18 @@ def _save(task_id: int, status: str, report: dict, *, reason: str = "") -> None:
         task = db.get(Task, task_id)
         if task is None:
             return
+        gsb = dict(task.gsb or {})
         if reason:
-            gsb = dict(task.gsb or {})
             gsb["reason"] = reason
-            task.gsb = gsb
             report = {**report, "reason_digest": reason_digest(reason),
                       "reason_chars": gsb_rules.visible_chars(reason)}
-            gsb_factcheck.reseal(task, reason)
+        if delivery:
+            gsb.update(delivery)
+        if reason or delivery:
+            # 先过继再换正文：过继要拿换之前的交付完整性去判事实核验当时核的是不是这一版
+            gsb_factcheck.reseal(task, gsb.get("reason") or "", gsb if delivery else None)
+            task.gsb = gsb
+        report = {**report, "delivery_digest": delivery_digest(gsb)}
         task.precheck_status = status
         task.precheck = report
         sync_stage(db, task)
@@ -561,10 +787,11 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
             return {"ok": False, "message": "这道题的质检正在跑"}
         if task.status not in (ANALYZED, QC):
             return {"ok": False, "message": f"状态 {task.status} 不用做提交前质检"}
-        gsb = task.gsb or {}
+        gsb = dict(task.gsb or {})
         reason, verdict, task_no = gsb.get("reason") or "", gsb.get("verdict") or "", task.task_no
         if not reason.strip():
             return {"ok": False, "message": "还没有理由正文，先跑 GSB 分析"}
+        prev_status, prev = task.precheck_status, dict(task.precheck or {})
         task.precheck_status = PRECHECK_RUNNING
         task.precheck = {"started_at": utc_now().isoformat()}
     bus.publish("tasks", {"type": "task", "id": task_id})
@@ -580,7 +807,17 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
     applied, new_reason = False, ""
     report: dict = {}
     retry_note = ""
-    for rnd in range(1, PRECHECK_FIX_ROUNDS + 1):
+    # 理由没动、只是交付完整性变了的时候，理由那一段沿用上一次的结论，只检交付完整性。
+    # 两样都没变的重跑照常整段重检，理由和事实核验那边一样。
+    reuse = (prev.get("reason_digest") == base["reason_digest"]
+             and (prev_status == PRECHECK_CONFIRMED
+                  or prev.get("reason_passed", prev_status in PRECHECK_OK))
+             and (prev.get("delivery_digest") or "") != delivery_digest(gsb))
+    if reuse:
+        report = {**base, "passed": True, "issues": [], "local_defects": [], "quote_dropped": 0,
+                  "rewrite": "", "rewrite_dropped": "", "summary": prev.get("summary", ""),
+                  "model": prev.get("model", ""), "reason_reused": True}
+    for rnd in range(1, 0 if reuse else PRECHECK_FIX_ROUNDS + 1):
         try:
             r = await llm.ask(
                 build_prompt(reason, verdict=verdict, task_no=task_no, retry_note=retry_note),
@@ -623,10 +860,28 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
     # 改写已经落上去，这一稿在规则层面是干净的，就按通过记。留在待改上等于要人再去
     # 确认一次一个已经改好的文本，而他手里并没有比这更该做的动作。
     status = PRECHECK_PASS if (report["passed"] or applied) else PRECHECK_FAIL
-    _save(task_id, status, report, reason=new_reason)
+    report["reason_passed"] = status == PRECHECK_PASS
+
+    # 交付完整性描述接着理由检，拿的是改好之后的那一稿理由：防照抄要对着定稿比。
+    try:
+        delivery = await precheck_delivery({**gsb, "reason": new_reason or reason},
+                                           task_no=task_no, apply=apply)
+    except (llm.LlmError, ValueError) as exc:
+        log.warning("题 %s 交付完整性质检没跑完：%s", task_no, exc)
+        _save(task_id, PRECHECK_ERROR,
+              {**report, "error": f"交付完整性质检没跑完：{exc}"[:600], "llm_error": True,
+               "duration_s": round(time.time() - started)},
+              reason=new_reason)
+        return {"ok": False, "message": f"交付完整性质检没跑完：{exc}"}
+    report["delivery"] = {k: v for k, v in delivery.items() if k != "fixed"}
+    if delivery["status"] == "fail":
+        status = PRECHECK_FAIL
+    _save(task_id, status, report, reason=new_reason, delivery=delivery["fixed"])
 
     n_issues = len(report["issues"])
-    if applied:
+    if report.get("reason_reused"):
+        msg = "理由没变，措辞质检沿用上一次的结论"
+    elif applied:
         msg = (f"质检改好了 {n_issues} 处，理由已更新为 "
                f"{gsb_rules.visible_chars(new_reason)} 字（原 {report['chars_before']} 字）")
     elif report["passed"]:
@@ -634,10 +889,19 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
     else:
         why = report.get("rewrite_dropped") or report.get("apply_skipped") or ""
         msg = f"挑出 {n_issues} 处：{report['summary']}" + (f"（改写稿没采用：{why}）" if why else "")
+    if delivery["status"] != "skipped":
+        fixed = [s for s, v in delivery["sides"].items() if v["status"] == "fixed"]
+        failed = [s for s, v in delivery["sides"].items() if v["status"] == "fail"]
+        msg += "；交付完整性描述" + (f"改好了 {'、'.join(fixed)} 侧" if fixed else "") + \
+               ("，" if fixed and failed else "") + \
+               (f"{'、'.join(failed)} 侧还有毛病没能自动改掉" if failed else "") + \
+               ("" if fixed or failed else "通过")
     log.info("题 %s 质检 %s", task_no, msg)
-    return {"ok": True, "passed": status == PRECHECK_PASS, "applied": applied,
+    return {"ok": True, "passed": status == PRECHECK_PASS,
+            "applied": applied or delivery["status"] == "fixed",
             "issues": n_issues, "summary": report["summary"], "message": msg,
-            "reason": new_reason or reason, "verdict": verdict}
+            "reason": new_reason or reason, "verdict": verdict,
+            **({"delivery": report["delivery"]} if delivery["status"] != "skipped" else {})}
 
 
 def confirm(task_id: int, note: str = "") -> dict:
@@ -664,6 +928,7 @@ def confirm(task_id: int, note: str = "") -> dict:
             "confirmed_note": (note or "").strip()[:500],
             # 指纹换成此刻这一稿：确认的是人改完之后的话，不是质检当时看到的那一段
             "reason_digest": reason_digest(reason),
+            "delivery_digest": delivery_digest(task.gsb or {}),
         })
         task.precheck = report
         task.precheck_status = PRECHECK_CONFIRMED

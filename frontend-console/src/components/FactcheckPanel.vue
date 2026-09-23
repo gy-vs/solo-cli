@@ -13,6 +13,7 @@ import { NButton, NInput, useDialog, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { api, type FactcheckReport, type FactcheckStatus, type TaskDetail } from '../api'
 import { FACTCHECK_COLOR, FACTCHECK_LABEL, fmtTime, HEX } from '../status'
+import DeliveryQc from './DeliveryQc.vue'
 
 const props = defineProps<{
   task: TaskDetail
@@ -171,6 +172,8 @@ function confirm() {
           [{{ s.side }}] {{ s.quote }} —— {{ s.why }}
         </div>
       </div>
+
+      <DeliveryQc :report="r.delivery" />
 
       <div v-if="r.reason_before" class="pt-1 border-t border-line space-y-1">
         <div class="label">订正之前的原文</div>

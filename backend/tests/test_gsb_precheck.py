@@ -58,6 +58,17 @@ def _task(task_id):
         return db.get(m.Task, task_id)
 
 
+# 两侧交付完整性是提交的必填项，门禁最后一道查它。夹具默认不带，是为了让跑质检的
+# 用例不必再给交付完整性那一次调用打桩；要验「门禁全开」的用例自己补上。
+DELIVERY = {
+    "a_delivery": {"score": 4, "desc": "src/parser.ts 按题目要求实现了越界判定和最大深度限制，测试也覆盖了这两处；"
+                                       "扣分在深度超限时仍返回笼统的解析失败，没有处理题目要求的错误类型区分。"},
+    "b_delivery": {"score": 3, "desc": "src/parser.ts 只实现了越界判定，最大深度限制没有实现，深度超限的输入"
+                                       "会被当成合法结构继续解析，题目要求的核心约束缺失了一半。"},
+}
+LAST_GATE = "交付完整性"
+
+
 def _stub(monkeypatch, *, text="", error=None):
     """把 llm.ask 换掉，并记下它收到的 prompt。"""
     seen: list[str] = []
@@ -430,6 +441,7 @@ def test_pass_with_fresh_reason_clears_the_gate(qc_task):
 
     with session() as db:
         t = db.get(m.Task, qc_task)
+        t.gsb = {**t.gsb, **DELIVERY}
         t.precheck_status = m.PRECHECK_PASS
         t.precheck = {"passed": True, "reason_digest": gp.reason_digest(GOOD)}
         assert gp.submit_block(t) == "" and gp.submittable(t) is True
@@ -498,7 +510,8 @@ def test_applying_marks_it_passed_and_not_stale(qc_task, monkeypatch):
     task = _task(qc_task)
     assert task.precheck_status == m.PRECHECK_PASS
     assert not gp.stale(task)
-    assert gp.submit_block(task) == ""
+    # 质检那几档都过了，剩下的只有夹具没带的交付完整性
+    assert LAST_GATE in gp.submit_block(task)
 
 
 def test_run_precheck_keeps_the_reason_when_the_rewrite_is_unusable(qc_task, monkeypatch):
@@ -633,6 +646,66 @@ def test_run_precheck_promotes_a_task_whose_factcheck_already_passed(tmp_db, mon
     assert _task(tid).status == m.QC
 
 
+# ---------------- 交付完整性随质检一起走 ----------------
+
+def _with_delivery(task_id):
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.gsb = {**t.gsb, **DELIVERY}
+
+
+def _replies(monkeypatch, replies):
+    seen: list[str] = []
+
+    async def ask(prompt, **kw):
+        seen.append(kw.get("purpose", ""))
+        return LlmResult(text=replies[min(len(seen) - 1, len(replies) - 1)], model="stub-model")
+
+    monkeypatch.setattr(gp.llm, "ask", ask)
+    return seen
+
+
+def test_precheck_checks_delivery_after_the_reason_and_clears_the_gate(qc_task, monkeypatch):
+    _with_delivery(qc_task)
+    ok = json.dumps({"A": {"verdict": "pass", "issues": []}, "B": {"verdict": "pass", "issues": []}})
+    seen = _replies(monkeypatch, [_report(passed=True), ok])
+    asyncio.run(gp.run_precheck(qc_task))
+    t = _task(qc_task)
+    assert t.precheck_status == m.PRECHECK_PASS
+    assert t.precheck["delivery"]["status"] == "ok"
+    assert len(seen) == 2 and "交付完整性" in seen[1]
+    assert gp.submit_block(t) == ""
+
+
+def test_precheck_fails_when_delivery_rewrite_is_unusable(qc_task, monkeypatch):
+    _with_delivery(qc_task)
+    bad = json.dumps({"A": {"verdict": "revise", "issues": [{"quote": "笼统的解析失败", "kind": "句子生硬"}],
+                            "rewrite": ""},
+                      "B": {"verdict": "pass", "issues": []}}, ensure_ascii=False)
+    _replies(monkeypatch, [_report(passed=True), bad])
+    asyncio.run(gp.run_precheck(qc_task))
+    t = _task(qc_task)
+    assert t.precheck_status == m.PRECHECK_FAIL
+    assert t.precheck["delivery"]["status"] == "fail"
+    assert t.precheck["reason_passed"] is True
+    assert gp.submit_block(t) != ""
+
+
+def test_editing_delivery_after_precheck_makes_it_stale(qc_task, monkeypatch):
+    from app.db import session
+
+    _with_delivery(qc_task)
+    ok = json.dumps({"A": {"verdict": "pass", "issues": []}, "B": {"verdict": "pass", "issues": []}})
+    _replies(monkeypatch, [_report(passed=True), ok])
+    asyncio.run(gp.run_precheck(qc_task))
+    with session() as db:
+        t = db.get(m.Task, qc_task)
+        t.gsb = {**t.gsb, "a_delivery": {**t.gsb["a_delivery"], "score": 3}}
+    assert gp.stale(_task(qc_task)) is True
+
+
 # ---------------- 人工确认 ----------------
 
 def test_confirm_clears_the_gate_after_a_fix(qc_task, monkeypatch):
@@ -642,11 +715,11 @@ def test_confirm_clears_the_gate_after_a_fix(qc_task, monkeypatch):
     asyncio.run(gp.run_precheck(qc_task))
     r = gp.confirm(qc_task, note="第二条是它读偏了")
     t = _task(qc_task)
-    assert r["ok"] is True and r["submittable"] is True
+    assert r["ok"] is True
     assert t.precheck_status == m.PRECHECK_CONFIRMED
     assert t.precheck["confirmed_from"] == m.PRECHECK_FAIL
     assert t.precheck["confirmed_note"] == "第二条是它读偏了"
-    assert gp.submit_block(t) == ""
+    assert LAST_GATE in gp.submit_block(t)
 
 
 def test_confirm_takes_the_digest_of_the_edited_reason(qc_task, monkeypatch):
@@ -727,6 +800,7 @@ def test_submittable_ids_only_lists_cleared_tasks(qc_task):
     assert gp.submittable_ids() == []
     with session() as db:
         t = db.get(m.Task, qc_task)
+        t.gsb = {**t.gsb, **DELIVERY}
         t.precheck_status = m.PRECHECK_CONFIRMED
         t.precheck = {"reason_digest": gp.reason_digest(GOOD)}
     assert gp.submittable_ids() == [qc_task]

@@ -22,6 +22,9 @@ class GsbUpdate(BaseModel):
     reason: str = ""
     a_startup: dict[str, Any] | None = None
     b_startup: dict[str, Any] | None = None
+    # 交付完整性：{"score": 1-5, "desc": "…"}。不传就不动
+    a_delivery: dict[str, Any] | None = None
+    b_delivery: dict[str, Any] | None = None
     validity: str = ""
     remark: str = ""
 

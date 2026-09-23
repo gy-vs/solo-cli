@@ -26,7 +26,7 @@ from app.schemas import (
 )
 from app.services import (
     difficulty, dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo,
-    gsb_uploader, gsb_verifier, pool, pool_bank, prompt_bank, runner, scheduler,
+    gsb_rules, gsb_uploader, gsb_verifier, pool, pool_bank, prompt_bank, runner, scheduler,
     scope, settings_store, trace, watchdog,
 )
 
@@ -962,6 +962,13 @@ async def save_gsb(task_id: int, body: GsbUpdate) -> dict:
             gsb["a_startup"] = body.a_startup
         if body.b_startup is not None:
             gsb["b_startup"] = body.b_startup
+        for key, value in (("a_delivery", body.a_delivery), ("b_delivery", body.b_delivery)):
+            if value is None:
+                continue
+            score = gsb_rules.parse_score(value.get("score"))
+            if value.get("score") not in (None, "") and score is None:
+                raise HTTPException(400, f"{key[0].upper()} 侧交付完整性评分必须是 1 到 5 的整数")
+            gsb[key] = {"score": score, "desc": str(value.get("desc") or "").strip()}
         if body.validity:
             gsb["validity"] = body.validity
         gsb["remark"] = body.remark.strip()
@@ -969,6 +976,18 @@ async def save_gsb(task_id: int, body: GsbUpdate) -> dict:
     report = await gsb_verifier.run_verify(task_id)
     with session() as db:
         return {"verify": report, "task": task_brief(_get(db, task_id), _runs(db, task_id))}
+
+
+@router.post("/{task_id}/delivery")
+async def backfill_delivery(task_id: int) -> dict:
+    """给交付完整性字段上线之前分析完的题补上这两对字段，不重跑整次分析。"""
+    with session() as db:
+        _get(db, task_id)
+    res = await gsb_analyzer.backfill_delivery(task_id)
+    if not res["ok"]:
+        raise HTTPException(409, res["message"])
+    with session() as db:
+        return {**res, "task": task_brief(_get(db, task_id), _runs(db, task_id))}
 
 
 @router.post("/{task_id}/verify")

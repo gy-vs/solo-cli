@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -18,7 +19,9 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import UPLOADED, Task, TaskRun, utc_now
-from app.services import dockerx, gate, gsb_attribution, gsb_precheck, gsb_repo, settings_store
+from app.services import (
+    dockerx, gate, gsb_attribution, gsb_precheck, gsb_repo, gsb_rules, settings_store,
+)
 from app.services.gsb_analyzer import VERDICT_LABEL
 
 log = logging.getLogger("gsb_uploader")
@@ -127,7 +130,62 @@ async def build_values(task: Task, runs: dict[str, TaskRun]) -> dict:
         values[f"{low}_artifact_snapshot"] = run.artifact_url or gsb_repo.commit_url(
             task.repo_url, run.artifact_sha)
         values[f"{low}_screencast"] = screencast.get(side, "")
+        delivery = gsb.get(f"{low}_delivery") or {}
+        score = gsb_rules.parse_score(delivery.get("score"))
+        values[f"{low}_score_delivery"] = score if score is not None else ""
+        values[f"{low}_desc_delivery"] = str(delivery.get("desc") or "")
     return values
+
+
+# 交付完整性这两对字段的 key 没拿到过实物：form-schema 要登录态，而写这段的时候平台身份
+# 已经失效。先按老五维的 score_delivery / desc_delivery 加侧别前缀取名；后台实际用的 key
+# 不一样时，按字段标签认——标签里同时写着「交付完整性」和侧别的那两个，按「描述」还是
+# 「分」分给描述和评分。认不出来的照旧落到 unknown_required 那里停下来报字段名，不猜。
+_DELIVERY_KIND = (("desc", ("描述", "说明", "desc")), ("score", ("评分", "分数", "得分", "score", "分")))
+
+
+def _delivery_target(f: dict) -> str:
+    """这个 schema 字段对应的本地交付完整性字段名，认不出来返回空串。"""
+    key = _field_key(f)
+    label = " ".join(str(f.get(k) or "") for k in ("label", "name", "title"))
+    text = f"{label} {key}"
+    if "交付完整性" not in text and "delivery" not in key.lower():
+        return ""
+    side = ""
+    if re.search(r"(?<![A-Za-z])A(?![A-Za-z])", label) or key.lower().startswith("a_"):
+        side = "a"
+    if re.search(r"(?<![A-Za-z])B(?![A-Za-z])", label) or key.lower().startswith("b_"):
+        side = "" if side else "b"
+    kind = next((k for k, words in _DELIVERY_KIND if any(w in text.lower() for w in words)), "")
+    return f"{side}_{kind}_delivery" if side and kind else ""
+
+
+def _score_value(f: dict, score):
+    """评分按字段类型给：数字类型给整数，下拉给能对上的那个选项值，其余给字符串。"""
+    if score in ("", None):
+        return ""
+    options = f.get("options") or []
+    for o in options:
+        v = o.get("value") if isinstance(o, dict) else o
+        lab = str(o.get("label") if isinstance(o, dict) else o)
+        if str(v).strip() == str(score) or re.match(rf"\s*{score}(?!\d)", lab):
+            return v
+    if f.get("field_type") in ("number", "integer", "int", "rating", "score", "slider"):
+        return int(score)
+    return str(score)
+
+
+def resolve_fields(schema: dict, values: dict) -> dict:
+    """按 schema 把交付完整性的值挂到平台实际用的 key 上，评分按字段类型换成对应的形态。"""
+    out = dict(values)
+    for f in enabled_fields(schema):
+        key = _field_key(f)
+        target = key if key in values and key.endswith("_delivery") else _delivery_target(f)
+        if not target or target not in values:
+            continue
+        v = values[target]
+        out[key] = _score_value(f, v) if "_score_" in target else v
+    return out
 
 
 def _field_key(f: dict) -> str:
@@ -360,6 +418,7 @@ async def upload_task(task_id: int) -> dict:
             schema = fs.json()
             fingerprint = schema.get("fingerprint", "")
             record["steps"].append(f"form-schema fingerprint={fingerprint}")
+            values = resolve_fields(schema, values)
 
             if unknown := unknown_required(schema, values):
                 return _fail(task_id, record,

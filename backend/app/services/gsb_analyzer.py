@@ -370,6 +370,23 @@ def _load_trace_index(task_no: str, side: str) -> dict:
 
 # ---------------- prompt ----------------
 
+DELIVERY_OUTPUT = (
+    f'  "a_delivery": {{"score": 1 到 5 的整数, "desc": "A 侧交付完整性描述，'
+    f'{gsb_rules.DELIVERY_TARGET_MIN} 到 {gsb_rules.DELIVERY_TARGET_MAX} 字，只写 A"}},\n'
+    f'  "b_delivery": {{"score": 1 到 5 的整数, "desc": "B 侧交付完整性描述，只写 B"}},'
+)
+
+
+def delivery_section() -> str:
+    """交付完整性那一段要求。分析、补问、事实核验三处给模型的是同一段话。"""
+    return f"""【交付完整性评分】
+除了对比结论，还要给两侧各打一个交付完整性分（1 到 5 的整数），并各写一段描述。
+这一项是给每一侧单独打的绝对分，和上面「谁更好」的对比是两件事。评分表：
+{gsb_rules.DELIVERY_RUBRIC}
+
+{gsb_rules.DELIVERY_WRITING_RULES}"""
+
+
 def build_prompt(task: Task, materials: dict[str, dict]) -> str:
     """组对比 prompt。两侧材料对称摆开，不给任何一侧多余的上下文。
 
@@ -441,6 +458,8 @@ PROMPT>>>
    一到两个真正影响结论的点展开，别把核验清单原样交出去。
 6. 另外分别给出两侧产物的启动方式，要让人照着就能把项目跑起来录屏；
    材料不足以给出完整步骤时，在对应的 note 里写清缺什么。
+7. 最后按下面的评分表，分别给 A、B 打交付完整性分并写描述。先定分再写描述，写完回头
+   对一遍：分数、描述、reason 里说这一侧的话，三者讲的必须是同一件事。
 
 【结论必须有据】
 理由里写到的每一处事实，都要能在上面那些文件里找到出处。想不起来在哪读到的，
@@ -453,6 +472,8 @@ PROMPT>>>
 【写法要求】
 {gsb_rules.WRITING_RULES}
 
+{delivery_section()}
+
 【输出格式】
 只输出一个 JSON 对象，不要任何前后说明，不要代码块围栏。结构如下（字段名必须完全一致）：
 {{
@@ -462,6 +483,7 @@ PROMPT>>>
   "b_findings": {{"good": ["…"], "bad": ["…"]}},
   "a_startup": {{"steps": ["…"], "commands": ["…"], "note": "给不出完整步骤时写原因，否则空串"}},
   "b_startup": {{"steps": ["…"], "commands": ["…"], "note": ""}},
+{DELIVERY_OUTPUT}
   "evidence": [{{"side": "A", "file": "src/x.ts", "quote": "从上面材料里逐字复制的原文片段"}}],
   "remark": "被排除的那三类情况如果出现就写在这里，否则空串"
 }}
@@ -664,6 +686,20 @@ def _startup(obj, repos) -> dict:
             "note": _clean(d.get("note"), repos)}
 
 
+def delivery_of(obj, repos: dict[str, Path] | None = None) -> dict:
+    """一侧的交付完整性。分数认不出来留 None，不猜——猜出来的分会带着描述一起交出去。"""
+    d = obj if isinstance(obj, dict) else {}
+    return {"score": gsb_rules.parse_score(d.get("score")),
+            "desc": _clean(d.get("desc") or d.get("description"), repos)}
+
+
+def delivery_complete(gsb: dict) -> bool:
+    """两侧的评分和描述都有了没有。"""
+    return all(gsb_rules.parse_score((gsb.get(k) or {}).get("score")) is not None
+               and str((gsb.get(k) or {}).get("desc") or "").strip()
+               for k in ("a_delivery", "b_delivery"))
+
+
 def normalize(obj: dict, repos: dict[str, Path] | None = None) -> dict:
     """把模型的原始输出洗成可入库的结论。
 
@@ -683,6 +719,8 @@ def normalize(obj: dict, repos: dict[str, Path] | None = None) -> dict:
         "b_findings": _findings(obj.get("b_findings"), repos),
         "a_startup": _startup(obj.get("a_startup"), repos),
         "b_startup": _startup(obj.get("b_startup"), repos),
+        "a_delivery": delivery_of(obj.get("a_delivery"), repos),
+        "b_delivery": delivery_of(obj.get("b_delivery"), repos),
         "evidence": [
             {"side": str(e.get("side") or "").upper()[:1],
              "file": _clean(e.get("file"), repos),
@@ -1015,6 +1053,158 @@ async def polish_findings(a: dict, b: dict, *, repos: dict[str, Path] | None = N
     return a, b, defects
 
 
+# ---------------- 交付完整性：自查改写与补问 ----------------
+
+def delivery_defects(gsb: dict) -> dict[str, list[str]]:
+    """两侧交付完整性各自还有哪些毛病。判的是写好之后的理由和不足清单，所以要放在
+    理由与 findings 都改完之后再调。"""
+    return {s: gsb_rules.delivery_defects(
+                gsb.get(f"{s.lower()}_delivery") or {}, side=s, reason=gsb.get("reason") or "",
+                bad_findings=(gsb.get(f"{s.lower()}_findings") or {}).get("bad"))
+            for s in config.SIDES}
+
+
+def build_delivery_fix_prompt(gsb: dict, defects: dict[str, list[str]]) -> str:
+    """把两侧交付完整性的毛病念给模型。
+
+    这一轮同样不给材料，只给已经核过的理由和两侧长处与不足清单当事实底本。分数和
+    描述对不上时哪个错改哪个，但改分数的依据也只能是这份底本里已经写着的事实。
+    """
+    current = json.dumps({"a_delivery": gsb.get("a_delivery"), "b_delivery": gsb.get("b_delivery")},
+                         ensure_ascii=False, indent=1)
+    listed = "\n".join(f"{s} 侧：\n" + "\n".join(f"  {i}. {d}" for i, d in enumerate(ds, 1))
+                       for s, ds in defects.items() if ds)
+    basis = json.dumps({"a_findings": gsb.get("a_findings"), "b_findings": gsb.get("b_findings")},
+                       ensure_ascii=False, indent=1)
+    return f"""下面是一份双跑对比里两侧的交付完整性评分与描述，其中有地方违反了规范，需要你改。
+
+【当前内容】
+{current}
+
+【必须改掉的地方】
+{listed}
+
+【事实底本：已经核对过的对比理由与两侧长处和不足】
+<<<REASON
+{gsb.get('reason') or ''}
+REASON>>>
+{basis}
+
+{delivery_section()}
+
+【改写约束】
+1. 只在上面事实底本和当前描述的事实范围内改，不要新增任何原本没有的事实、文件名或函数名。
+2. 分数和描述对不上时，看事实底本：底本里写着这一侧有交付缺陷，就降分并把扣分点写清；
+   底本里这一侧没有交付缺陷，就把描述里无据的缺陷说法删掉。
+3. 没被点名的那一侧原样交回，分数和描述一个字都不要动。
+4. 只输出一个 JSON 对象，顶层只有 a_delivery 与 b_delivery，各自只有 score（整数）和
+   desc（字符串）。不要代码块围栏，不要任何说明。"""
+
+
+async def polish_delivery(gsb: dict, *, repos: dict[str, Path] | None = None,
+                          purpose: str = "", rounds: int = REASON_FIX_ROUNDS
+                          ) -> tuple[dict, dict, dict[str, list[str]]]:
+    """把两侧交付完整性改到符合规范。返回 (a_delivery, b_delivery, 每侧还没修掉的毛病)。
+
+    按侧采信：一侧改好了、另一侧改坏了的时候只收改好的那一侧，两侧捆在一起要么全收
+    要么全丢，会让已经改好的那一侧跟着被丢掉。落点照 findings 那边查，这一轮看不到
+    材料，多出来的文件名一律是编的。
+    """
+    cur = dict(gsb)
+    origin = "\n".join([gsb.get("reason") or "", _findings_text(gsb.get("a_findings") or {},
+                                                                 gsb.get("b_findings") or {}),
+                        *(str((gsb.get(k) or {}).get("desc") or "") for k in ("a_delivery", "b_delivery"))])
+    defects = delivery_defects(cur)
+    for rnd in range(1, rounds + 1):
+        if not any(defects.values()):
+            break
+        log.info("%s 交付完整性不合规，第 %d 轮改写：%s", purpose or "GSB", rnd,
+                 "；".join(d for ds in defects.values() for d in ds)[:200])
+        try:
+            r = await llm.ask(build_delivery_fix_prompt(cur, defects),
+                              purpose=f"{purpose} 交付完整性改写", attempts=1,
+                              timeout_s=REASON_FIX_TIMEOUT_S)
+            obj = extract_object(r.text, "a_delivery", "交付完整性 JSON")
+        except (llm.LlmError, ValueError) as exc:
+            log.warning("%s 交付完整性改写失败，保留上一版：%s", purpose or "GSB", exc)
+            break
+        for s in config.SIDES:
+            key = f"{s.lower()}_delivery"
+            if not defects[s]:
+                continue
+            fixed = delivery_of(obj.get(key), repos)
+            if invented := gsb_rules.invented_tokens(fixed["desc"], origin):
+                log.warning("%s 第 %d 轮 %s 侧交付完整性改写冒出了原文没有的落点（%s），丢弃",
+                            purpose or "GSB", rnd, s, "、".join(invented[:4]))
+                continue
+            trial = {**cur, key: fixed}
+            left = delivery_defects(trial)[s]
+            if len(left) >= len(defects[s]):
+                log.warning("%s 第 %d 轮 %s 侧交付完整性改写没有减少毛病（%d → %d），丢弃",
+                            purpose or "GSB", rnd, s, len(defects[s]), len(left))
+                continue
+            cur[key] = fixed
+            defects[s] = left
+    return cur.get("a_delivery") or {}, cur.get("b_delivery") or {}, defects
+
+
+def build_delivery_ask_prompt(prompt_text: str, gsb: dict) -> str:
+    """补问交付完整性。材料原样再给一遍，外加已经定稿的结论，只要这两个字段。
+
+    结论要一起给：交付完整性和理由必须讲同一件事，不给它看理由，它会重新判一遍，
+    判出来的分数和已经写好的理由很可能对不上。
+    """
+    done = json.dumps({"verdict": gsb.get("verdict"), "reason": gsb.get("reason"),
+                       "a_findings": gsb.get("a_findings"), "b_findings": gsb.get("b_findings")},
+                      ensure_ascii=False, indent=1)
+    return f"""{prompt_text}
+
+【已经定稿的对比结论】
+下面这份对比结论已经写好并核对过，不要改它。你这一次只补两侧的交付完整性评分和描述，
+分数与描述要和这份结论里说各侧的话对得上。
+{done}
+
+【这一次的输出格式】
+只输出一个 JSON 对象，不要任何前后说明，不要代码块围栏：
+{{
+{DELIVERY_OUTPUT.rstrip(',')}
+}}"""
+
+
+async def ask_delivery(prompt_text: str, gsb: dict, *, repos: dict[str, Path] | None = None,
+                       purpose: str = "") -> dict:
+    """分析那一次没给全交付完整性时补问一次。返回补好的 {a_delivery, b_delivery}。
+
+    只补缺的那一侧：已经给了的那一侧是和理由同一次生成的，比补问出来的更可信。
+    """
+    r = await llm.ask(build_delivery_ask_prompt(prompt_text, gsb),
+                      purpose=f"{purpose} 交付完整性", attempts=2)
+    obj = extract_object(r.text, "a_delivery", "交付完整性 JSON")
+    out = {}
+    for key in ("a_delivery", "b_delivery"):
+        have = gsb.get(key) or {}
+        if gsb_rules.parse_score(have.get("score")) is not None and str(have.get("desc") or "").strip():
+            out[key] = have
+        else:
+            out[key] = delivery_of(obj.get(key), repos)
+    return out
+
+
+async def fill_delivery(gsb: dict, prompt_text: str, *, repos: dict[str, Path] | None = None,
+                        purpose: str = "") -> tuple[dict, dict[str, list[str]]]:
+    """补齐并收口两侧交付完整性。返回 (补好的 gsb, 每侧还没修掉的毛病)。
+
+    补问之后仍然缺字段就让这次分析失败：平台把这两对字段设成了必填，缺一个交上去
+    就是字段缺失，而且那时候已经没人会回头看它为什么是空的。
+    """
+    if not delivery_complete(gsb):
+        gsb = {**gsb, **await ask_delivery(prompt_text, gsb, repos=repos, purpose=purpose)}
+    if not delivery_complete(gsb):
+        raise RuntimeError("分析没给出两侧完整的交付完整性评分与描述，补问一次后仍然缺")
+    a, b, left = await polish_delivery(gsb, repos=repos, purpose=purpose)
+    return {**gsb, "a_delivery": a, "b_delivery": b}, left
+
+
 def _require_evidence(task_no: str, kept: list[dict], dropped: list[dict],
                       analysis_dir: Path) -> None:
     """回查结果不达标就让这次分析失败。
@@ -1129,6 +1319,10 @@ async def analyze_task(task_id: int) -> dict:
         gsb["a_findings"], gsb["b_findings"], findings_left = await polish_findings(
             gsb["a_findings"], gsb["b_findings"],
             repos=workspaces, purpose=f"GSB {task_no}")
+        # 交付完整性放在理由和 findings 改完之后收口：「满分却在理由里写了交付问题」
+        # 要拿定稿的理由去判，拿改之前那一稿判，改完可能又对不上了。
+        gsb, delivery_left = await fill_delivery(gsb, prompt_text, repos=workspaces,
+                                                 purpose=f"GSB {task_no}")
 
         with session() as db:
             t = db.get(Task, task_id)
@@ -1144,6 +1338,7 @@ async def analyze_task(task_id: int) -> dict:
                 # 改了两轮还没改动的地方，界面上的核验会用同一份规则再报一次
                 "reason_defects": left,
                 "findings_defects": findings_left,
+                "delivery_defects": delivery_left,
                 # 回查丢掉的引用。留空说明每一条都在材料里对上了原文，非空就是
                 # 它转抄时改了字，界面上能翻出来是哪几句
                 "evidence_dropped": dropped,
@@ -1175,3 +1370,67 @@ async def analyze_task(task_id: int) -> dict:
                 t.auto_error = f"GSB 分析失败：{exc}"[:2000]
         bus.publish("tasks", {"type": "task", "id": task_id})
         return {"ok": False, "error": str(exc)}
+
+
+async def backfill_delivery(task_id: int) -> dict:
+    """给交付完整性字段上线之前就分析完的题补上这两对字段，不重跑整次分析。
+
+    材料照分析那样重新取齐、prompt 照原样组，再附上已经定稿的结论只问这两个字段——
+    重跑整次分析会把已经过了两道质检的理由整段换掉。补完不动理由，所以理由那一档的
+    质检结论不作废；两道质检记着的交付完整性指纹对不上，会自己把这道题放回质检队列，
+    交付完整性那部分在那里过一遍轨迹核对和措辞质检。
+    """
+    with session() as db:
+        t = db.get(Task, task_id)
+        if t is None:
+            return {"ok": False, "message": "任务不存在"}
+        if t.status not in (ANALYZED, QC):
+            return {"ok": False, "message": f"状态 {t.status} 不能补交付完整性"}
+        gsb = dict(t.gsb or {})
+        if not str(gsb.get("reason") or "").strip():
+            return {"ok": False, "message": "还没有理由正文，先跑 GSB 分析"}
+        runs = {r.side: r for r in db.query(TaskRun).filter(TaskRun.task_id == task_id).all()}
+        if set(runs) != set(config.SIDES):
+            return {"ok": False, "message": f"两侧的运行记录不全，只有 {sorted(runs) or '空'}"}
+        task_no = t.task_no
+        snapshot = gsb_repo.snapshot_sha(t.env_snapshot)
+        materials = {s: await collect_side(task_no, s, runs[s], snapshot) for s in config.SIDES}
+        prompt_text = build_prompt(t, materials)
+
+    workspaces = {s: config.TaskPaths(task_no, s).workspace for s in config.SIDES}
+    try:
+        filled, left = await fill_delivery(gsb, prompt_text, repos=workspaces,
+                                           purpose=f"GSB {task_no}")
+    except (llm.LlmError, ValueError, RuntimeError) as exc:
+        log.warning("题 %s 补交付完整性失败：%s", task_no, exc)
+        return {"ok": False, "message": f"补交付完整性失败：{exc}"}
+
+    from app.services import gsb_precheck
+
+    with session() as db:
+        t = db.get(Task, task_id)
+        if t is None:
+            return {"ok": False, "message": "任务不存在"}
+        cur = dict(t.gsb or {})
+        cur["a_delivery"], cur["b_delivery"] = filled["a_delivery"], filled["b_delivery"]
+        t.gsb = cur
+        # 两道质检的结论只对理由负过责，交付完整性从没被核过。把交付指纹显式记成空串，
+        # 它们就和刚补上的这一对对不上，自己回到质检队列；理由指纹不动，理由那一段沿用。
+        for attr in ("factcheck", "precheck"):
+            report = dict(getattr(t, attr) or {})
+            if report.get("reason_digest"):
+                report["delivery_digest"] = ""
+                setattr(t, attr, report)
+        analysis = dict(t.analysis or {})
+        analysis["delivery_defects"] = left
+        analysis["delivery_backfilled_at"] = utc_now().isoformat()
+        t.analysis = analysis
+        gsb_precheck.sync_stage(db, t)
+
+    from app.services import gsb_verifier
+
+    await gsb_verifier.run_verify(task_id)
+    bus.publish("tasks", {"type": "task", "id": task_id})
+    a, b = filled["a_delivery"], filled["b_delivery"]
+    return {"ok": True, "message": f"已补上交付完整性：A {a['score']} 分，B {b['score']} 分",
+            "a_delivery": a, "b_delivery": b}

@@ -85,6 +85,20 @@ def verify(data: dict) -> dict:
         items.append(_item("reason_side_mismatch", "block",
                            f"「{h['quote'][:80]}」{h['why']}"))
 
+    # ---- 交付完整性评分与描述 ----
+    # 规则和生成时的自查是同一份（gsb_rules.delivery_checks）。data 里没有这个键的是
+    # 只核理由的老调用，不算缺；collect 一律会带上，老题没有这对字段就是空的，照样报缺。
+    for side in config.SIDES:
+        key = f"{side.lower()}_delivery"
+        if key not in data:
+            continue
+        items.extend(_item(name, level, message) for name, level, message in
+                     gsb_rules.delivery_checks(data.get(key) or {}, side=side, reason=reason,
+                                               bad_findings=(data.get(f"{side.lower()}_findings") or {}).get("bad")))
+        for h in (data.get("delivery_attribution") or {}).get(side) or []:
+            items.append(_item("delivery_side_mismatch", "block",
+                               f"{side} 侧交付完整性描述里的 {h['ref']}：{h['why']}"))
+
     # ---- 两侧的硬性材料 ----
     for side in config.SIDES:
         s = sides.get(side)
@@ -186,6 +200,10 @@ async def collect(task_id: int) -> dict:
             "harness_version": task.harness_version,
             "peer_openings": gsb_analyzer.peer_openings(db, task_id),
             "evidence_dropped": (task.analysis or {}).get("evidence_dropped") or [],
+            "a_delivery": gsb.get("a_delivery") or {},
+            "b_delivery": gsb.get("b_delivery") or {},
+            "a_findings": gsb.get("a_findings") or {},
+            "b_findings": gsb.get("b_findings") or {},
             "sides": {},
         }
         task_no = task.task_no
@@ -221,7 +239,11 @@ async def collect(task_id: int) -> dict:
             "files": await _side_files(task_no, side, index),
         }
 
-    data["attribution"] = gsb_attribution.hard(data["reason"], gsb_attribution.load_corpora(task_no))
+    corpora = gsb_attribution.load_corpora(task_no)
+    data["attribution"] = gsb_attribution.hard(data["reason"], corpora)
+    data["delivery_attribution"] = {
+        s: gsb_attribution.side_hard(str(data[f"{s.lower()}_delivery"].get("desc") or ""), s, corpora)
+        for s in config.SIDES}
 
     image = settings_store.get("cc.image")
     data["image_version"] = await dockerx.claude_version(image) if image else ""

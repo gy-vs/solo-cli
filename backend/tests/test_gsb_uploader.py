@@ -43,7 +43,9 @@ def ready_task(tmp_db, tmp_path, monkeypatch):
                    repro_level="无外部依赖",
                    repo_url="https://github.com/acme/widget",
                    env_snapshot="https://github.com/acme/widget/commit/" + "c" * 40)
-        t.gsb = {"verdict": "A", "reason": "A 侧更好"}
+        t.gsb = {"verdict": "A", "reason": "A 侧更好",
+                 "a_delivery": {"score": 4, "desc": "A 侧交付描述"},
+                 "b_delivery": {"score": 2, "desc": "B 侧交付描述"}}
         t.verify = {"overall": "ok"}
         db.add(t)
         db.flush()
@@ -388,7 +390,7 @@ def test_upload_refuses_a_reason_that_credits_one_side_with_the_others_code(read
     task_id, ids = ready_task
     with session() as db:
         t = db.get(m.Task, task_id)
-        t.gsb = {"verdict": "A", "reason": "A 依据 removeNode 的返回值更新 size。"}
+        t.gsb = {**t.gsb, "verdict": "A", "reason": "A 依据 removeNode 的返回值更新 size。"}
         Path(db.get(m.TaskRun, ids["A"]).trace_file).write_text(
             '{"input": "function deleteNode() {}"}', encoding="utf-8")
         Path(db.get(m.TaskRun, ids["B"]).trace_file).write_text(

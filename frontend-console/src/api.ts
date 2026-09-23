@@ -181,9 +181,17 @@ export interface Gsb {
   b_findings: { good: string[]; bad: string[] }
   a_startup: Startup
   b_startup: Startup
+  a_delivery?: Delivery
+  b_delivery?: Delivery
   evidence: { side?: string; step?: number; file?: string; quote?: string }[]
   remark: string
   validity?: string
+}
+
+/** 一侧的交付完整性。评分 1 到 5，老题分析时还没有这对字段 */
+export interface Delivery {
+  score: number | null
+  desc: string
 }
 
 /** 启动说明。录屏要照着这个把项目跑起来 */
@@ -247,6 +255,26 @@ export interface PrecheckReport {
   confirmed_from?: string
   confirmed_note?: string
   error?: string
+  delivery?: DeliveryQc
+}
+
+/** 两道质检里交付完整性那一段的结论。事实核验按 problems 报，措辞质检按 issues 报 */
+export interface DeliveryQcSide {
+  status: 'ok' | 'fixed' | 'fail'
+  score?: number | null
+  problems?: { quote: string; type?: string; claim?: string; fact?: string }[]
+  issues?: PrecheckIssue[]
+  local_defects?: string[]
+  notes?: string[]
+  rewrite_dropped?: string
+  desc_before?: string
+  desc_after?: string
+}
+export interface DeliveryQc {
+  status: 'ok' | 'fixed' | 'fail'
+  sides: Partial<Record<Side, DeliveryQcSide>>
+  notes?: string[]
+  model?: string
 }
 
 /** 事实核验报告。一处不符记四样：原文、轨迹里其实是什么、改成了什么、归哪一侧 */
@@ -282,6 +310,7 @@ export interface FactcheckReport {
   /** 措辞质检改写之后，事实结论过继到新一稿的时间 */
   resealed_at?: string
   error?: string
+  delivery?: DeliveryQc
 }
 
 export interface TaskDetail extends TaskBrief {
@@ -555,8 +584,11 @@ export const api = {
   analyze: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/analyze`),
   /** 手动走一遍推产物加开分析，给推送失败后重试用 */
   advance: (id: number) => post<{ ok: boolean; message?: string; error?: string }>(`/api/tasks/${id}/advance`),
-  saveGsb: (id: number, body: { verdict?: string; reason: string; a_startup?: Startup; b_startup?: Startup; validity?: string; remark?: string }) =>
+  saveGsb: (id: number, body: { verdict?: string; reason: string; a_startup?: Startup; b_startup?: Startup;
+    a_delivery?: Delivery; b_delivery?: Delivery; validity?: string; remark?: string }) =>
     put<{ verify: VerifyReport; task: TaskBrief }>(`/api/tasks/${id}/gsb`, body),
+  backfillDelivery: (id: number) =>
+    post<{ ok: boolean; message?: string; task: TaskBrief }>(`/api/tasks/${id}/delivery`),
   verify: (id: number) => post<VerifyReport>(`/api/tasks/${id}/verify`),
 
   // ---- 录屏 ----
