@@ -39,7 +39,7 @@ from app.db import session
 from app.events import bus
 from app.models import (
     ANALYSIS_DONE, ANALYSIS_FAILED, ANALYSIS_RUNNING, ANALYZED, ANALYZING, FACTCHECK_IDLE,
-    NEEDS_ATTENTION, PRECHECK_IDLE, Task, TaskRun, utc_now,
+    NEEDS_ATTENTION, PRECHECK_IDLE, QC, Task, TaskRun, utc_now,
 )
 from app.services import dockerx, gsb_evidence, gsb_repo, gsb_rules, llm, trace
 

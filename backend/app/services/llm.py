@@ -58,6 +58,10 @@ STALL_S = 300
 HEARTBEAT_S = 30
 # stream-json 一行就是一个事件。默认 64KB 限制会被设计题那种超长 result 打穿。
 STREAM_LIMIT = 8 * 1024 * 1024
+# 交完 result 之后 CLI 有时不退：它派生的进程还攥着 stdout，管道等不到 EOF，
+# 按进程组杀也解不开，只能干等 timeout_s。result 已经是完整答案，给它这么久收尾，
+# 过了就直接收掉。
+RESULT_GRACE_S = 15
 
 
 class LlmError(RuntimeError):
@@ -291,9 +295,11 @@ async def _read_stdout(proc: asyncio.subprocess.Process, buf: list[bytes],
         tick["kind"] = _event_kind(line)
         tick["at"] = time.time()
         if tick["kind"] == "result":
+            tick["result_at"] = time.time()
             log.info("%s CLI 收到 result · %d 个事件 · %.0fs",
                      tick.get("purpose") or "llm", tick["n"],
                      time.time() - float(tick.get("started") or time.time()))
+            return
 
 
 async def _read_stderr(proc: asyncio.subprocess.Process, buf: list[bytes],
@@ -384,16 +390,25 @@ async def _once(prompt: str, model: str, timeout_s: int,
     async def pump() -> None:
         await _feed_stdin(proc, prompt)
         hb = asyncio.create_task(_heartbeat(proc, tick, stalled), name="llm-heartbeat")
+        rest = asyncio.gather(_read_stderr(proc, err_buf, fatal, purpose), proc.wait())
         try:
-            await asyncio.gather(
-                _read_stdout(proc, out_buf, tick),
-                _read_stderr(proc, err_buf, fatal, purpose),
-                proc.wait(),
-            )
+            await _read_stdout(proc, out_buf, tick)
+            if not tick.get("result_at"):
+                await rest
+                return
+            try:
+                await asyncio.wait_for(asyncio.shield(rest), RESULT_GRACE_S)
+            except asyncio.TimeoutError:
+                log.warning("%s CLI 交完 result %ds 还没退出，直接收掉",
+                            purpose or "llm", RESULT_GRACE_S)
+                kill_group(proc)
         finally:
             hb.cancel()
-            with suppress(asyncio.CancelledError):
+            rest.cancel()
+            with suppress(asyncio.CancelledError, Exception):
                 await hb
+            with suppress(asyncio.CancelledError, Exception):
+                await rest
 
     try:
         await asyncio.wait_for(pump(), timeout=timeout_s)

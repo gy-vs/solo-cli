@@ -450,6 +450,63 @@ def test_warnings_on_stderr_do_not_kill_a_healthy_run(monkeypatch, tmp_path):
     assert text == "分析好了"
 
 
+def test_result_is_returned_even_if_the_cli_never_lets_go_of_its_pipes(monkeypatch, tmp_path):
+    """交完 result 就该回来，不陪 CLI 等到 timeout_s。
+
+    题 235 补交付完整性时就是这样：42 秒拿到 result，进程却不退，派生的进程攥着管道，
+    心跳判卡住按进程组杀了也等不到 EOF，一直挂到二十分钟超时才靠超时分支交差。
+    这里的假进程被杀也不关管道，只有 result 之后主动收手才出得来。
+    """
+    killed: dict = {}
+    _hanging_proc(monkeypatch, tmp_path, [], killed)
+    never = asyncio.Event()
+
+    class StuckStream:
+        def __init__(self, lines: list[bytes]) -> None:
+            self._lines = list(lines)
+
+        async def readline(self) -> bytes:
+            if self._lines:
+                return self._lines.pop(0)
+            await never.wait()
+            return b""
+
+        async def read(self, n: int = -1) -> bytes:
+            return await self.readline()
+
+    class StuckProc:
+        pid = 4242424
+        returncode = None
+        stdin = type("S", (), {"write": lambda s, d: None, "close": lambda s: None,
+                               "drain": lambda s: asyncio.sleep(0)})()
+
+        def __init__(self) -> None:
+            self.stdout = StuckStream([b'{"type":"system","subtype":"init"}\n',
+                                       b'{"type":"result","result":"\xe8\xa1\xa5\xe5\xa5\xbd\xe4\xba\x86"}\n'])
+            self.stderr = StuckStream([])
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            await never.wait()
+            return 0
+
+    async def fake_exec(*cmd, **kw):
+        return StuckProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(llm, "RESULT_GRACE_S", 0.05)
+
+    async def run():
+        return await asyncio.wait_for(llm._once("x", "auto", 3600), timeout=5)
+
+    text, _sid, _usage = asyncio.run(run())
+
+    assert text == "补好了"
+    assert killed.get("pg") == 4242424
+
+
 # ---------------- 工作目录与 skill ----------------
 
 def test_ask_defaults_to_the_empty_dir_but_honours_cwd(monkeypatch):
