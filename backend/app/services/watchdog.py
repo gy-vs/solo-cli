@@ -42,7 +42,7 @@ from app.models import (
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
     RUN_TIMEOUT, SCHEDULABLE, SETTLING, WATCHED, RunEvent, Task, TaskRun, as_utc, utc_now,
 )
-from app.services import dockerx, gsb_repo, llm, settings_store
+from app.services import difficulty, dockerx, gsb_repo, llm, settings_store
 
 log = logging.getLogger("watchdog")
 
@@ -263,6 +263,11 @@ def clear_analysis(task: Task) -> None:
     task.factcheck = {}
     task.precheck_status = PRECHECK_IDLE
     task.precheck = {}
+    # 难度筛选的那四个数是这一跑的步数与用时，重跑之后它们就不是这道题的现状了。留着
+    # 的话界面上显示的是上一跑的数，而人正是看着它判断这道题跑得够不够狠。人工放行那
+    # 一笔要留：它是对这道题的决定，不随某一次跑作废。
+    task.difficulty_screen = {k: v for k, v in (task.difficulty_screen or {}).items()
+                              if k in ("override", "override_at")}
     analysis_dir = config.TaskPaths(task.task_no).analysis
     # gsb_facts.json 是事实核验的材料，它对应的是上一跑的轨迹，必须跟着清掉：
     # 留着的话下一轮核验会拿上一跑的执行记录去判新理由，报出来的不符全是假的。
@@ -500,10 +505,14 @@ async def advance_pair(task_id: int) -> dict:
 
 
 async def _advance_pair(task_id: int) -> dict:
-    """两侧都正常结束之后的推进：销毁容器、推产物、写描述、质检。
+    """两侧都正常结束之后的推进：销毁容器、筛难度、推产物、写描述、质检。
 
     推产物必须排在分析前面：分析要拿 snapshot..HEAD 的补丁当产物材料，而这个区间
     只有在产物提交之后才存在。顺序反过来的话，两侧的补丁都会是空的。
+
+    难度筛选排在推产物之前，是因为它是这条链上唯一能止损的位置。它判废弃的题后面
+    每一步都是纯支出：两侧各一次 git 推送、一次十几二十分钟的分析、两道质检各一次
+    模型调用。而它自己只是四个数的比较，不花钱也不等谁，所以放在最前面没有代价。
     """
     with session() as db:
         task = db.get(Task, task_id)
@@ -526,6 +535,12 @@ async def _advance_pair(task_id: int) -> dict:
         task.status = RUN_DONE
         detached = list(runs)
     await _destroy_containers(task_no, detached)
+
+    # 两侧都跑得太轻的题到此为止，别再花后面那次分析额度。判据与留痕见 difficulty 模块；
+    # 指标读不到时它给的是放行，所以这里不会因为一份缺字段的 verdict 把真题废掉。
+    screened = difficulty.screen(task_id)
+    if screened.get("verdict") == difficulty.DISCARD:
+        return await discard_task(task_id, f"难度筛选未通过：{screened['reason']}")
 
     push = await push_artifacts(task_id)
     if not push["ok"]:
@@ -876,6 +891,32 @@ def _settle_finished() -> int:
     return len(moved)
 
 
+async def _scan_probe() -> int:
+    """先跑完那一侧就已经太轻的题，整题废弃，另一侧一次都不起。返回废了几道。
+
+    调度那边已经把判出太轻的题的另一侧扣在队列里不放（见 scheduler._waiting），所以
+    这一步不抢时间，它只负责把「扣着」变成「结案」——不然那道题会一直躺在队列里，
+    界面上看是在排队，实际上永远等不到出闸。
+
+    只处理「恰好一侧正常跑完、另一侧还在等槽位」的题，判据与留痕都在 difficulty 里。
+    另一侧已经在跑的不碰：那台容器的时间已经花下去了，这时废掉整题省不下什么，
+    却要中断一次正在进行的运行。
+    """
+    if not difficulty.probe_enabled() or paused():
+        return 0
+    with session() as db:
+        candidates = [t.id for t in db.execute(
+            select(Task).where(Task.status.in_(SCHEDULABLE))).scalars()]
+    killed = 0
+    for task_id in candidates:
+        report = difficulty.probe(task_id)
+        if report.get("verdict") != difficulty.DISCARD:
+            continue
+        await discard_task(task_id, f"探路未通过：{report['reason']}")
+        killed += 1
+    return killed
+
+
 def _settle_stopped() -> int:
     """人按了停止、两侧都停下来的题，从「运行中」挪到「需人工」。返回挪了几道。
 
@@ -1198,6 +1239,9 @@ async def tick() -> dict:
     # 也都排在配对之前：推进是按额度慢慢来的，状态不能跟着它一起等。
     stats["run_done"] = _settle_finished()
     stats["settled"] = _settle_stopped()
+    # 探路排在收状态之后、推进之前：它要的是「一侧已正常跑完、另一侧还在等槽位」这个
+    # 当口，前面几步刚把状态收干净，而它判废的题不该再往下走推进那条链。
+    stats["probed"] = await _scan_probe()
     # 探测排在推进前面：账单刚恢复时，这一步会把上一轮卡住的题放回流程，
     # 紧接着的两步扫描当轮就能把它们排上，不必再等一个周期。
     stats["freed"] = await _scan_llm_recovery()

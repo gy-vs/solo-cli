@@ -197,7 +197,11 @@ async function setParallel(v: number | null) {
         class="px-4 py-3 border-t border-line grid grid-cols-[28px_56px_60px_1fr_110px_auto] items-center gap-3 hover:bg-bg3/40">
         <span class="mono text-xs nums" :class="i < (sch?.free ?? 0) ? 'text-ok' : 'text-fg2'">{{ i + 1 }}</span>
         <span class="mono text-xs text-fg0 cursor-pointer" @click="router.push(`/tasks/${q.task_id}`)">#{{ q.task_no }}</span>
-        <span class="mono text-[12px] font-semibold" :style="{ color: SIDE_HEX[q.side] }">{{ q.side }} 侧</span>
+        <span class="mono text-[12px] font-semibold" :style="{ color: SIDE_HEX[q.side] }">
+          {{ q.side }} 侧
+          <span v-if="q.deferred" class="block text-[10px] font-normal text-fg2"
+            title="探路：这道题的另一侧还没出结论，先让别的题的首侧走。轮到它时照样出闸">探路靠后</span>
+        </span>
         <div class="min-w-0 cursor-pointer" @click="router.push(`/tasks/${q.task_id}`)">
           <div class="text-xs text-fg0 truncate">
             {{ byTaskNo[q.task_no]?.question_type }} · {{ byTaskNo[q.task_no]?.languages }}

@@ -428,6 +428,12 @@ const payloadPreview = computed<[string, string][]>(() => {
       <div v-if="discarded" class="mt-3 text-xs text-fg1">
         该题已于 {{ fmtTime(task.discarded_at) }} 废弃，不再出现在题库与运行舱列表中。
       </div>
+      <!-- 难度筛选是在开分析之前做的，废弃的题一次分析额度都没花。恢复之后不再按阈值筛它，
+           所以这句话要连「按恢复会发生什么」一起说清楚 -->
+      <div v-if="task.difficulty_screen?.verdict === 'discard'" class="mt-3 inner p-3 text-xs text-warn leading-5">
+        难度筛选未通过：{{ task.difficulty_screen.reason }}。这一步在 GSB 分析之前，所以还没有花掉分析额度。
+        按「恢复」就能把它捞回来接着分析，恢复之后不再按阈值筛这道题。
+      </div>
       <div v-if="!canUpload && task.status === 'QC' && verifyReport?.overall === 'block'" class="mt-3 text-xs text-err">
         自检存在红项，上传按钮已禁用。
       </div>

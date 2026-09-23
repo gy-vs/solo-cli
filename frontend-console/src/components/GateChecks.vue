@@ -15,6 +15,8 @@ const FIX_LABEL: Record<string, string> = {
   reset_sides: '重置到初始快照',
   archive_traces: '归档现有轨迹',
   remove_containers: '删除残留容器',
+  scope_check: '体检改动面',
+  scope_override: '认了，照跑',
 }
 const color = (l: string) => LEVEL_HEX[l] || LEVEL_HEX.block
 
@@ -28,6 +30,17 @@ async function run(action: string) {
   } catch (e: any) { msg.error(e.message) } finally { busy.value = '' }
 }
 function fix(action: string) {
+  if (action === 'scope_override') {
+    dialog.warning({
+      title: '放行这道题的改动面',
+      content: '模型判定这道题只在一个模块里打转，两边都会很快做完、比不出高下。放行之后门禁不再拦它，'
+        + '两个容器各跑两个多小时。只有你确认模型看走眼了再放行。',
+      positiveText: '确认放行',
+      negativeText: '取消',
+      onPositiveClick: () => run(action),
+    })
+    return
+  }
   if (action !== 'reset_sides') return run(action)
   dialog.warning({
     title: '重置两侧到初始快照',

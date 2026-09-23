@@ -83,6 +83,23 @@ export interface TaskRunDetail extends TaskRunBrief {
   git_diff_stat: string
 }
 
+/** 难度筛选结论。两侧都跑得太轻的题在开 GSB 分析之前就废弃掉，省下那次额度。
+ *
+ *  四个数的口径和列表行里显示的完全一致：steps 是工具调用步数，minutes 是容器用时。
+ *  读不到的留 null，这时 verdict 是 unknown，题照常往下走 —— 「一步没调」和「还不知道」
+ *  是两件事。skipped 是筛选被关掉，或者人按过恢复、已经替这道题拍过板了。 */
+export interface DifficultyScreen {
+  verdict?: 'pass' | 'discard' | 'unknown' | 'skipped'
+  reason?: string
+  steps?: Partial<Record<Side, number | null>>
+  minutes?: Partial<Record<Side, number | null>>
+  thresholds?: Record<string, number>
+  checked_at?: string
+  /** 人工放行过：恢复废弃题时打上，之后不再按阈值筛它 */
+  override?: boolean
+  override_at?: string
+}
+
 export interface TaskBrief {
   id: number
   task_no: string
@@ -125,6 +142,13 @@ export interface TaskBrief {
   factcheck_notes: string[]
   factcheck_summary: string
   factcheck_stale: boolean
+  /** 难度筛选：跑完之后按两侧步数与用时判这道题值不值得花一次分析额度 */
+  difficulty_screen: DifficultyScreen
+  /** 改动面体检：开跑前按题面判这道题要动几个模块。空串表示还没体检过 */
+  scope_verdict: '' | 'pass' | 'narrow' | 'unknown' | 'skipped'
+  /** 门禁会不会因为改动面太窄拦下它。人工放行过、结论过期的都是 false */
+  scope_blocked: boolean
+  scope_summary: string
   upload_ok: boolean | null
   submission_id: number | null
   priority: number
@@ -336,6 +360,9 @@ export interface QueueItem {
   attempt: number
   /** 被看护退回来重跑的，跟第一次排队的区分开 */
   requeued: boolean
+  /** 探路把它降到了队尾：这道题的另一侧还没出结论，先让别的题的首侧走。
+   *  不是被拦住，队列排空了它照样出闸 */
+  deferred: boolean
 }
 
 export interface RunningItem {
@@ -499,8 +526,13 @@ export const api = {
   release: (id: number) => post<{ ok: boolean }>(`/api/tasks/${id}/release`),
   discard: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/discard`),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
-  fix: (id: number, action: 'clone_sides' | 'reset_sides' | 'archive_traces' | 'remove_containers') =>
+  fix: (id: number, action: 'clone_sides' | 'reset_sides' | 'archive_traces' | 'remove_containers'
+    | 'scope_check' | 'scope_override') =>
     post<{ ok: boolean; message: string }>(`/api/tasks/${id}/fix/${action}`),
+  /** ids 给空数组就是「把所有还没体检过改动面的待领题都跑一遍」 */
+  batchScope: (ids: number[]) =>
+    post<{ ok: boolean; checked: number; cached: number; narrow: number; message: string }>(
+      '/api/tasks/batch/scope', { ids }),
 
   // ---- 运行 ----
   /** 不给 side 就把两侧都停了 */

@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.models import Task, TaskRun
-from app.services import gsb_factcheck, gsb_precheck, gsb_repo
+from app.services import gsb_factcheck, gsb_precheck, gsb_repo, scope
 
 
 class SettingsUpdate(BaseModel):
@@ -180,6 +180,14 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "factcheck_notes": factcheck.get("notes") or [],
         "factcheck_summary": factcheck.get("summary") or factcheck.get("error") or "",
         "factcheck_stale": gsb_factcheck.stale(t),
+        # 难度筛选结论。整份给出去而不是摊成扁平字段：里面是两侧的四个数加一句话，
+        # 界面上要么不显示、要么就得把数字一起显示出来，摊开反而要在前端拼回去。
+        "difficulty_screen": t.difficulty_screen,
+        # 开跑前的改动面结论。只给一句话和拦不拦，模块清单留给详情页的门禁面板：
+        # 列表上真正要回答的问题只有「这道题现在能不能领」。
+        "scope_verdict": (t.scope or {}).get("verdict") or "",
+        "scope_blocked": bool(scope.blocking(t)),
+        "scope_summary": scope.summary(t.scope) if t.scope else "",
         "upload_ok": (t.upload or {}).get("ok"),
         "submission_id": (t.upload or {}).get("submission_id"),
         "priority": t.priority,

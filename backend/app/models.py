@@ -223,6 +223,15 @@ class Task(Base, JsonMixin):
     # 「说的是不是真的」三者一个都碰不到（见 gsb_factcheck 模块说明）。
     factcheck_status: Mapped[str] = mapped_column(String(16), default=FACTCHECK_IDLE)
     factcheck_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 难度筛选结论：两侧的步数与用时，加当时那套阈值。见 difficulty 模块说明。
+    # 不另立状态：判废弃就走 DISCARDED，那套废弃、恢复、列表过滤已经现成。而结论要留下来，
+    # 一道题事后被问起「这么简单为什么还评了」或者「凭什么把它废了」，凭据只有这四个数。
+    # 列名不叫 screen_json：题级已经有个 screencast_json 是录屏链接，两个名字摆在一起读代码
+    # 的人分不清哪个是哪个；也不叫 difficulty_json，那会和题面自带的 difficulty 撞。
+    difficulty_screen_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 开跑前的改动面体检：题面要动哪几个模块，加当时的题面指纹。见 scope 模块说明。
+    # 和上面那条是一前一后两道关，都在拦难度不够的题，所以两个字段挨着放。
+    scope_json: Mapped[str] = mapped_column(Text, default="{}")
     upload_json: Mapped[str] = mapped_column(Text, default="{}")
 
     # ---- 队列与来源 ----
@@ -309,6 +318,22 @@ class Task(Base, JsonMixin):
     @factcheck.setter
     def factcheck(self, v: dict) -> None:
         self.factcheck_json = self._dump(v)
+
+    @property
+    def difficulty_screen(self) -> dict:
+        return self._load(self.difficulty_screen_json, {})
+
+    @difficulty_screen.setter
+    def difficulty_screen(self, v: dict) -> None:
+        self.difficulty_screen_json = self._dump(v)
+
+    @property
+    def scope(self) -> dict:
+        return self._load(self.scope_json, {})
+
+    @scope.setter
+    def scope(self, v: dict) -> None:
+        self.scope_json = self._dump(v)
 
     @property
     def upload(self) -> dict:

@@ -20,6 +20,9 @@
     docker compose exec backend python -m app.cli ready          # 还该质检哪些题
     docker compose exec backend python -m app.cli gate 219 221   # 整条质检走一遍
     docker compose exec backend python -m app.cli precheck 219   # 只跑措辞那一道
+    docker compose exec backend python -m app.cli screen         # 难度筛选试算，调阈值用
+    docker compose exec backend python -m app.cli screen --probe # 探路试算：另一侧本来不必跑的有哪些
+    docker compose exec backend python -m app.cli scope          # 待领题的改动面预先体检一遍
     docker compose exec backend python -m app.cli deliver 219 ~/a.mp4 ~/b.mp4
     docker compose exec backend python -m app.cli submit         # 批量提交放行的
 """
@@ -145,6 +148,99 @@ async def cmd_gate(args: argparse.Namespace) -> int:
         print(f"  题 {nos.get(x['id'], x['id'])}：{x.get('message') or ''}")
     print(f"\n已发起 {len(started)} 道，其余在队列里等额度。跑完看 "
           f"`python -m app.cli status`，界面上也会自己刷新。")
+    return 0
+
+
+async def cmd_screen(args: argparse.Namespace) -> int:
+    """按当前阈值把跑完的题试算一遍难度筛选，只出名单。
+
+    这条命令是调阈值用的，它自己什么都不改。跑完的题在开分析之前会被自动筛一遍，
+    两侧都太轻的直接废弃 —— 而「这套阈值到底会废掉哪些」，只有在自己认得的那批题上
+    算一遍才看得出来。名单里出现真题就说明线画高了。
+    """
+    async with _client() as c:
+        r = await c.get("/api/tasks/difficulty/preview")
+        r.raise_for_status()
+        out = r.json()
+
+    th = out["thresholds"]
+    print(f"难度筛选：{'已开启' if out['enabled'] else '已关闭（下面只是试算）'}")
+    print(f"  两侧都不到 {th['min_minutes']} 分钟，或都不到 {th['min_steps']} 步 → 废弃")
+    print(f"  一侧不到 {th['low_steps']} 步时，另一侧要有 {th['low_peer_steps']} 步以上")
+    print(f"  一侧在 {th['low_steps']}–{th['min_steps']} 步时，另一侧要有 {th['mid_peer_steps']} 步以上")
+
+    items = out["items"]
+    if not items:
+        print("\n还没有两侧都跑完的题，算不出名单。")
+        return 0
+    discard = [x for x in items if x["verdict"] == "discard"]
+    if args.all:
+        shown = items
+    else:
+        shown = discard
+    print(f"\n共 {len(items)} 道两侧都跑完的题，按这套阈值会废弃 {len(discard)} 道"
+          + ("：" if shown else "，一道都不废。"))
+    for x in shown:
+        steps, mins = x["steps"], x["minutes"]
+        nums = "  ".join(f"{s} {steps.get(s) if steps.get(s) is not None else '—':>3} 步 "
+                         f"{mins.get(s) if mins.get(s) is not None else '—':>5} 分"
+                         for s in ("A", "B"))
+        mark = {"discard": "废弃", "pass": "保留", "unknown": "判不了", "skipped": "不筛"}
+        print(f"  {x['task_no']:<12} {mark.get(x['verdict'], x['verdict']):<4} {nums}   "
+              f"{x['status']}")
+    if discard and not args.all:
+        print("\n名单里出现自己认得的真题就说明线画高了，去设置页的「难度筛选」调，"
+              "再跑一次这条命令。加 --all 看全部题的四个数。")
+    return 0
+
+
+async def cmd_screen_probe(args: argparse.Namespace) -> int:
+    """探路的试算：这套阈值下，另一侧本来可以不跑的有哪些。
+
+    和上面那条问的不是同一件事。那条问「哪些题白评了」，这条问「哪些容器白跑了」，
+    所以名单里列的是另一侧的那两个数——判错的代价落在它身上。
+    """
+    async with _client() as c:
+        r = await c.get("/api/tasks/difficulty/probe-preview")
+        r.raise_for_status()
+        out = r.json()
+
+    th = out["thresholds"]
+    print(f"探路：{'已开启' if out['enabled'] else '已关闭（下面只是试算）'}")
+    print(f"  先跑完那一侧不到 {th['probe_steps']} 步 且 不到 {th['probe_minutes']} 分钟 → 整题废弃")
+    if not out["total"]:
+        print("\n还没有两侧都跑完的题，算不出名单。")
+        return 0
+
+    print(f"\n共 {out['total']} 道两侧都跑完的题，按这套阈值有 {out['hit']} 道的另一侧"
+          f"本来不必跑，省下约 {out['saved_hours']} 个容器小时。")
+    shown = out["items"] if args.all else [x for x in out["items"] if x["verdict"] == "discard"]
+    for x in shown:
+        print(f"  {x['task_no']:<12} 先跑完 {x['side']} 侧 "
+              f"{x['steps'] if x['steps'] is not None else '—':>3} 步 "
+              f"{x['minutes'] if x['minutes'] is not None else '—':>5} 分"
+              f"   → 另一侧 {x['peer_steps'] if x['peer_steps'] is not None else '—':>3} 步 "
+              f"{x['peer_minutes'] if x['peer_minutes'] is not None else '—':>5} 分   {x['status']}")
+    if out["hit"]:
+        print(f"\n被判掉的那些题，另一侧最多走了 {out['peer_max_steps']} 步——这个数要是逼近"
+              f"自己认得的真题的水平，就说明线画高了。")
+    return 0
+
+
+async def cmd_scope(args: argparse.Namespace) -> int:
+    """给待领的题预先体检一遍改动面，把只动一个模块的题在开跑前挑出来。
+
+    领取时会自动补跑，但那是排在 clone 和门禁中间的，人得盯着等。趁手头没事先跑完这
+    一轮，白天领题就不必等模型；改动面太窄的那几道也能提前看到，不必一道道领了才知道。
+    """
+    async with _client() as c:
+        r = await c.post("/api/tasks/batch/scope", json={"ids": []})
+        r.raise_for_status()
+        out = r.json()
+    print(out.get("message") or "没有要体检的题")
+    if out.get("narrow"):
+        print("\n被判太窄的题在题库列表上有标注，点进去看门禁里的 scope 一行，"
+              "里面写着模型数出了哪几个模块。判错了就按那一行的「认了，照跑」放行。")
     return 0
 
 
@@ -305,6 +401,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("task_nos", nargs="*", metavar="题号")
     q.add_argument("-n", "--dry-run", action="store_true", help="只看要跑哪些，不真的发起")
 
+    sc = sub.add_parser("screen", help="按当前阈值试算难度筛选会废弃哪些题，什么都不改")
+    sc.add_argument("-a", "--all", action="store_true", help="连保留的题也列出来，看全部四个数")
+    sc.add_argument("--probe", action="store_true",
+                    help="改算探路：只看先跑完那一侧，列出另一侧本来不必跑的题")
+
+    sub.add_parser("scope", help="给待领的题预先体检改动面，提前挑出只动一个模块的题")
+
     d = sub.add_parser("deliver", help="交付录屏并提交：收下本机视频、代传、直接交到平台")
     d.add_argument("task_no", metavar="题号")
     d.add_argument("a", metavar="A侧视频路径")
@@ -317,8 +420,13 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+async def cmd_screen_or_probe(args: argparse.Namespace) -> int:
+    return await (cmd_screen_probe(args) if args.probe else cmd_screen(args))
+
+
 HANDLERS = {"ready": cmd_ready, "gate": cmd_gate, "precheck": cmd_precheck,
-            "deliver": cmd_deliver, "status": cmd_status, "submit": cmd_submit}
+            "screen": cmd_screen_or_probe, "scope": cmd_scope, "deliver": cmd_deliver,
+            "status": cmd_status, "submit": cmd_submit}
 
 
 def main(argv: list[str] | None = None) -> int:

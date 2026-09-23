@@ -25,9 +25,9 @@ from app.schemas import (
     ScreencastDeliver, ScreencastUpdate, task_brief, task_detail,
 )
 from app.services import (
-    dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo, gsb_uploader,
-    gsb_verifier, pool, pool_bank, prompt_bank, runner, scheduler, settings_store,
-    trace, watchdog,
+    difficulty, dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo,
+    gsb_uploader, gsb_verifier, pool, pool_bank, prompt_bank, runner, scheduler,
+    scope, settings_store, trace, watchdog,
 )
 
 log = logging.getLogger("tasks")
@@ -175,6 +175,56 @@ async def precheck_ready() -> dict:
     return {"ids": ids, "items": items}
 
 
+@router.get("/difficulty/preview")
+async def difficulty_preview() -> dict:
+    """按当前阈值把两侧都跑完的题试算一遍，只出名单不动数据。
+
+    调阈值只能这么调。「把步数线从 40 提到 50 能多省几次分析」这种问题，光看数字想不
+    出来，得拿手里这批题实际跑出来的步数和用时算一遍，看名单里有没有自己认得的真题。
+    所以已经分析过、已经提交的题也一起算进来——它们的结论不会再改，但正是用来回答
+    「这套阈值当初会不会误杀它们」的样本。
+    """
+    items = difficulty.preview()
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
+    return {"enabled": difficulty.enabled(), "thresholds": difficulty.thresholds(),
+            "counts": counts, "items": items}
+
+
+@router.get("/difficulty/probe-preview")
+async def difficulty_probe_preview() -> dict:
+    """按当前探路阈值试算：另一侧本来可以不跑的有哪些，能省下多少机器时间。
+
+    和上面那个问的不是一件事。那个问「这套阈值会废掉哪些题」，答案影响的是分析额度；
+    这个问「哪些题在先跑完一侧的时候就该收手」，答案影响的是容器小时。样本只取两侧
+    都正常跑完的题——只有它们才知道另一侧后来实际跑了多久，也才算得出省下的那笔账。
+    """
+    items = difficulty.probe_preview()
+    hit = [x for x in items if x["verdict"] == difficulty.DISCARD]
+    saved = sum(x["peer_minutes"] or 0 for x in hit) / 60
+    return {"enabled": difficulty.probe_enabled(), "thresholds": difficulty.probe_thresholds(),
+            "total": len(items), "hit": len(hit), "saved_hours": round(saved, 1),
+            "peer_max_steps": max((x["peer_steps"] or 0 for x in hit), default=0),
+            "items": items}
+
+
+@router.post("/batch/scope")
+async def batch_scope(body: IdList) -> dict:
+    """把还没体检过改动面的待领题一次性体检完。ids 给空就是全部待领题。
+
+    提前跑完这一轮，领取时就不必等模型——不然一道题的体检要插在 clone 和门禁中间，
+    人盯着转圈等一两分钟，而这活完全可以趁没人用的时候先做掉。
+    """
+    ids = body.ids or scope.ready_ids()
+    if not ids:
+        return {"ok": True, "message": "待领题的改动面都体检过了", **await scope.warm([])}
+    out = await scope.warm(ids)
+    return {"ok": True, **out,
+            "message": f"体检 {out['checked']} 道（{out['cached']} 道已有结论没重跑），"
+                       f"其中 {out['narrow']} 道改动面太窄会被门禁拦下"}
+
+
 @router.post("/batch/quality-gate")
 async def batch_quality_gate(body: IdList) -> dict:
     """把勾中的题整条质检走一遍（事实核验 + 措辞 + 本地核验 + 平台质检），不等结果。
@@ -246,7 +296,12 @@ async def batch_claim(body: IdList) -> dict:
     那是个 FieldInfo 对象，只有经过 HTTP 请求才会被 FastAPI 解析成布尔值。在 Python 里
     直接调用它，force 拿到的就是这个对象本身，而它是真值——于是批量领取会一路强制到底，
     clone 没成、门禁全红的题照样进队列。
+
+    改动面体检先并发跑一轮再进循环。_claim 自己也会补跑，但那是串行的：十道题就是十次
+    模型调用一个接一个，每次一两分钟，光这一项就能把整个请求拖到二十分钟以上。这一轮跑
+    完之后下面每道题读的都是缓存。
     """
+    await scope.warm(body.ids)
     results = []
     for tid in body.ids:
         try:
@@ -386,6 +441,14 @@ async def _claim(task_id: int, force: bool) -> dict:
         bus.publish("tasks", {"type": "task", "id": task_id})
         return {"queued": False, "prepare": prep, "gate": None}
 
+    # 改动面体检要赶在门禁前面跑完：门禁只读存下来的结论，不自己调模型。位置也不能更早，
+    # 得等 clone 完才有仓库结构可看。结论带题面指纹缓存着，一道题放回再领不会重复花钱。
+    # 强制启动时不跑：这条判的是值不值得跑，人既然已经说了照跑，再问一遍模型纯属浪费。
+    if not force:
+        await scope.ensure(task_id)
+
+    with session() as db:
+        snapshot = _get(db, task_id)
     report = gate.summarize(await gate.run_checks(snapshot))
     # 强制启动只放行口径类的问题。容器起不来、或者这一侧的起点不对（没 clone 成、
     # HEAD 对不上），跑出来的东西根本不成立：docker 会拿一个空目录当工作区挂进去，
@@ -466,8 +529,13 @@ async def restore(task_id: int) -> dict:
         t.status = back
         t.discarded_from = ""
         t.discarded_at = None
+        # 被难度筛选废弃的题，恢复就是人在说「这道题我还是要评」。不打这个记号的话，
+        # 巡检下一轮拿同一套阈值再算一遍，四个数一个没变，结论当然还是废弃 —— 人按
+        # 恢复只会看见题一闪又回到废弃列表，而他没做错任何事。
+        released = difficulty.override(t)
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return {"ok": True, "status": back, "message": f"已恢复为 {back}"}
+    return {"ok": True, "status": back,
+            "message": f"已恢复为 {back}" + ("，难度筛选不再拦它" if released else "")}
 
 
 @router.post("/{task_id}/fix/{action}")
@@ -497,6 +565,14 @@ async def gate_fix(task_id: int, action: str) -> dict:
             for run in _runs(db, task_id):
                 run.container_exists = False
         return {"ok": r.ok, "message": r.err.strip() or "两侧容器已删除"}
+    if action == "scope_check":
+        r = await scope.check(task_id)
+        return {"ok": r.get("ok", False), "message": r.get("reason") or scope.summary(r)}
+    if action == "scope_override":
+        with session() as db:
+            changed = scope.override(_get(db, task_id), note="门禁上人工放行")
+        bus.publish("tasks", {"type": "task", "id": task_id})
+        return {"ok": True, "message": "已放行，这道题的改动面不再拦它" if changed else "本来就没被拦"}
     raise HTTPException(404, "未知修复动作")
 
 

@@ -60,6 +60,18 @@ const branchBad = computed(() => props.task.branch_check?.ok === false)
       <div v-if="task.dedup_verdict === 'discard'" class="text-err mt-0.5 line-clamp-2" :title="task.dedup_reason">
         查重命中：{{ task.dedup_reason }}
       </div>
+      <!-- 难度筛选废弃的题要把那句话原样显出来，里面有两侧的步数和用时。人正是照着
+           这四个数决定是按「恢复」把它捞回去评，还是承认这道题确实太简单 -->
+      <div v-if="task.difficulty_screen?.verdict === 'discard'" class="text-warn mt-0.5"
+        :title="task.difficulty_screen.reason">
+        难度不够：{{ task.difficulty_screen.reason }}
+      </div>
+    </div>
+    <!-- 还没开跑就判出改动面太窄的题，列表上先标出来。领取按钮不禁用：这条判的是
+         值不值得跑，人认为模型看走眼了，强制启动仍然照走 -->
+    <div v-else-if="task.scope_blocked" class="text-[12px] text-warn line-clamp-2"
+      :title="task.scope_summary">
+      改动面太窄：{{ task.scope_summary }}
     </div>
     <div v-else-if="task.origin === 'designed'" class="text-[12px] flex items-center gap-1.5"
       :class="task.dedup_verdict === 'pass' ? 'text-ok' : 'text-warn'">

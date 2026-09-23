@@ -24,7 +24,7 @@ from app.models import (
     RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING, RUN_WAITING, SCHEDULABLE, Task, TaskRun,
     as_utc, derive_task_status, utc_now,
 )
-from app.services import dockerx, runner, settings_store
+from app.services import difficulty, dockerx, runner, settings_store
 
 log = logging.getLogger("scheduler")
 
@@ -65,6 +65,13 @@ class Scheduler:
         题级状态取 SCHEDULABLE 而不只是 QUEUED，理由见该常量的注释。
         两侧记录不齐的题跳过：缺一侧说明数据坏了，发出去也只会跑出半份结果，
         而巡检那边永远等不到配对。
+
+        开着探路时还要再动一道队形（见 difficulty 末尾那一节）。先跑完那一侧已经判出
+        太轻的题，另一侧直接不放——那道题下一轮巡检就要废掉。其余「还不知道轻不轻」的
+        第二侧不拦，只降一档排到队尾：别的题的首侧先走，轮完了还有空槽它照样出闸。
+
+        这道排序必须长在这里而不是交给巡检。巡检默认五分钟一轮，调度两秒一轮，等巡检
+        判出来，另一侧早就跑起来了。
         """
         rows = db.execute(
             select(TaskRun.id, TaskRun.task_id, TaskRun.side, TaskRun.status, TaskRun.attempt,
@@ -74,10 +81,16 @@ class Scheduler:
             .order_by(Task.priority, Task.claimed_at, Task.id, TaskRun.side)
         ).all()
         sides = Counter(r.task_id for r in rows)
-        return [{"run_id": r.id, "task_id": r.task_id, "task_no": r.task_no, "side": r.side,
-                 "attempt": r.attempt, "requeued": r.status == RUN_QUEUED}
-                for r in rows
-                if r.status in RUN_WAITING and sides[r.task_id] == len(config.SIDES)]
+        ready = [r for r in rows
+                 if r.status in RUN_WAITING and sides[r.task_id] == len(config.SIDES)]
+        held, deferred = difficulty.probe_order(db, sorted({r.task_id for r in ready}))
+        out = [{"run_id": r.id, "task_id": r.task_id, "task_no": r.task_no, "side": r.side,
+                "attempt": r.attempt, "requeued": r.status == RUN_QUEUED,
+                "deferred": r.id in deferred}
+               for r in ready if r.id not in held]
+        # 稳定排序，降级的整体挪到队尾，各自内部仍按上面那个优先级顺序
+        out.sort(key=lambda q: q["deferred"])
+        return out
 
     def _running_view(self) -> list[dict]:
         with session() as db:

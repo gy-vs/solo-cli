@@ -4,7 +4,8 @@
 workspace_B 这样），因为 A 和 B 是两次完全独立的运行，一侧就绪不代表另一侧也就绪。
 
 题面口径（难度、任务类型）在这里就挡住，是因为跑完了才发现不符合平台收题范围，
-两个容器的算力就白花了。
+两个容器的算力就白花了。题面的改动面够不够宽（scope 检查）挡在这里是同一个道理：
+只动一个模块的题两边都能很快做完，比不出高下，那两个多小时同样是白花。
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from dataclasses import asdict, dataclass
 
 from app import config
 from app.models import Task
-from app.services import dockerx, gsb_repo, settings_store
+from app.services import dockerx, gsb_repo, scope, settings_store
 # 快照 sha 的解析归仓库模块管，这里只是用；保留 gate.snapshot_sha 这个名字给现有调用方
 from app.services.gsb_repo import snapshot_sha  # noqa: F401
 
@@ -79,6 +80,30 @@ def _scan_blacklist(root: str, patterns: list[str], limit: int = 20) -> list[str
     return hits
 
 
+def _scope_check(task: Task) -> Check:
+    """题面的改动面够不够宽。只读已经存下来的体检结论，不在这里调模型。
+
+    门禁每点一次「重新检查」就跑一遍，界面上还会随着状态变化自动重查；要是把模型调用
+    放在这里，一次翻页就能烧掉十几次调用，而结论是同一份。真正的体检由领取那条路负责
+    触发，这里只负责把结论摆出来。
+
+    拦得住但不是硬前提：这条判的是「值不值得跑」，不是「能不能跑」。模型看题面判错的
+    时候，人按下强制启动就该照跑，不该逼人去改题面或者关掉整道校验。
+    """
+    if not scope.enabled():
+        return Check("scope", "ok", "跨模块校验已关闭")
+    report = task.scope or {}
+    if report.get("override"):
+        return Check("scope", "ok", f"改动面已人工放行（{scope.summary(report)}）")
+    if not scope.settled(task):
+        return Check("scope", "warn",
+                     "题面改过了，改动面要重新体检" if report else "还没体检过题面的改动面，领取时会先跑一次",
+                     fix="scope_check")
+    hit = scope.blocking(task)
+    return Check("scope", "block", hit, fix="scope_override") if hit \
+        else Check("scope", "ok", scope.summary(report))
+
+
 async def run_checks(task: Task) -> list[Check]:
     checks: list[Check] = []
 
@@ -128,6 +153,7 @@ async def run_checks(task: Task) -> list[Check]:
     else:
         checks.append(Check("repro_level", "warn",
                             f"可复现等级「{task.repro_level or '空'}」不在平台选项里，上传前需要改题块"))
+    checks.append(_scope_check(task))
 
     # 3. 仓库与分支
     if not task.repo_url:
