@@ -37,6 +37,8 @@ SKILL_NAME = "solo-prompt"
 # 同一个 skills 目录在宿主机上的路径。录屏文档校验要把 skill 自带的 ps 脚本挂进
 # powershell 容器，docker -v 的源由宿主 daemon 解析，容器里的 /host/skills 它不认。
 SKILL_DIR_HOST = _env("SKILL_DIR_HOST") or str(SKILL_DIR_MOUNT)
+# 在对话里跑 /solo-report 写出来的那份文档。录屏协作巡检时把里面还新鲜的片段直接发布，不再花额度重写。
+SOLO_REPORT_DOC = Path(_env("SOLO_REPORT_DOC") or str(Path(__file__).resolve().parents[2] / "docs" / "SoloReport.md"))
 # CLI 只认这四个固定位置下的 skill，给不了自定义目录参数，所以把挂载点链过去。
 # 详见 llm.ensure_skills_linked。
 SKILL_LINK = Path.home() / ".cursor" / "skills"

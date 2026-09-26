@@ -25,6 +25,8 @@ services:
       - SKILL_DIR_MOUNT=/host/skills
       # 录屏文档的 PowerShell 校验要把 skill 自带的脚本挂进 powershell 容器，同样得给宿主路径
       - SKILL_DIR_HOST=${SKILL_DIR:-${HOME}/.cursor/skills}
+      # 对话里跑 /solo-report 写的文档，录屏协作把里面还新鲜的片段直接发布
+      - SOLO_REPORT_DOC=/host/solo-docs/SoloReport.md
       - SECRET_KEY_FILE=/data/secret.key
       - HOST_PORT=${HOST_PORT:-8788}
       # 以下为首次启动的设置种子（设置表已有值时忽略），之后在界面维护
@@ -45,6 +47,8 @@ services:
       # 出题 SOP：agent 在容器里读这份 skill 执行 /solo-prompt
       - ${SKILL_DIR:-${HOME}/.cursor/skills}:/host/skills:ro
       - ./data:/data
+      # 挂目录不挂文件：prune / render 是整份重写，单文件挂载会一直指着旧 inode
+      - ./docs:/host/solo-docs:ro
     expose:
       - "8000"
     healthcheck:

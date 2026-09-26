@@ -296,8 +296,14 @@ def stub_repo(tmp_db, monkeypatch):
     monkeypatch.setattr(rec_repo, "append", append)
     monkeypatch.setattr(rec_repo, "delete_branch", delete_branch)
     monkeypatch.setattr(rec_repo, "entries", lambda: state["entries"])
-    monkeypatch.setattr(recording, "start_generate",
-                        lambda tid, force=False: state["started"].append(tid) or {"ok": True})
+
+    def start_batch(ids, force=False):
+        state["started"].extend(ids)
+        state.setdefault("batches", []).append(list(ids))
+        return {"ok": True, "message": "", "started": list(ids), "skipped": {}}
+
+    monkeypatch.setattr(recording, "start_batch", start_batch)
+    monkeypatch.setattr(recording, "_pause", {})
     monkeypatch.setattr(recording, "_start_collect", lambda tid, e: state["collected"].append(tid))
     monkeypatch.setattr(recording.settings_store, "get_bool", lambda k, d=False: d)
     return state
@@ -421,25 +427,30 @@ def test_claim_reports_when_someone_else_got_there_first(stub_repo, monkeypatch)
 
 # ---------------- 批量 ----------------
 
-def test_batch_generate_starts_within_quota_and_queues_the_rest(tmp_db, monkeypatch):
+def test_batch_generate_packs_within_quota_and_queues_the_rest(tmp_db, monkeypatch):
     from app.db import session
 
     ids = [_add(no, m.QC) for no in ("101", "102", "103")]
     bad = _add("104", m.ANALYZED)
-    started = []
+    batches = []
 
-    def fake_start(tid, force=False):
-        started.append(tid)
-        recording._gen_jobs[tid] = object()
-        return {"ok": True, "message": "已开始生成录屏文档"}
+    def fake_batch(tids, force=False):
+        batches.append(list(tids))
+        job = object()
+        for t in tids:
+            recording._gen_jobs[t] = job
+        return {"ok": True, "message": "", "started": list(tids), "skipped": {}}
 
     monkeypatch.setattr(rec_repo, "available", lambda: (True, ""))
-    monkeypatch.setattr(recording, "max_parallel", lambda: 2)
-    monkeypatch.setattr(recording, "start_generate", fake_start)
+    monkeypatch.setattr(recording, "max_parallel", lambda: 1)
+    monkeypatch.setattr(recording, "batch_size", lambda: 2)
+    monkeypatch.setattr(recording, "start_batch", fake_batch)
     monkeypatch.setattr(recording, "_gen_jobs", {})
+    monkeypatch.setattr(recording, "_pause", {})
     res = recording.queue_generate([*ids, bad])
-    assert started == ids[:2]
+    assert batches == [ids[:2]] and recording.running_calls() == 1
     assert [r["ok"] for r in res] == [True, True, True, False]
+    assert "2 道合写" in res[0]["message"]
     with session() as db:
         queued = db.get(m.Task, ids[2])
         assert queued.recording["wanted"] is True
@@ -453,3 +464,270 @@ def test_scan_runs_manual_queue_first_even_when_auto_generate_is_off(stub_repo, 
                         lambda k, d=False: False if k == "rec.auto_generate" else d)
     asyncio.run(recording.scan())
     assert stub_repo["started"] == [manual] and auto not in stub_repo["started"]
+
+
+def test_scan_packs_tasks_into_batches(stub_repo, monkeypatch):
+    ids = [_add(no, m.QC) for no in ("101", "102", "103", "104", "105")]
+    monkeypatch.setattr(recording, "batch_size", lambda: 2)
+    monkeypatch.setattr(recording, "max_parallel", lambda: 5)
+    asyncio.run(recording.scan())
+    assert stub_repo["batches"] == [ids[:2], ids[2:4], ids[4:]]
+
+
+# ---------------- 账号级失败 ----------------
+
+def test_account_error_pauses_the_queue_without_charging_the_task(stub_repo, monkeypatch):
+    from app.db import session
+
+    from app.services import llm
+
+    tid = _add("101", m.QC, recording={"state": "generating", "fails": 1})
+    _add("102", m.QC)
+    exc = llm.LlmError("Cursor 账号有未付账单，模型请求被拒。", retryable=False)
+    recording._record_failure(tid, "101", gp.reason_digest(REASON), exc)
+    with session() as db:
+        rec = db.get(m.Task, tid).recording
+    assert rec["fails"] == 1 and rec["account"] is True and rec["failed_at"] == ""
+    assert "未付账单" in recording.paused()
+    stats = asyncio.run(recording.scan())
+    assert stub_repo["started"] == [] and "未付账单" in stats["paused"]
+
+    recording._pause.clear()
+    with session() as db:
+        assert recording.needs_generation(db.get(m.Task, tid)) == "账号问题恢复后重新生成"
+    asyncio.run(recording.scan())
+    assert tid in stub_repo["started"]
+
+
+def test_task_level_error_still_counts_and_cools_down(stub_repo):
+    from app.db import session
+
+    tid = _add("101", m.QC)
+    recording._record_failure(tid, "101", gp.reason_digest(REASON), rec_report.ReportError("写了 3 稿仍没过"))
+    with session() as db:
+        t = db.get(m.Task, tid)
+        assert t.recording["fails"] == 1 and not recording.paused()
+        assert recording.needs_generation(t) == ""
+
+
+def test_restart_clears_fail_counts_charged_by_old_account_errors(tmp_db):
+    from app.db import session
+
+    from app.services import llm
+
+    bad = _add("101", m.QC, recording={"state": "failed", "fails": 3, "failed_at": "2026-01-01T00:00:00+00:00",
+                                       "error": llm._FATAL_PATTERNS[0][1]})
+    real = _add("102", m.QC, recording={"state": "failed", "fails": 3, "error": "写了 3 稿仍没过 PowerShell 校验"})
+    recording.reset_stale_generating()
+    with session() as db:
+        assert db.get(m.Task, bad).recording["fails"] == 0
+        assert recording.needs_generation(db.get(m.Task, bad)) == "账号问题恢复后重新生成"
+        assert db.get(m.Task, real).recording["fails"] == 3
+
+
+# ---------------- 合写与素材精简 ----------------
+
+def test_pack_respects_count_and_char_budget():
+    sizes = [("1", 30), ("2", 30), ("3", 30), ("4", 100), ("5", 10)]
+    assert rec_report.pack(sizes, limit=70, max_n=5) == [["1", "2"], ["3"], ["4"], ["5"]]
+    assert rec_report.pack(sizes, limit=10_000, max_n=2) == [["1", "2"], ["3", "4"], ["5"]]
+    assert rec_report.pack(sizes, limit=10_000, max_n=99)[0] == ["1", "2", "3", "4", "5"]
+
+
+def test_extract_fragments_splits_by_heading_and_drops_per_task_fences():
+    raw = ("好的\n```markdown\n## 第 101 题　甲\n\n```powershell\nnpm run dev\n```\n```\n\n---\n"
+           "```markdown\n## 第 102 题　乙\n\n正文\n```\n")
+    got = rec_report.extract_fragments(raw, ["101", "102", "103"])
+    assert set(got) == {"101", "102"}
+    assert got["101"] == "## 第 101 题　甲\n\n```powershell\nnpm run dev\n```\n"
+    assert got["102"] == "## 第 102 题　乙\n\n正文\n"
+
+
+def test_slim_dedupes_commands_clips_output_and_shares_probe():
+    probe = {"kind": "backend", "ports": ["3000"]}
+    long = "x" * 5000
+    mat = {"task_no": "101", "sides": {
+        "A": {"probe": {**probe, "root": "/w/101/A"}, "final_summary": long,
+              "trace_commands": {"install": [{"cmd": "npm i", "output": long}],
+                                 "other": [{"cmd": "npm i", "output": "again"}]}},
+        "B": {"probe": {**probe, "root": "/w/101/B"},
+              "trace_commands": {"install": [{"cmd": "npm i", "output": "ok"}]}}}}
+    out = rec_report.slim(mat)
+    a = out["sides"]["A"]
+    assert out["probe_shared"] == probe and a["probe"].startswith("两侧相同")
+    assert a["trace_commands"]["other"] == []
+    assert len(a["trace_commands"]["install"][0]["output"]) < 1000
+    assert len(a["final_summary"]) < 1500
+    assert out["sides"]["B"]["trace_commands"]["install"][0]["output"] == "ok"
+    assert mat["sides"]["A"]["final_summary"] == long
+
+
+def test_generate_many_rewrites_only_the_tasks_that_failed(tmp_path, monkeypatch):
+    from app.services import llm
+
+    for rel in ("SKILL.md", "references/report-template.md", "references/powershell-rules.md",
+                "scripts/collect.py", "scripts/verify_ps.py"):
+        p = tmp_path / "skills" / "solo-report" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("规则", encoding="utf-8")
+    monkeypatch.setattr(config, "SKILL_DIR_MOUNT", tmp_path / "skills")
+
+    async def fake_collect(no):
+        if no == "104":
+            raise rec_report.ReportError("collect.py 失败")
+        return {"task_no": no, "kind_label": f"素材{no}"}
+
+    prompts, models = [], []
+
+    async def fake_ask(prompt, **kw):
+        prompts.append(prompt)
+        models.append(kw.get("model"))
+        nos = [n for n in ("101", "102", "103") if f"第 {n} 题素材" in prompt]
+        text = "".join(f"## 第 {n} 题　稿{len(prompts)}\n\n正文\n\n" for n in nos)
+        return llm.LlmResult(text=text, model="m", session_id="", usage={}, duration_s=1, attempts=1)
+
+    async def fake_verify(fragment):
+        bad = "第 102 题" in fragment and "稿1" in fragment
+        return (not bad, "L3: 含 &&" if bad else "全部通过")
+
+    monkeypatch.setattr(rec_report, "collect", fake_collect)
+    monkeypatch.setattr(rec_report.llm, "ask", fake_ask)
+    monkeypatch.setattr(rec_report, "verify", fake_verify)
+    res = asyncio.run(rec_report.generate_many(["101", "102", "103", "104"], model="cheap", max_n=3))
+    assert len(prompts) == 2 and models == ["cheap", "cheap"]
+    assert "一起写 3 道题" in prompts[0]
+    assert "第 102 题素材" in prompts[1] and "第 101 题素材" not in prompts[1] and "含 &&" in prompts[1]
+    assert res["101"].rounds == 1 and res["103"].rounds == 1 and res["102"].rounds == 2
+    assert isinstance(res["104"], rec_report.ReportError)
+
+
+def test_generate_many_hands_an_llm_error_to_every_task_in_the_batch(tmp_path, monkeypatch):
+    from app.services import llm
+
+    for rel in ("SKILL.md", "references/report-template.md", "references/powershell-rules.md",
+                "scripts/collect.py", "scripts/verify_ps.py"):
+        p = tmp_path / "skills" / "solo-report" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("规则", encoding="utf-8")
+    monkeypatch.setattr(config, "SKILL_DIR_MOUNT", tmp_path / "skills")
+
+    async def fake_collect(no):
+        return {"task_no": no}
+
+    async def fake_ask(prompt, **kw):
+        raise llm.LlmError("Cursor 账号有未付账单", retryable=False)
+
+    monkeypatch.setattr(rec_report, "collect", fake_collect)
+    monkeypatch.setattr(rec_report.llm, "ask", fake_ask)
+    res = asyncio.run(rec_report.generate_many(["101", "102"], max_n=3))
+    assert all(isinstance(v, llm.LlmError) and recording.account_error(v) for v in res.values())
+
+
+# ---------------- 导入对话里生成的文档 ----------------
+
+DOC = """# 众测题目验证命令
+
+<!-- solo-report:index:start -->
+| 题号 |
+<!-- solo-report:index:end -->
+
+<!-- solo-report:task=101 generated=2026-09-26 -->
+
+## 第 101 题　Bug 修复　·　困难　·　纯后端
+
+A 侧命令
+
+---
+
+<!-- solo-report:task=102 generated=2026-09-20 -->
+
+## 第 102 题　Feature 迭代　·　中等　·　全栈
+
+B 侧命令
+"""
+
+
+def test_parse_doc_splits_sections_and_reads_kind():
+    doc = rec_report.parse_doc(DOC)
+    assert set(doc) == {"101", "102"}
+    assert doc["101"].fragment == "## 第 101 题　Bug 修复　·　困难　·　纯后端\n\nA 侧命令\n"
+    assert doc["101"].generated == "2026-09-26" and doc["101"].kind_label == "纯后端"
+    assert doc["102"].kind_label == "全栈"
+
+
+def test_parse_doc_reads_skill_layout_with_marker_under_heading():
+    """skill 的 render.py 把标记写在标题行下面。"""
+    text = ("# 头\n\n| 总览 |\n\n## 第 235 题　Feature 迭代　·　困难　·　无界面\n"
+            "<!-- solo-report:task=235 generated=2026-09-24 -->\n\n仓库：x\n\n```powershell\na\n\n\nb\n```\n\n"
+            "## 第 236 题　Bug 修复　·　困难　·　无界面\n<!-- solo-report:task=236 generated=2026-09-24 -->\n\n仓库：y\n")
+    doc = rec_report.parse_doc(text)
+    assert doc["235"].fragment == ("## 第 235 题　Feature 迭代　·　困难　·　无界面\n\n仓库：x\n\n"
+                                   "```powershell\na\n\n\nb\n```\n")
+    assert doc["236"].fragment.endswith("仓库：y\n") and doc["236"].kind_label == "无界面"
+
+
+def test_scan_publishes_fresh_chat_sections_instead_of_generating(stub_repo, monkeypatch, tmp_path):
+    from app.db import session
+
+    settled = {"finished_at": "2026-09-25T10:00:00+00:00"}
+    fresh = _add("101", m.QC)
+    stale = _add("102", m.QC)
+    other = _add("103", m.QC)
+    with session() as db:
+        for tid in (fresh, stale):
+            t = db.get(m.Task, tid)
+            t.precheck = {**t.precheck, **settled}
+    doc = tmp_path / "SoloReport.md"
+    doc.write_text(DOC.replace("2026-09-20", "2026-09-24"), encoding="utf-8")
+    monkeypatch.setattr(config, "SOLO_REPORT_DOC", doc)
+    published = []
+
+    async def verify(fragment):
+        return True, "全部通过"
+
+    async def publish(no, it, report):
+        published.append((no, report.material["kind_label"], report.model))
+
+    monkeypatch.setattr(rec_report, "verify", verify)
+    monkeypatch.setattr(recording, "_publish", publish)
+    stats = asyncio.run(recording.scan())
+    assert published == [("101", "纯后端", "对话 /solo-report")] and stats["imported"] == 1
+    assert fresh not in stub_repo["started"] and {stale, other} <= set(stub_repo["started"])
+    with session() as db:
+        assert db.get(m.Task, fresh).recording["source"] == "chat"
+
+
+def test_chat_section_that_fails_verify_falls_back_to_generation_once(stub_repo, monkeypatch, tmp_path):
+    from app.db import session
+
+    tid = _add("101", m.QC)
+    doc = tmp_path / "SoloReport.md"
+    doc.write_text(DOC, encoding="utf-8")
+    monkeypatch.setattr(config, "SOLO_REPORT_DOC", doc)
+    calls = []
+
+    async def verify(fragment):
+        calls.append(fragment)
+        return False, "L3: 含 &&"
+
+    monkeypatch.setattr(rec_report, "verify", verify)
+    asyncio.run(recording.scan())
+    asyncio.run(recording.scan())
+    assert len(calls) == 1 and stub_repo["started"].count(tid) == 2
+    with session() as db:
+        assert "含 &&" in db.get(m.Task, tid).recording["import_error"]
+
+
+def test_batch_workdir_links_only_the_batch_tasks(tmp_path, monkeypatch):
+    """合写不能把作答总目录交给 CLI：几路同时全盘 rg 会压垮 Docker Desktop 的文件共享。"""
+    root = tmp_path / "coder"
+    for no in ("101", "102", "999"):
+        (root / "workspace" / no / "A").mkdir(parents=True)
+    monkeypatch.setattr(config, "CODER_ROOT_MOUNT", root)
+    monkeypatch.setattr(config, "WORKSPACE_DIR", "workspace")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    assert rec_report._workdir(["101"], scratch) == root / "workspace" / "101"
+    wd = rec_report._workdir(["101", "102", "404"], scratch)
+    assert wd == scratch and sorted(p.name for p in wd.iterdir()) == ["101", "102"]
+    assert (wd / "101" / "A").is_dir()

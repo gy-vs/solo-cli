@@ -161,7 +161,14 @@ SPECS: tuple[Spec, ...] = (
     Spec("rec.auto_generate", "自动生成录屏文档", "录屏协作", default="1", kind="bool",
          help="题一进待录屏就排队生成；关掉则只在录屏页手动点「生成」"),
     Spec("rec.max_parallel", "文档生成并发", "录屏协作", default="2", kind="number",
-         help="同时写录屏文档的道数。每道要调模型写片段、再跑 PowerShell 校验，十分钟上下"),
+         help="同时跑几次模型调用写录屏文档。一次调用可以合写好几道，见「一次合写道数」"),
+    Spec("rec.model", "录屏文档模型", "录屏协作", default="", kind="select",
+         help="留空沿用分析模型。写文档是照素材填模板，不需要最强的模型，换个便宜的能省不少额度"),
+    Spec("rec.batch_size", "一次合写道数", "录屏协作", default="3", kind="number",
+         help="一次模型调用最多写几道。skill 说明约 1 万 token 每次都要发，合写能把它摊掉；"
+              "填 1 回到一题一调。上限 5：再多模型容易张冠李戴，一次失败连坐的题也多"),
+    Spec("rec.batch_chars", "一次合写素材上限（字符）", "录屏协作", default="120000", kind="number",
+         help="一次调用里各题素材加起来的字符上限，大题会自动少合几道。一道题的素材通常 2 万到 4 万字符"),
 )
 SPEC_BY_KEY = {s.key: s for s in SPECS}
 

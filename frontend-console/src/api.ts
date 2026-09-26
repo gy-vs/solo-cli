@@ -772,6 +772,8 @@ export interface RecLocal {
     collect_error?: string
     recorded_by?: string
     wanted?: boolean
+    source?: string
+    account?: boolean
   }
   generating: boolean
   collecting: boolean
@@ -790,8 +792,12 @@ export interface RecOverview {
   auto_generate: boolean
   max_parallel: number
   generating: number
+  calls?: number
+  batch_size?: number
+  model?: string
+  paused?: string
   skill_missing: string[]
-  last_scan: { at?: string; error?: string; generated?: number; collected?: number; withdrawn?: number }
+  last_scan: { at?: string; error?: string; imported?: number; generated?: number; collected?: number; withdrawn?: number }
   local: RecLocal[]
   queue: RecQueueItem[]
 }

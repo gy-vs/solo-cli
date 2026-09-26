@@ -115,13 +115,17 @@ function clearSecret(it: SettingItem) { form[it.key] = ''; reveal[it.key] = true
               <span class="text-[12px] text-fg2">{{ it.help || (form[it.key] !== '0' && form[it.key] !== '' ? '开启' : '关闭') }}</span>
             </div>
           </template>
-          <template v-else-if="it.kind === 'select' && it.key === 'cursor.model'">
+          <template v-else-if="it.kind === 'select' && it.key.endsWith('.model')">
             <div class="flex gap-2">
               <NSelect v-model:value="form[it.key]" :options="models.map(m => ({ label: m, value: m }))" filterable tag size="small" :loading="loadingModels"
-                placeholder="选择或输入模型 slug" />
+                :clearable="it.key !== 'cursor.model'"
+                :placeholder="it.key === 'cursor.model' ? '选择或输入模型 slug' : '留空沿用分析模型'" />
               <NButton size="small" tertiary :loading="loadingModels" @click="loadModels">刷新</NButton>
             </div>
-            <div class="text-[12px] text-fg2">{{ modelsSource === 'live' ? '列表来自 Cursor CLI 实时探测' : '实时探测不可用，显示内置列表；可直接输入 slug' }}</div>
+            <div class="text-[12px] text-fg2">
+              <template v-if="it.key !== 'cursor.model' && it.help">{{ it.help }}。</template>
+              {{ modelsSource === 'live' ? '列表来自 Cursor CLI 实时探测' : '实时探测不可用，显示内置列表；可直接输入 slug' }}
+            </div>
           </template>
           <template v-else-if="it.secret">
             <div class="flex gap-2">

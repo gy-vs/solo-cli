@@ -109,6 +109,9 @@ const count = (k: TabKey) => lists.value[k].length
 function docLine(t: RecLocal): { text: string; cls: string } {
   const r = t.recording
   if (t.generating || r.state === 'generating') return { text: r.note || '生成中', cls: 'text-run' }
+  if (r.state === 'failed' && r.account) {
+    return { text: `账号问题没生成：${r.error || '原因不明'}，恢复后自动重排，不算这道题失败`, cls: 'text-warn' }
+  }
   if (r.state === 'failed') {
     const auto = (r.fails ?? 0) <= 2 && r.error !== '后端重启，生成中断' ? '，巡检稍后自动重试' : ''
     return { text: `生成失败（第 ${r.fails ?? 1} 次）：${r.error || '原因不明'}${auto}`, cls: 'text-err' }
@@ -425,6 +428,9 @@ const scanNote = computed(() => {
       <div v-if="!isRecorder && data.skill_missing.length" class="card px-4 py-2.5 text-xs text-err border-err/40">
         生成录屏文档要用 solo-report skill：{{ data.skill_missing.join('；') }}
       </div>
+      <div v-if="!isRecorder && data.paused" class="card px-4 py-2.5 text-xs text-warn border-warn/40">
+        文档生成已暂停：{{ data.paused }}。这是账号层面的问题，不计入各题的失败次数；处理好后巡检每 10 分钟会试一批，成功一次就恢复。
+      </div>
 
       <!-- 流程总览：四个数字对应出题端的四栏，一眼看出卡在哪一步 -->
       <div v-if="!isRecorder" class="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -470,8 +476,8 @@ const scanNote = computed(() => {
             :disabled="!!data.skill_missing.length" @click="batchGenerate">
             批量生成（{{ picked.size }}）
           </NButton>
-          <span v-if="tab === 'docs' && picked.size > data.max_parallel" class="text-fg2">
-            额度 {{ data.max_parallel }}，超出的排队由巡检接着跑
+          <span v-if="tab === 'docs' && picked.size > data.max_parallel * (data.batch_size || 1)" class="text-fg2">
+            每次合写 {{ data.batch_size || 1 }} 道、同时 {{ data.max_parallel }} 路，超出的排队由巡检接着跑
           </span>
           <NButton v-if="tab === 'waiting'" size="small" type="warning" secondary :loading="busy === 'batch'" @click="batchWithdraw">
             批量撤回（{{ picked.size }}）
@@ -520,7 +526,7 @@ const scanNote = computed(() => {
                 <span v-if="t.generating" class="dot bg-run animate-breathe mr-1" />{{ docLine(t).text }}
               </div>
               <div v-else-if="tab === 'waiting'" class="text-[12px] text-fg1 truncate">
-                {{ t.recording.rounds ? `${t.recording.rounds} 稿通过校验 · ` : '' }}发布于 {{ fmtTime(t.entry?.published_at) }}
+                {{ t.recording.source === 'chat' ? '取自对话报告 · ' : t.recording.rounds ? `${t.recording.rounds} 稿通过校验 · ` : '' }}发布于 {{ fmtTime(t.entry?.published_at) }}
               </div>
               <div v-else-if="tab === 'returned'" class="text-[12px] truncate"
                 :class="t.recording.collect_error ? 'text-err' : 'text-info'" :title="t.recording.collect_error">

@@ -25,11 +25,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
@@ -37,7 +39,7 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import DISCARDED, DONE, QC, READY, UPLOADED, Task, as_utc, utc_now
-from app.services import gsb_precheck, gsb_uploader, rec_repo, rec_report, settings_store
+from app.services import gsb_precheck, gsb_uploader, llm, rec_repo, rec_report, settings_store
 
 log = logging.getLogger("solo-cli.rec")
 
@@ -50,12 +52,14 @@ WITHDRAWN = "withdrawn"
 GEN_AUTO_RETRIES = 2          # 自动生成失败后再试几次
 GEN_RETRY_GAP_S = 1800        # 两次自动重试之间至少隔多久
 COLLECT_RETRY_GAP_S = 300     # 收视频失败（多半是平台代传失败）之后隔多久再试
+ACCOUNT_PAUSE_S = 600         # 账号级报错（欠费、Key 无效、模型名不对）之后整队停多久再探一次
 FINAL = frozenset({UPLOADED, DONE, DISCARDED})
 
 _gen_jobs: dict[int, asyncio.Task] = {}
 _collect_jobs: dict[int, asyncio.Task] = {}
 _scan_task: asyncio.Task | None = None
 _last_scan: dict = {}
+_pause: dict = {}
 
 
 # ---------------- 口径 ----------------
@@ -66,6 +70,43 @@ def max_parallel() -> int:
 
 def auto_generate() -> bool:
     return settings_store.get_bool("rec.auto_generate", True)
+
+
+def batch_size() -> int:
+    return max(1, min(settings_store.get_int("rec.batch_size", 3), rec_report.BATCH_MAX))
+
+
+def batch_chars() -> int:
+    return max(20_000, settings_store.get_int("rec.batch_chars", 120_000))
+
+
+def model() -> str:
+    return (settings_store.get("rec.model") or "").strip()
+
+
+def running_calls() -> int:
+    """在跑的模型调用数。合写的几道共用一个任务，按任务算额度。"""
+    return len({id(j) for j in _gen_jobs.values()})
+
+
+def account_error(exc: BaseException | str) -> bool:
+    """这个失败是不是整个账号的问题：换哪道题都一样，不该记到题头上。"""
+    if isinstance(exc, llm.LlmError):
+        return not exc.retryable and "工作目录" not in str(exc)
+    return isinstance(exc, str) and llm.is_fatal(exc) and "工作目录" not in exc
+
+
+def paused() -> str:
+    """账号级报错之后的冷却期里返回原因。冷却过了放一批去探，还不行再停。"""
+    if _pause and time.monotonic() < _pause["until"]:
+        return _pause["reason"]
+    return ""
+
+
+def _set_pause(reason: str) -> None:
+    if not paused():
+        log.warning("录屏文档生成暂停 %d 分钟：%s", ACCOUNT_PAUSE_S // 60, reason)
+    _pause.update(reason=reason, until=time.monotonic() + ACCOUNT_PAUSE_S)
 
 
 def producer_active() -> bool:
@@ -99,6 +140,8 @@ def needs_generation(task: Task) -> str:
     same = rec.get("digest") == current_digest(task)
     if state in (PUBLISHED, COLLECTED) and same:
         return ""
+    if state == GEN_FAILED and rec.get("account"):
+        return "账号问题恢复后重新生成"
     if state == GEN_FAILED and same:
         if int(rec.get("fails") or 0) > GEN_AUTO_RETRIES:
             return ""
@@ -124,32 +167,55 @@ def _update(task_id: int, **fields) -> dict:
 # ---------------- 生成与发布 ----------------
 
 def start_generate(task_id: int, *, force: bool = False) -> dict:
-    """起一个生成任务。force 跳过额度（人在页面上点的）。"""
-    if task_id in _gen_jobs:
-        return {"ok": False, "message": "这道题的文档正在生成"}
+    """起一道题的生成。force 跳过额度和账号暂停（人在页面上点的）。"""
+    res = start_batch([task_id], force=force)
+    if res["ok"]:
+        return {"ok": True, "message": "已开始生成录屏文档"}
+    return {"ok": False, "message": (res["skipped"] or {}).get(task_id) or res["message"]}
+
+
+def start_batch(task_ids: list[int], *, force: bool = False) -> dict:
+    """几道题合成一个生成任务：collect 各自跑，写片段按字符预算合批调模型。
+
+    返回 {"ok", "message", "started": [...], "skipped": {id: 原因}}。
+    """
+    skipped: dict[int, str] = {}
     ok, why = rec_repo.available()
     if not ok:
-        return {"ok": False, "message": why}
+        return {"ok": False, "message": why, "started": [], "skipped": {}}
     if missing := rec_report.preflight():
-        return {"ok": False, "message": "；".join(missing)}
-    if not force and len(_gen_jobs) >= max_parallel():
-        return {"ok": False, "message": f"已有 {len(_gen_jobs)} 道在生成，额度 {max_parallel()}"}
+        return {"ok": False, "message": "；".join(missing), "started": [], "skipped": {}}
+    if not force and running_calls() >= max_parallel():
+        return {"ok": False, "message": f"已有 {running_calls()} 路在生成，额度 {max_parallel()}",
+                "started": [], "skipped": {}}
+    if not force and (reason := paused()):
+        return {"ok": False, "message": f"账号问题暂停中：{reason}", "started": [], "skipped": {}}
+    ids: list[int] = []
     with session() as db:
-        task = db.get(Task, task_id)
-        if task is None:
-            return {"ok": False, "message": "题目不存在"}
-        if task.status != QC:
-            return {"ok": False, "message": f"只有待录屏的题能生成录屏文档（当前 {task.status}）"}
-    _update(task_id, state=GENERATING, stage="queued", note="排队", error="", wanted=False,
-            started_at=utc_now().isoformat())
-    job = asyncio.create_task(_generate(task_id), name=f"rec-gen-{task_id}")
-    _gen_jobs[task_id] = job
-    job.add_done_callback(lambda _: _gen_jobs.pop(task_id, None))
-    return {"ok": True, "message": "已开始生成录屏文档"}
+        for tid in task_ids:
+            task = db.get(Task, tid)
+            if tid in _gen_jobs:
+                skipped[tid] = "这道题的文档正在生成"
+            elif task is None:
+                skipped[tid] = "题目不存在"
+            elif task.status != QC:
+                skipped[tid] = f"只有待录屏的题能生成录屏文档（当前 {task.status}）"
+            else:
+                ids.append(tid)
+    if not ids:
+        return {"ok": False, "message": "没有能生成的题", "started": [], "skipped": skipped}
+    for tid in ids:
+        _update(tid, state=GENERATING, stage="queued", note="排队", error="", wanted=False,
+                account=False, started_at=utc_now().isoformat())
+    job = asyncio.create_task(_generate(ids), name=f"rec-gen-{'-'.join(map(str, ids))}")
+    for tid in ids:
+        _gen_jobs[tid] = job
+    job.add_done_callback(lambda _: [_gen_jobs.pop(t, None) for t in ids])
+    return {"ok": True, "message": f"已开始生成 {len(ids)} 道", "started": ids, "skipped": skipped}
 
 
 def queue_generate(task_ids: list[int]) -> list[dict]:
-    """批量生成：额度内的当场开跑，其余打上手动排队标记，由巡检按额度接着起。
+    """批量生成：额度内的按合写道数装批当场开跑，其余打上手动排队标记，由巡检按额度接着起。
 
     不像单题那样跳过额度：一次勾几十道全部同时调模型，账单和限流都扛不住。
     手动排队不受「自动生成」开关、失败冷却、文档已是最新这几条限制 —— 人点了就是要重写。
@@ -157,28 +223,36 @@ def queue_generate(task_ids: list[int]) -> list[dict]:
     ok, why = rec_repo.available()
     if not ok:
         return [{"id": tid, "ok": False, "message": why} for tid in task_ids]
-    results = []
-    for tid in task_ids:
-        with session() as db:
+    results: dict[int, dict] = {}
+    todo: list[tuple[int, str]] = []
+    with session() as db:
+        for tid in task_ids:
             task = db.get(Task, tid)
             if task is None:
-                results.append({"id": tid, "ok": False, "message": "题目不存在"})
-                continue
-            if task.status != QC:
-                results.append({"id": tid, "ok": False, "task_no": task.task_no,
-                                "message": f"只有待录屏的题能生成（当前 {task.status}）"})
-                continue
-            no = task.task_no
-        if tid in _gen_jobs:
-            results.append({"id": tid, "ok": True, "task_no": no, "message": "已在生成"})
-            continue
-        if len(_gen_jobs) < max_parallel():
-            res = start_generate(tid)
-            results.append({"id": tid, "task_no": no, **res})
-            continue
+                results[tid] = {"id": tid, "ok": False, "message": "题目不存在"}
+            elif task.status != QC:
+                results[tid] = {"id": tid, "ok": False, "task_no": task.task_no,
+                                "message": f"只有待录屏的题能生成（当前 {task.status}）"}
+            elif tid in _gen_jobs:
+                results[tid] = {"id": tid, "ok": True, "task_no": task.task_no, "message": "已在生成"}
+            else:
+                todo.append((tid, task.task_no))
+    size = batch_size()
+    while todo and running_calls() < max_parallel() and not paused():
+        chunk, todo = todo[:size], todo[size:]
+        res = start_batch([tid for tid, _ in chunk])
+        for tid, no in chunk:
+            if tid in res["started"]:
+                msg = "已开始生成" + (f"（{len(res['started'])} 道合写）" if len(res["started"]) > 1 else "")
+                results[tid] = {"id": tid, "ok": True, "task_no": no, "message": msg}
+            else:
+                results[tid] = {"id": tid, "ok": False, "task_no": no,
+                                "message": res["skipped"].get(tid) or res["message"]}
+    why = f"账号问题暂停中，恢复后巡检接着跑：{paused()}" if paused() else "额度已满，排队等巡检接着跑"
+    for tid, no in todo:
         _update(tid, wanted=True, note="手动排队")
-        results.append({"id": tid, "ok": True, "task_no": no, "message": "额度已满，排队等巡检接着跑"})
-    return results
+        results[tid] = {"id": tid, "ok": True, "task_no": no, "message": why}
+    return [results[tid] for tid in task_ids if tid in results]
 
 
 async def batch(action: str, keys: list) -> list[dict]:
@@ -198,54 +272,143 @@ async def batch(action: str, keys: list) -> list[dict]:
     return out
 
 
-async def _generate(task_id: int) -> None:
+def _info(task: Task) -> dict:
+    return {
+        "id": task.id, "digest": current_digest(task), "gsb": dict(task.gsb or {}),
+        "repo_url": (task.repo_url or "").rstrip("/"),
+        "title": f"{task.question_type or ''} · {task.difficulty or ''}".strip(" ·"),
+    }
+
+
+async def _generate(task_ids: list[int]) -> None:
+    info: dict[str, dict] = {}
+    with session() as db:
+        for tid in task_ids:
+            task = db.get(Task, tid)
+            if task is not None:
+                info[task.task_no] = _info(task)
+
+    def progress(no: str, stage: str, note: str) -> None:
+        if no in info:
+            _update(info[no]["id"], stage=stage, note=note)
+
+    try:
+        results = await rec_report.generate_many(list(info), progress=progress, model=model(),
+                                                 max_n=batch_size(), limit=batch_chars())
+    except Exception as exc:  # noqa: BLE001
+        results = {no: exc for no in info}
+    for no, res in results.items():
+        if no not in info:
+            continue
+        if isinstance(res, Exception):
+            _record_failure(info[no]["id"], no, info[no]["digest"], res)
+            continue
+        try:
+            await _publish(no, info[no], res)
+        except Exception as exc:  # noqa: BLE001
+            _record_failure(info[no]["id"], no, info[no]["digest"], exc)
+
+
+def _record_failure(task_id: int, task_no: str, digest: str, exc: BaseException) -> None:
+    if account_error(exc):
+        # 账号的问题不记到题头上：不加失败次数、不进冷却，整队停一阵，恢复后原样重排
+        _set_pause(str(exc))
+        _update(task_id, state=GEN_FAILED, stage="", note="", account=True, failed_at="",
+                error=str(exc)[:800], digest=digest)
+        return
     with session() as db:
         task = db.get(Task, task_id)
-        if task is None:
-            return
-        task_no, digest = task.task_no, current_digest(task)
-        gsb, repo_url = dict(task.gsb or {}), (task.repo_url or "").rstrip("/")
-        title = f"{task.question_type or ''} · {task.difficulty or ''}".strip(" ·")
+        fails = int(((task.recording if task else {}) or {}).get("fails") or 0) + 1
+    log.warning("录屏文档 %s 生成失败（第 %d 次）：%s", task_no, fails, exc)
+    _update(task_id, state=GEN_FAILED, stage="", note="", fails=fails, account=False,
+            failed_at=utc_now().isoformat(), error=str(exc)[:800], digest=digest)
 
-    def progress(stage: str, note: str) -> None:
-        _update(task_id, stage=stage, note=note)
 
+async def _publish(task_no: str, it: dict, report: rec_report.Report) -> None:
+    task_id, digest, gsb = it["id"], it["digest"], it["gsb"]
     owner = rec_repo.device()
-    try:
-        report = await rec_report.generate(task_no, progress=progress)
-        md = rec_report.render(report.fragment, task_no=task_no, owner=owner, digest=digest)
-        local = config.TaskPaths(task_no).analysis / "screencast-report.md"
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_text(md, encoding="utf-8")
-        kind_label = str(report.material.get("kind_label") or "")
-        meta = {"task_no": task_no, "owner": owner, "digest": digest, "repo_url": repo_url,
-                "title": title, "kind_label": kind_label, "verdict": gsb.get("verdict") or "",
-                "generated_at": utc_now().isoformat(), "model": report.model, "rounds": report.rounds}
-        progress("publish", "推到录屏仓库")
-        pub = await rec_repo.publish_branch(owner, task_no, {
-            rec_repo.REPORT_FILE: md,
-            rec_repo.META_FILE: json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
-        })
-        if not pub["ok"]:
-            raise rec_report.ReportError(pub["message"])
-        ev = rec_repo.event(rec_repo.PUBLISHED, owner, task_no, digest=digest, title=title,
-                            kind_label=kind_label, verdict=meta["verdict"], repo_url=repo_url)
-        res = await rec_repo.append([ev], subject=f"publish {task_no}")
-        if not res["ok"]:
-            raise rec_report.ReportError(res["message"])
-    except Exception as exc:  # noqa: BLE001
-        with session() as db:
-            task = db.get(Task, task_id)
-            fails = int(((task.recording if task else {}) or {}).get("fails") or 0) + 1
-        log.warning("录屏文档 %s 生成失败（第 %d 次）：%s", task_no, fails, exc)
-        _update(task_id, state=GEN_FAILED, stage="", note="", fails=fails,
-                failed_at=utc_now().isoformat(), error=str(exc)[:800], digest=digest)
-        return
+    _update(task_id, stage="publish", note="推到录屏仓库")
+    md = rec_report.render(report.fragment, task_no=task_no, owner=owner, digest=digest)
+    local = config.TaskPaths(task_no).analysis / "screencast-report.md"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(md, encoding="utf-8")
+    kind_label = str(report.material.get("kind_label") or "")
+    meta = {"task_no": task_no, "owner": owner, "digest": digest, "repo_url": it["repo_url"],
+            "title": it["title"], "kind_label": kind_label, "verdict": gsb.get("verdict") or "",
+            "generated_at": utc_now().isoformat(), "model": report.model, "rounds": report.rounds}
+    pub = await rec_repo.publish_branch(owner, task_no, {
+        rec_repo.REPORT_FILE: md,
+        rec_repo.META_FILE: json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+    })
+    if not pub["ok"]:
+        raise rec_report.ReportError(pub["message"])
+    ev = rec_repo.event(rec_repo.PUBLISHED, owner, task_no, digest=digest, title=it["title"],
+                        kind_label=kind_label, verdict=meta["verdict"], repo_url=it["repo_url"])
+    res = await rec_repo.append([ev], subject=f"publish {task_no}")
+    if not res["ok"]:
+        raise rec_report.ReportError(res["message"])
+    _pause.clear()
     log.info("录屏文档 %s 已发布（%d 稿通过校验）", task_no, report.rounds)
     _update(task_id, state=PUBLISHED, stage="", note="", digest=digest, fails=0, error="",
-            rounds=report.rounds, model=report.model, kind_label=kind_label,
+            account=False, rounds=report.rounds, model=report.model, kind_label=kind_label,
             published_at=utc_now().isoformat(), branch_deleted=False,
             collect_error="", collected_at="")
+
+
+# ---------------- 导入对话里生成的文档 ----------------
+
+def _local_date(stamp: str) -> str:
+    try:
+        tz = ZoneInfo(os.environ.get("TZ") or "Asia/Shanghai")
+        return as_utc(datetime.fromisoformat(stamp)).astimezone(tz).date().isoformat()
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return ""
+
+
+def doc_fresh(task: Task, sec: rec_report.DocSection) -> bool:
+    """对话文档里这一段是不是照当前理由写的。
+
+    本项目写的标记带 digest，直接比。render.py 写的只有日期：理由最后一次定稿（事实核验
+    重封、措辞质检改写）不晚于生成那天才算数。同一天先生成后改理由的会漏判，但改理由会让题
+    回到待质检，文档那段随之被 prune 剔除，下次就不会再进来。
+    """
+    if sec.digest:
+        return sec.digest == current_digest(task)
+    pre, fact = task.precheck or {}, task.factcheck or {}
+    stamps = [pre.get("applied_at"), pre.get("finished_at"), fact.get("resealed_at"), fact.get("finished_at")]
+    settled = max((d for s in stamps if s and (d := _local_date(s))), default="")
+    return bool(sec.generated) and sec.generated >= settled
+
+
+def import_candidates(tasks: list[Task], doc: dict[str, rec_report.DocSection]) -> list[tuple[dict, rec_report.DocSection]]:
+    out = []
+    for t in tasks:
+        sec = doc.get(t.task_no)
+        rec = t.recording or {}
+        if sec is None or t.id in _gen_jobs or not needs_generation(t):
+            continue
+        if rec.get("import_skip") == current_digest(t) or not doc_fresh(t, sec):
+            continue
+        out.append((_info(t), sec))
+    return out
+
+
+async def _import(it: dict, sec: rec_report.DocSection) -> bool:
+    """校验过了就照常发布；没过就记下，这一稿理由不再试导入，交给生成。"""
+    ok, out = await rec_report.verify(sec.fragment)
+    if not ok:
+        log.info("对话文档里第 %s 题没过 PowerShell 校验，改为自己生成：%s", sec.task_no, out[-300:])
+        _update(it["id"], import_skip=it["digest"], import_error=out[-600:])
+        return False
+    report = rec_report.Report(fragment=sec.fragment, material={"kind_label": sec.kind_label}, rounds=0,
+                               verify_tail=out[-1500:], model="对话 /solo-report")
+    try:
+        await _publish(sec.task_no, it, report)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("对话文档里第 %s 题发布失败：%s", sec.task_no, exc)
+        return False
+    _update(it["id"], source="chat", doc_generated=sec.generated, import_error="")
+    return True
 
 
 # ---------------- 收回视频 ----------------
@@ -308,7 +471,8 @@ async def _scan_safe() -> None:
 
 
 async def scan() -> dict:
-    stats = {"generated": 0, "collected": 0, "withdrawn": 0, "cleaned": 0, "at": utc_now().isoformat()}
+    stats = {"imported": 0, "generated": 0, "collected": 0, "withdrawn": 0, "cleaned": 0,
+             "at": utc_now().isoformat()}
     res = await rec_repo.sync()
     if not res["ok"]:
         stats["error"] = res["message"]
@@ -351,6 +515,7 @@ async def scan() -> dict:
         wanted = sorted((t for t in tasks.values() if needs_generation(t)),
                         key=lambda t: (not (t.recording or {}).get("wanted"), t.task_no))
         wanted_ids = [(t.id, bool((t.recording or {}).get("wanted"))) for t in wanted]
+        imports = import_candidates(wanted, rec_report.read_doc()) if wanted else []
 
     if withdraw:
         r = await rec_repo.append(withdraw, subject=f"withdraw {len(withdraw)}")
@@ -369,17 +534,23 @@ async def scan() -> dict:
             stats["cleaned"] += 1
             _update(task_id, branch_deleted=True)
 
-    for tid, manual in wanted_ids:
-        if len(_gen_jobs) >= max_parallel():
-            break
-        if not (manual or auto_generate()):
-            continue
-        if start_generate(tid)["ok"]:
-            stats["generated"] += 1
+    imported = set()
+    for it, sec in imports:
+        if await _import(it, sec):
+            imported.add(it["id"])
+    stats["imported"] = len(imported)
+    picks = [tid for tid, manual in wanted_ids if (manual or auto_generate()) and tid not in imported]
+    if picks and (reason := paused()):
+        stats["paused"] = reason
+        picks = []
+    size = batch_size()
+    while picks and running_calls() < max_parallel():
+        chunk, picks = picks[:size], picks[size:]
+        stats["generated"] += len(start_batch(chunk)["started"])
     _last_scan.clear()
     _last_scan.update(stats)
-    if any(stats[k] for k in ("generated", "collected", "withdrawn", "cleaned")):
-        log.info("录屏协作：起生成 %d，收视频 %d，撤回 %d，清分支 %d",
+    if any(stats[k] for k in ("imported", "generated", "collected", "withdrawn", "cleaned")):
+        log.info("录屏协作：导入对话文档 %d，起生成 %d，收视频 %d，撤回 %d，清分支 %d", stats["imported"],
                  stats["generated"], stats["collected"], stats["withdrawn"], stats["cleaned"])
     return stats
 
@@ -393,6 +564,12 @@ def reset_stale_generating() -> int:
             if rec.get("state") == GENERATING:
                 task.recording = {**rec, "state": GEN_FAILED, "error": "后端重启，生成中断",
                                   "failed_at": "", "stage": "", "note": ""}
+                n += 1
+        # 以前账号出问题时失败次数是记到题头上的，一整队被刷到自动重试上限。清回去
+        for task in db.execute(select(Task).where(Task.recording_json.like('%"failed"%'))).scalars():
+            rec = task.recording or {}
+            if rec.get("state") == GEN_FAILED and not rec.get("account") and account_error(rec.get("error") or ""):
+                task.recording = {**rec, "account": True, "fails": 0, "failed_at": ""}
                 n += 1
     return n
 
@@ -551,7 +728,8 @@ def overview() -> dict:
         "available": ok, "message": why, "device": me,
         "role": "recorder" if rec_repo.recorder_only() else "producer",
         "repo": rec_repo.repo_slug(), "auto_generate": auto_generate(),
-        "max_parallel": max_parallel(), "generating": len(_gen_jobs),
+        "max_parallel": max_parallel(), "generating": len(_gen_jobs), "calls": running_calls(),
+        "batch_size": batch_size(), "model": model(), "paused": paused(),
         "skill_missing": rec_report.preflight(),
         "last_scan": dict(_last_scan), "local": local, "queue": queue,
         "now": time.time(),
