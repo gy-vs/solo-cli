@@ -84,6 +84,11 @@ SPECS: tuple[Spec, ...] = (
               "那套判据收紧：一侧二十步但啃了两小时，那道题未必简单"),
     Spec("difficulty.probe_minutes", "探路：先跑完那一侧低于这个用时才算轻（分钟）", "难度筛选",
          default="30", kind="number"),
+    Spec("difficulty.hard_steps", "单侧步数硬下限：任一侧跑完低于这个步数整题废弃", "难度筛选",
+         default="20", kind="number",
+         help="不看用时，也不看另一侧是排队还是已经在跑：一侧十来步就收工，说明题面对模型"
+              "没构成难度，另一侧跑得再久也比不出东西，在跑的那台容器一并停掉。"
+              "用时撑得长多半是在网关重试或空转上耗的，不代表题难。填 0 关掉"),
     Spec("difficulty.screen", "跑完先筛一遍难度", "难度筛选", default="1", kind="bool",
          help="两侧都跑得太轻的题在开 GSB 分析之前就废弃掉，省下那次分析与两道质检的额度。"
               "废弃的题进废弃列表，按「恢复」就能捞回来接着分析，恢复之后不再按阈值筛。"
@@ -144,6 +149,19 @@ SPECS: tuple[Spec, ...] = (
               "同基底的不同功能点在 0.3 上下，0.45 落在两者之间。往低调更容易误杀真题，"
               "但被拒的候选只是没落地、日志里写明了相似度和撞的是哪道题；往高调会漏掉"
               "同义改写的重复题，代价是两个容器白跑两小时"),
+    Spec("rec.enabled", "启用录屏协作", "录屏协作", default="0", kind="bool",
+         help="题进待录屏后自动按 solo-report 生成录屏文档并推到录屏仓库，录屏端在「录屏录制处理」"
+              "页拉取、录完回传视频，本机自动收回，题进「可上传」。设备标识沿用本机标识（pool.device），"
+              "Token 沿用 GitHub Token"),
+    Spec("rec.repo", "录屏仓库", "录屏协作",
+         help="GitHub 私有仓库 owner/repo，出题端与录屏端填同一个。不存在会自动建成 private。"
+              "不要用题库仓库或任何一道题的作答仓库：作答仓库只许有 main/A/B 三个分支"),
+    Spec("rec.recorder_only", "本机只做录屏", "录屏协作", default="0", kind="bool",
+         help="录屏端打开：不生成文档、不收视频，只在录屏页认领、录制、回传"),
+    Spec("rec.auto_generate", "自动生成录屏文档", "录屏协作", default="1", kind="bool",
+         help="题一进待录屏就排队生成；关掉则只在录屏页手动点「生成」"),
+    Spec("rec.max_parallel", "文档生成并发", "录屏协作", default="2", kind="number",
+         help="同时写录屏文档的道数。每道要调模型写片段、再跑 PowerShell 校验，十分钟上下"),
 )
 SPEC_BY_KEY = {s.key: s for s in SPECS}
 

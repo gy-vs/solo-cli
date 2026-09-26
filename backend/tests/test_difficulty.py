@@ -397,11 +397,44 @@ def test_the_probe_keeps_quiet_when_the_peer_is_already_running(task_with_runs, 
     from app.db import session
 
     task_id, ids = task_with_runs
-    _one_finished(ids, side="A", steps=18, minutes=11, peer=m.RUN_RUNNING)
+    _one_finished(ids, side="A", steps=25, minutes=11, peer=m.RUN_RUNNING)
 
     assert asyncio.run(wd._scan_probe()) == 0
     with session() as db:
         assert db.get(m.Task, task_id).status != m.DISCARDED
+
+
+HARD_TH = {**PROBE_TH, "hard_steps": 20}
+
+
+def test_below_the_hard_floor_only_steps_count():
+    """6 步耗了 30.3 分钟的那道题：用时撑长了，步数已经说明它没构成难度。"""
+    assert df.probe_judge(6, 30.3, HARD_TH)[0] == df.DISCARD
+    assert df.probe_judge(6, None, HARD_TH)[0] == df.DISCARD
+    assert df.probe_judge(20, 95, HARD_TH)[0] == df.PASS
+
+
+def test_the_hard_floor_can_be_turned_off():
+    assert df.probe_judge(6, 30.3, {**PROBE_TH, "hard_steps": 0})[0] == df.PASS
+
+
+def test_the_hard_floor_discards_even_while_the_peer_runs(task_with_runs, no_push):
+    """另一侧跑下去也必然被筛掉，停掉它才是省。"""
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _one_finished(ids, side="A", steps=6, minutes=31, peer=m.RUN_RUNNING)
+
+    assert asyncio.run(wd._scan_probe()) == 1
+    with session() as db:
+        task = db.get(m.Task, task_id)
+        assert task.status == m.DISCARDED
+        assert "硬下限" in task.auto_error
+
+
+def test_the_post_run_screen_also_applies_the_hard_floor():
+    verdict, reason = df.judge({"A": 6, "B": 150}, {"A": 31, "B": 100}, {**TH, "hard_steps": 20})
+    assert verdict == df.DISCARD and "硬下限" in reason
 
 
 def test_the_probe_lets_a_heavy_first_side_through(task_with_runs, no_push):

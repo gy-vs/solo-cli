@@ -32,7 +32,7 @@ async function doSync() {
     await Promise.all([refreshTasks(), refreshStatus()])
   } catch (e: any) { msg.error(e.message) } finally { syncing.value = false }
 }
-const pipeline: Status[] = ['AVAILABLE', 'QUEUED', 'RUNNING', 'RUN_DONE', 'ANALYZED', 'QC', 'UPLOADED', 'DONE']
+const pipeline: Status[] = ['AVAILABLE', 'QUEUED', 'RUNNING', 'RUN_DONE', 'ANALYZED', 'QC', 'READY', 'UPLOADED', 'DONE']
 const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => !t.screencast?.[x])
 </script>
 

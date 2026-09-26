@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.models import Task, TaskRun
+from app.models import SETTLING, Task, TaskRun
 from app.services import gsb_factcheck, gsb_precheck, gsb_repo, scope
 
 
@@ -183,6 +183,10 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "factcheck_notes": factcheck.get("notes") or [],
         "factcheck_summary": factcheck.get("summary") or factcheck.get("error") or "",
         "factcheck_stale": gsb_factcheck.stale(t),
+        # 事实核验没放行时给人看的那句话。理由核对过了、只是交付完整性没对上的题，
+        # mismatches 是 0，照着它拼只会得出一句「0 处不符」，人看不懂卡在哪
+        "factcheck_block": gsb_factcheck.factcheck_block(t) if t.status in SETTLING else "",
+        "factcheck_auto_retries": int(factcheck.get("auto_retries") or 0),
         # 难度筛选结论。整份给出去而不是摊成扁平字段：里面是两侧的四个数加一句话，
         # 界面上要么不显示、要么就得把数字一起显示出来，摊开反而要在前端拼回去。
         "difficulty_screen": t.difficulty_screen,

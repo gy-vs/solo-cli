@@ -12,6 +12,7 @@ from app import config
 from app.db import init_db
 from app.routers import design as design_router
 from app.routers import host as host_router
+from app.routers import recording as recording_router
 from app.routers import settings as settings_router
 from app.routers import system as system_router
 from app.routers import tasks as tasks_router
@@ -77,8 +78,17 @@ async def lifespan(_: FastAPI):
              "不符处直接订正）与措辞质检，都放行才进待录屏；卡住的由巡检补跑")
     # 录屏是整条流水线上唯一还等人的一步，而人手上只有两个文件路径。把这条命令印在
     # 启动日志里，省得下次要交录屏时先去翻文档找它叫什么
-    log.info("录屏    : 录完交上来 → "
-             "docker compose exec backend python -m app.cli deliver 题号 A.mp4 B.mp4")
+    from app.services import rec_repo
+
+    rec_ok, rec_why = rec_repo.available()
+    if rec_ok:
+        log.info("录屏    : 协作已启用，仓库 %s，本机%s；页面 http://localhost:%s/recording",
+                 rec_repo.repo_slug(),
+                 "只做录屏" if rec_repo.recorder_only() else "自动生成文档并收回视频",
+                 config.HOST_PORT)
+    else:
+        log.info("录屏    : 协作未启用（%s）；手工交付 → "
+                 "docker compose exec backend python -m app.cli deliver 题号 A.mp4 B.mp4", rec_why)
     log.info("=" * 60)
     yield
     await scheduler.stop()
@@ -91,6 +101,7 @@ app.include_router(settings_router.router)
 app.include_router(tasks_router.router)
 app.include_router(design_router.router)
 app.include_router(host_router.router)
+app.include_router(recording_router.router)
 
 
 @app.exception_handler(Exception)

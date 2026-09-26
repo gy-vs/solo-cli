@@ -97,6 +97,10 @@ _PUSH_FAILURES = (
     ("cannot lock ref", "远端这个分支正被另一次推送占用，稍后重试即可"),
     ("failed to lock", "远端这个分支正被另一次推送占用，稍后重试即可"),
     ("protected branch", "这个分支在远端是受保护的，推不上去"),
+    # push 已经带了 --no-verify，走到这里说明钩子是从别处注入的（全局 core.hooksPath 之类）
+    ("hook exited", "仓库的推送钩子失败了（如 husky 的 pre-push），检查全局 git 钩子配置"),
+    ("gnutls_handshake", "和 GitHub 的 TLS 连接被中途掐断，网络抖动，稍后会自动重试"),
+    ("tls connection", "和 GitHub 的 TLS 连接被中途掐断，网络抖动，稍后会自动重试"),
     ("authentication failed", "GitHub Token 认证没过，到设置页换一个"),
     ("403", "Token 没有这个仓库的写权限"),
     ("could not resolve host", "连不上 GitHub，检查网络"),
@@ -412,6 +416,28 @@ async def diverged_detail(ws: Path, repo_url: str, side: str, *, known: set[str]
     return f"{sha[:12]}（{subject}）" if subject else sha[:12]
 
 
+STALE_LOCK_S = 600
+
+
+def clear_stale_index_lock(ws: Path) -> bool:
+    """删掉明显是崩溃遗留的 .git/index.lock。返回有没有删。
+
+    推产物之前容器已经销毁，模型那边不可能还有 git 在跑；锁文件放了十分钟以上，
+    只能是哪个 git 进程被杀时没来得及收。不删的话 git add 每轮都报 File exists，
+    这道题永远推不上去。十分钟以内的不碰：可能真有人在这个目录里敲 git。
+    """
+    lock = ws / ".git" / "index.lock"
+    try:
+        age = datetime.now().timestamp() - lock.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    if age < STALE_LOCK_S:
+        return False
+    lock.unlink(missing_ok=True)
+    log.warning("%s 的 index.lock 已放了 %.0f 分钟，按崩溃遗留删掉", ws, age / 60)
+    return True
+
+
 def commit_message(task_no: str, side: str, session_id: str) -> str:
     return (f"solo {task_no} · {side}\n\n"
             f"SessionID: {session_id or '-'}\n")
@@ -463,6 +489,7 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
         return {"ok": False, "message": f"{side} 侧工作区没有改动，这一跑没有产出，不能当作产物提交"}
 
     if changed:
+        clear_stale_index_lock(ws)
         # add / commit 的参数里没有凭据，stderr 可以带给调用方帮人定位问题
         add = await _git(ws, "add", "-A", timeout=180)
         if not add.ok:
@@ -492,9 +519,11 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
     # 凭据走临时 credential helper，不用带 token 的 URL——push 失败时 git 会把命令行
     # 回显进 stderr，URL 里的 token 就跟着漏出去了。-c 必须放在 push 之前，放后面
     # git 会把它当成 push 的参数。目标写 origin：上面已经核对过它和题块仓库是同一个，
-    # 而测试里的 origin 是本地裸仓库，这样不用联网也能走通整条 push 链路
+    # 而测试里的 origin 是本地裸仓库，这样不用联网也能走通整条 push 链路。
+    # --no-verify 和 commit 那边同一个理由：husky 的 pre-push 要 yarn / npx，这个容器里
+    # 没有，钩子一挂推送就失败，而且每轮巡检都照样失败一次。
     push = await dockerx.run(
-        ["git", "-C", str(ws), *credential_args(repo_url), "push", "origin",
+        ["git", "-C", str(ws), *credential_args(repo_url), "push", "--no-verify", "origin",
          f"HEAD:refs/heads/{side}"], timeout=300,
     )
     if not push.ok:

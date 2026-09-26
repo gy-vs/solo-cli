@@ -323,7 +323,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
     async with _client() as c:
         items = await _tasks(c)
     checking = [t for t in items if t["status"] == "ANALYZED"]
-    recording = [t for t in items if t["status"] == "QC"]
+    recording = [t for t in items if t["status"] in ("QC", "READY")]
     if not checking and not recording:
         print("没有在质检或录屏这两步上的题。")
         return 0
@@ -361,7 +361,8 @@ async def cmd_submit(args: argparse.Namespace) -> int:
             if missing:
                 print(f"这些题号在库里找不到：{'、'.join(missing)}", file=sys.stderr)
         else:
-            ids = [t["id"] for t in items if t["status"] == "QC" and not t.get("precheck_block")]
+            ids = [t["id"] for t in items
+                   if t["status"] in ("QC", "READY") and not t.get("precheck_block")]
         nos = {t["id"]: t["task_no"] for t in items}
         if not ids:
             print("没有质检放行、可以提交的题。先跑 precheck，或者在界面上确认放行。")

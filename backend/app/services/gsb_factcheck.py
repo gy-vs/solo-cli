@@ -38,8 +38,8 @@ from app import config
 from app.db import session
 from app.events import bus
 from app.models import (
-    ANALYZED, FACTCHECK_CONFIRMED, FACTCHECK_ERROR, FACTCHECK_FAIL, FACTCHECK_IDLE,
-    FACTCHECK_OK, FACTCHECK_PASS, FACTCHECK_RUNNING, PRECHECK_IDLE, QC, Task, utc_now,
+    FACTCHECK_CONFIRMED, FACTCHECK_ERROR, FACTCHECK_FAIL, FACTCHECK_IDLE,
+    FACTCHECK_OK, FACTCHECK_PASS, FACTCHECK_RUNNING, PRECHECK_IDLE, SETTLING, Task, utc_now,
 )
 from app.services import gsb_analyzer, gsb_attribution, gsb_rules, llm
 
@@ -774,7 +774,7 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
             return {"ok": False, "message": "题目不存在"}
         if task.factcheck_status == FACTCHECK_RUNNING:
             return {"ok": False, "message": "这道题的事实核验正在跑"}
-        if task.status not in (ANALYZED, QC):
+        if task.status not in SETTLING:
             return {"ok": False, "message": f"状态 {task.status} 不用做事实核验"}
         gsb = task.gsb or {}
         reason = gsb.get("reason") or ""
@@ -783,8 +783,10 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
             return {"ok": False, "message": "还没有理由正文，先跑 GSB 分析"}
         gsb = dict(gsb)
         prev_status, prev = task.factcheck_status, dict(task.factcheck or {})
+        # 看门狗自动重核的次数，要跨过这一次一直带下去，见 watchdog._retry_failed_checks
+        auto_retries = int(prev.get("auto_retries") or 0)
         task.factcheck_status = FACTCHECK_RUNNING
-        task.factcheck = {"started_at": utc_now().isoformat()}
+        task.factcheck = {"started_at": utc_now().isoformat(), "auto_retries": auto_retries}
     bus.publish("tasks", {"type": "task", "id": task_id})
 
     started = time.time()
@@ -804,7 +806,8 @@ async def run_factcheck(task_id: int, *, apply: bool = True) -> dict:
             "attribution": attribution,
             "attribution_version": ATTRIBUTION_VERSION,
             "attribution_sides": [s for s in config.SIDES if corpora.get(s)],
-            "finished_at": utc_now().isoformat()}
+            "finished_at": utc_now().isoformat(),
+            "auto_retries": auto_retries}
     if not any((facts.get(s) or {}).get("steps_total") for s in config.SIDES):
         # 两侧都没有轨迹就核不了。判 ERROR 而不是 PASS：PASS 的意思是「对过了，没问题」，
         # 而这里是「压根没对」，拿它当通过会让一道无从核验的题一路走到提交。
@@ -1100,7 +1103,7 @@ def skip_reason(task: Task) -> str:
     剔除要在发出去之前做：批量一次勾一百多道，里面多半有已经核过的，照单发出去
     就是照单烧钱。口径写在这里给批量入口和看门狗共用。
     """
-    if task.status not in (ANALYZED, QC):
+    if task.status not in SETTLING:
         return f"状态 {task.status} 不用做事实核验"
     if task.factcheck_status == FACTCHECK_RUNNING:
         return "事实核验正在跑"

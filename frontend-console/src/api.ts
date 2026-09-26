@@ -30,7 +30,7 @@ const put = <T>(p: string, body?: any) => request<T>(p, { method: 'PUT', body: J
 /** 题级状态：只描述这道题走到哪一步，单侧容器跑得怎样看 TaskRun.status */
 export type Status =
   | 'AVAILABLE' | 'CLAIMED' | 'QUEUED' | 'RUNNING' | 'RUN_DONE' | 'ANALYZING'
-  | 'ANALYZED' | 'QC' | 'UPLOADED' | 'DONE' | 'NEEDS_ATTENTION' | 'DISCARDED'
+  | 'ANALYZED' | 'QC' | 'READY' | 'UPLOADED' | 'DONE' | 'NEEDS_ATTENTION' | 'DISCARDED'
 
 /** 提交前质检走到哪一档。ERROR 是质检自己没跑成，和 FAIL 不是一回事 */
 export type PrecheckStatus = 'IDLE' | 'RUNNING' | 'PASS' | 'FAIL' | 'CONFIRMED' | 'ERROR'
@@ -141,6 +141,10 @@ export interface TaskBrief {
   /** 订正留痕，一处一句：哪一段哪一句、轨迹里其实是什么、改成了什么 */
   factcheck_notes: string[]
   factcheck_summary: string
+  /** 事实核验没放行时给人看的原话，放行了是空串 */
+  factcheck_block: string
+  /** 看门狗已经自动重跑过几次（上限 2 次，用完才真正留给人） */
+  factcheck_auto_retries: number
   factcheck_stale: boolean
   /** 难度筛选：跑完之后按两侧步数与用时判这道题值不值得花一次分析额度 */
   difficulty_screen: DifficultyScreen
@@ -433,6 +437,7 @@ export interface SystemStatus {
     draftless: number
   }
   design: { running: number[] }
+  rec?: { enabled: boolean; recorder_only: boolean }
   /** 后台批量质检的进度。整批要跑几个小时，进度搭状态接口这趟车 */
   precheck: PrecheckJob
   counts: Record<Status, number>
@@ -676,4 +681,118 @@ export const api = {
   designRun: (id: number) => get<DesignRun & { tasks: TaskBrief[] }>(`/api/design/${id}`),
   designCancel: (id: number) => post<{ ok: boolean }>(`/api/design/${id}/cancel`),
   designDedup: (ids: number[]) => post<{ ok: boolean; passed: number; discarded: number }>('/api/design/dedup', { ids }),
+
+  // ---- 录屏录制处理 ----
+  rec: () => get<RecOverview>('/api/rec'),
+  recSync: () => post<{ ok: boolean; message?: string; stats?: Record<string, any> }>('/api/rec/sync'),
+  recGenerate: (taskId: number) => post<{ ok: boolean; message: string }>(`/api/rec/tasks/${taskId}/generate`),
+  recWithdraw: (taskId: number) => post<{ ok: boolean; message: string }>(`/api/rec/tasks/${taskId}/withdraw`),
+  recLocalReport: async (taskId: number) => {
+    const res = await fetch(`/api/rec/tasks/${taskId}/report`)
+    const text = await res.text()
+    if (!res.ok) {
+      let detail: any = text
+      try { detail = JSON.parse(text)?.detail ?? text } catch { /* 纯文本 */ }
+      throw new ApiError(res.status, detail)
+    }
+    return text
+  },
+  recClaim: (key: string) => post<RecReport>('/api/rec/claim', { key }),
+  recReport: (key: string) => get<RecReport>(`/api/rec/report?key=${encodeURIComponent(key)}`),
+  recRelease: (key: string) => post<{ ok: boolean; message: string }>('/api/rec/release', { key }),
+  recVideos: async (key: string, files: { A?: File | null; B?: File | null }, paths: { A?: string; B?: string } = {}) => {
+    const form = new FormData()
+    form.append('key', key)
+    if (files.A) form.append('a', files.A)
+    if (files.B) form.append('b', files.B)
+    if (paths.A) form.append('a_path', paths.A)
+    if (paths.B) form.append('b_path', paths.B)
+    const res = await fetch('/api/rec/videos', { method: 'POST', body: form })
+    const text = await res.text()
+    let body: any = null
+    try { body = text ? JSON.parse(text) : null } catch { body = text }
+    if (!res.ok) throw new ApiError(res.status, body?.detail ?? body)
+    return body as { ok: boolean; message: string }
+  },
+}
+
+// ---------- 录屏协作 ----------
+/** 录屏仓库里一道题此刻的状态（按事件流折叠出来） */
+export type RecEntryState = 'open' | 'claimed' | 'recorded' | 'collected' | 'withdrawn'
+
+export interface RecEntry {
+  key: string
+  owner: string
+  task_no: string
+  state: RecEntryState
+  digest: string
+  title: string
+  kind_label: string
+  verdict: string
+  repo_url: string
+  branch: string
+  published_at: string
+  claimed_by: string
+  claimed_at: string
+  recorded_by: string
+  recorded_at: string
+  collected_at: string
+}
+
+export interface RecQueueItem extends RecEntry {
+  mine: boolean
+  claimed_by_me: boolean
+  recorded_by_me: boolean
+}
+
+/** 本机题目的录屏进度（题上的 recording 字段） */
+export interface RecLocal {
+  id: number
+  task_no: string
+  status: Status
+  question_type: string
+  difficulty: string
+  verdict: string
+  recording: {
+    state?: 'generating' | 'failed' | 'published' | 'collected' | 'withdrawn'
+    stage?: string
+    note?: string
+    error?: string
+    fails?: number
+    rounds?: number
+    model?: string
+    kind_label?: string
+    started_at?: string
+    published_at?: string
+    collected_at?: string
+    collect_error?: string
+    recorded_by?: string
+  }
+  generating: boolean
+  collecting: boolean
+  screencast: Record<string, string>
+  submit_block: string
+  entry: RecEntry | null
+  need: string
+}
+
+export interface RecOverview {
+  available: boolean
+  message: string
+  device: string
+  role: 'producer' | 'recorder'
+  repo: string
+  auto_generate: boolean
+  max_parallel: number
+  generating: number
+  skill_missing: string[]
+  last_scan: { at?: string; error?: string; generated?: number; collected?: number; withdrawn?: number }
+  local: RecLocal[]
+  queue: RecQueueItem[]
+}
+
+export interface RecReport {
+  ok: boolean
+  entry: RecEntry
+  markdown: string
 }

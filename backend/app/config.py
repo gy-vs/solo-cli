@@ -34,6 +34,9 @@ HOST_AGENT_URL = _env("HOST_AGENT_URL") or "http://host.docker.internal:8790"
 # 出题规则的唯一来源就是这个目录下的 solo-prompt skill，不在本项目里另存一份。
 SKILL_DIR_MOUNT = Path(_env("SKILL_DIR_MOUNT") or str(Path.home() / ".cursor" / "skills"))
 SKILL_NAME = "solo-prompt"
+# 同一个 skills 目录在宿主机上的路径。录屏文档校验要把 skill 自带的 ps 脚本挂进
+# powershell 容器，docker -v 的源由宿主 daemon 解析，容器里的 /host/skills 它不认。
+SKILL_DIR_HOST = _env("SKILL_DIR_HOST") or str(SKILL_DIR_MOUNT)
 # CLI 只认这四个固定位置下的 skill，给不了自定义目录参数，所以把挂载点链过去。
 # 详见 llm.ensure_skills_linked。
 SKILL_LINK = Path.home() / ".cursor" / "skills"

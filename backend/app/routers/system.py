@@ -64,6 +64,9 @@ async def system_status() -> dict:
                   "image": settings_store.get("qc.image")},
         "pool": pool.snapshot(),
         "design": {"running": sorted(designer.running)},
+        # 录屏端的侧栏只留录屏页和设置，界面要先知道本机是哪个角色
+        "rec": {"enabled": settings_store.get_bool("rec.enabled", False),
+                "recorder_only": settings_store.get_bool("rec.recorder_only", False)},
         # 批量质检要跑几个小时，进度搭这趟车：页面每次 SSE 刷新本来就会拉一次状态，
         # 单给这个数字再开一条轮询不值当
         "precheck": gsb_precheck.job(),

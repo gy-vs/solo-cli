@@ -258,6 +258,44 @@ def test_a_repo_commit_hook_cannot_block_the_archive(cloned):
     assert r["ok"] is True, r.get("message")
 
 
+def test_a_repo_push_hook_cannot_block_the_archive(cloned):
+    """题 501 就卡在这：husky 的 pre-push 要 yarn，commit 带了 --no-verify 而 push 没带。"""
+    hooks = cloned["ws"] / ".git" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-push"
+    hook.write_text("#!/bin/sh\necho 'yarn: not found' >&2\nexit 127\n", encoding="utf-8")
+    hook.chmod(0o755)
+    (cloned["ws"] / "one.py").write_text("1\n", encoding="utf-8")
+
+    r = asyncio.run(gsb_repo.commit_and_push(
+        "07", cloned["repo"], "A", cloned["sha"], message="m"))
+
+    assert r["ok"] is True, r.get("message")
+
+
+def test_a_crashed_git_leaves_no_permanent_index_lock(cloned):
+    """题 440 就卡在这：两天前留下的 index.lock，git add 每轮都报 File exists。"""
+    import os
+
+    lock = cloned["ws"] / ".git" / "index.lock"
+    lock.write_text("", encoding="utf-8")
+    old = lock.stat().st_mtime - gsb_repo.STALE_LOCK_S - 60
+    os.utime(lock, (old, old))
+    (cloned["ws"] / "one.py").write_text("1\n", encoding="utf-8")
+
+    r = asyncio.run(gsb_repo.commit_and_push(
+        "07", cloned["repo"], "A", cloned["sha"], message="m"))
+
+    assert r["ok"] is True, r.get("message")
+
+
+def test_a_fresh_index_lock_is_left_alone(cloned):
+    lock = cloned["ws"] / ".git" / "index.lock"
+    lock.write_text("", encoding="utf-8")
+    assert gsb_repo.clear_stale_index_lock(cloned["ws"]) is False
+    assert lock.exists()
+
+
 # ---------------- push 失败要说人话，但不能带出 token ----------------
 
 @pytest.mark.parametrize("err, expect", [
@@ -267,6 +305,8 @@ def test_a_repo_commit_hook_cannot_block_the_archive(cloned):
     ("remote: Permission denied\nfatal: Authentication failed for 'https://github.com/a/b'",
      "认证"),
     ("fatal: could not resolve host: github.com", "连不上"),
+    ("fatal: unable to access 'https://github.com/a/b/': gnutls_handshake() failed: "
+     "The TLS connection was non-properly terminated.", "TLS"),
 ])
 def test_push_failure_is_explained_without_leaking_the_token(err, expect):
     """网络抖一下也会走到失败分支，一律说成「检查写权限」会把人带偏。

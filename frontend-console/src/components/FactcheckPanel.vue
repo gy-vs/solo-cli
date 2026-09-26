@@ -106,6 +106,7 @@ function confirm() {
         {{ hasReport ? '重跑核验' : '跑核验' }}
       </NButton>
     </div>
+    <div v-if="status === 'FAIL' && task.factcheck_block" class="text-xs text-err">{{ task.factcheck_block }}</div>
 
     <!-- 还没跑过：说清这一步在判什么。它和措辞质检最容易被当成一回事 -->
     <div v-if="!hasReport" class="inner p-3 text-xs text-fg1 leading-6">

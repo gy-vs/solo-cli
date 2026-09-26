@@ -74,7 +74,7 @@ async function load(keepEdits = false) {
     if (!pairEnded(t)) tab.value = t.runs?.length ? 'runs' : 'prompt'
     else if (t.status === 'ANALYZED') {
       tab.value = needsHand(t) ? 'precheck' : 'gsb'
-    } else if (t.status === 'QC' || t.status === 'UPLOADED' || t.status === 'DONE') {
+    } else if (t.status === 'QC' || t.status === 'READY' || t.status === 'UPLOADED' || t.status === 'DONE') {
       tab.value = SIDES.every((s) => t.screencast?.[s]) ? 'gsb' : 'screencast'
     } else tab.value = 'runs'
   }
@@ -136,7 +136,7 @@ const gsbDot = computed(() => {
  * 拿它点灯会让每一道待质检的题都亮着橙点，等于没点。 */
 const precheckDot = computed(() => {
   const t = task.value
-  if (!t || (t.status !== 'QC' && t.status !== 'ANALYZED')) return ''
+  if (!t || !['QC', 'READY', 'ANALYZED'].includes(t.status)) return ''
   if (t.factcheck_status === 'RUNNING' || t.precheck_status === 'RUNNING') return 'bg-run animate-breathe'
   if (t.factcheck_status === 'FAIL' || t.factcheck_status === 'ERROR') return 'bg-err'
   if (t.precheck_status === 'ERROR') return 'bg-err'
@@ -349,7 +349,7 @@ const payloadPreview = computed<[string, string][]>(() => {
         <StatusPill :status="task.status" />
         <span v-if="task.analysis_status === 'RUNNING'" class="pill text-run border-run/50"><span class="dot bg-run animate-breathe" />对比分析中</span>
         <span v-else-if="task.analysis_status === 'FAILED'" class="pill text-err border-err/50">分析失败</span>
-        <PrecheckPill v-if="task.status === 'QC' || task.status === 'ANALYZED'"
+        <PrecheckPill v-if="['QC', 'READY', 'ANALYZED'].includes(task.status)"
           :status="task.precheck_status" :issues="task.precheck_issues"
           :stale="task.precheck_stale" small />
         <span v-if="task.gsb_verdict" class="pill" :style="{ color: SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1, borderColor: (SIDE_HEX[task.gsb_verdict as Side] || HEX.fg1) + '55' }">
@@ -410,7 +410,7 @@ const payloadPreview = computed<[string, string][]>(() => {
           把视频路径贴回录屏页，系统会收下、代传并直接提交。
         </span>
       </div>
-      <div v-if="task.status === 'QC' && screencastReady && task.precheck_block"
+      <div v-if="(task.status === 'QC' || task.status === 'READY') && screencastReady && task.precheck_block"
         class="mt-3 text-xs text-warn flex items-start gap-1.5">
         <span class="dot mt-1.5 shrink-0 bg-warn" />
         <span>{{ task.precheck_block }}</span>
@@ -421,8 +421,9 @@ const payloadPreview = computed<[string, string][]>(() => {
         class="mt-3 text-xs text-err flex items-start gap-1.5">
         <span class="dot mt-1.5 shrink-0 bg-err" />
         <span>
-          事实核验发现 {{ task.factcheck_mismatches }} 处描述和轨迹对不上，自动订正没成功。
+          {{ task.factcheck_block || '事实核验没放行' }}。
           去「提交前质检」页看是哪几处——报告里写了轨迹里实际是什么，照着改完确认就行。
+          <template v-if="task.factcheck_auto_retries < 2">看门狗也会在十分钟后自动重核一次。</template>
         </span>
       </div>
       <div v-else-if="task.status === 'ANALYZED' && task.precheck_status === 'FAIL'"
@@ -449,7 +450,7 @@ const payloadPreview = computed<[string, string][]>(() => {
         难度筛选未通过：{{ task.difficulty_screen.reason }}。这一步在 GSB 分析之前，所以还没有花掉分析额度。
         按「恢复」就能把它捞回来接着分析，恢复之后不再按阈值筛这道题。
       </div>
-      <div v-if="!canUpload && task.status === 'QC' && verifyReport?.overall === 'block'" class="mt-3 text-xs text-err">
+      <div v-if="!canUpload && (task.status === 'QC' || task.status === 'READY') && verifyReport?.overall === 'block'" class="mt-3 text-xs text-err">
         自检存在红项，上传按钮已禁用。
       </div>
     </div>

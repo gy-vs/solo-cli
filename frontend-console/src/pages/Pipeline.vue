@@ -23,7 +23,7 @@ const router = useRouter()
 const msg = useMessage()
 const dialog = useDialog()
 
-type TabKey = 'running' | 'failed' | 'pending' | 'qc' | 'screencast' | 'submitted'
+type TabKey = 'running' | 'failed' | 'pending' | 'qc' | 'screencast' | 'ready' | 'submitted'
 
 const TABS: {
   key: TabKey; label: string; statuses: Status[]; desc: string; empty: string
@@ -57,9 +57,15 @@ const TABS: {
   },
   {
     key: 'screencast', label: '待录屏', statuses: ['QC'],
-    desc: '质检放行了，理由不会再动，照着它录就行。录完把视频路径贴进详情页，'
-      + '系统收下、代传、直接提交',
+    desc: '质检放行了，理由不会再动，照着它录就行。启用录屏协作后，录屏文档自动生成并发给录屏端，'
+      + '视频回传后自动收下、代传，题进「可上传」；也可以自己录完把视频路径贴进详情页',
     empty: '没有等着录屏的题',
+    pick: true,
+  },
+  {
+    key: 'ready', label: '可上传', statuses: ['READY'],
+    desc: '质检放行、两侧录屏也到位了，只差人点一下提交。勾选后可以整批提交',
+    empty: '没有可以直接提交的题',
     pick: true,
   },
   {
@@ -155,7 +161,9 @@ function stage(t: TaskBrief): { text: string; cls: string } {
     // 事实那一道排在措辞前面，所以卡在哪一道就说哪一道，别笼统说「质检没过」——
     // 两者该做的动作完全不同：一个是回去核对轨迹，一个是改句子
     if (t.factcheck_status === 'FAIL') {
-      return { text: `事实核验有 ${t.factcheck_mismatches} 处与轨迹不符，改完确认`, cls: 'text-err' }
+      // 自动重跑还没用完时，看门狗十分钟后会自己再核一次，别让人急着动手
+      const auto = t.factcheck_auto_retries < 2 ? '，看门狗稍后自动重核' : '，已自动重核 2 次，需人工'
+      return { text: (t.factcheck_block || '事实核验没放行') + auto, cls: 'text-err' }
     }
     if (t.factcheck_status === 'ERROR') return { text: t.factcheck_summary || '事实核验没跑完', cls: 'text-err' }
     if (t.precheck_status === 'FAIL') {
@@ -173,6 +181,10 @@ function stage(t: TaskBrief): { text: string; cls: string } {
     // 别在前端翻译一遍 —— 翻译的版本和点下去被回绝的理由对不上，人会以为是两个问题
     if (t.precheck_block) return { text: t.precheck_block, cls: 'text-warn' }
     return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 录屏已齐，可提交`, cls: 'text-ok' }
+  }
+  if (t.status === 'READY') {
+    if (t.precheck_block) return { text: t.precheck_block, cls: 'text-warn' }
+    return { text: `${VERDICT_LABEL[t.gsb_verdict as 'A'] || '结论已出'} · 录屏已到位，可提交`, cls: 'text-ok' }
   }
   if (t.status === 'UPLOADED') return { text: `已提交 #${t.submission_id ?? ''}`, cls: 'text-info' }
   if (t.status === 'DONE') return { text: '已完成并清理', cls: 'text-fg2' }
@@ -201,7 +213,7 @@ function badSides(t: TaskBrief): Side[] {
 const liveSides = (t: TaskBrief) => t.runs.filter((r) => r.status === 'RUNNING').map((r) => r.side)
 /** 待质检和待录屏两栏都把「A/B 用时」那列换成质检结果：结论早写完了，这时候该横着比的
  *  是哪几道理由还要改 */
-const showPrecheck = computed(() => tab.value === 'qc' || tab.value === 'screencast')
+const showPrecheck = computed(() => tab.value === 'qc' || tab.value === 'screencast' || tab.value === 'ready')
 /** 这一稿还没问过模型才值得再跑一次。判了待改的也算「已有结论」—— 理由没改就再问一遍，
  *  挑出来的还是那几处。ERROR 例外，那是没跑成，重跑正是该做的事。
  *
@@ -484,7 +496,7 @@ const cols = computed(() => (current.value.pick
         @click="batchPrecheck">
         批量质检（{{ pickedCount }}）
       </NButton>
-      <NButton v-if="tab === 'qc'" size="small" type="info" :loading="batching" @click="batchUpload">
+      <NButton v-if="tab === 'qc' || tab === 'ready'" size="small" type="info" :loading="batching" @click="batchUpload">
         批量提交（{{ pickedCount }}）
       </NButton>
       <NButton v-if="pickedCount < counts[tab]" size="small" tertiary @click="pickAll">
@@ -582,7 +594,7 @@ const cols = computed(() => (current.value.pick
             </NButton>
           </template>
 
-          <template v-if="tab === 'qc'">
+          <template v-if="tab === 'qc' || tab === 'ready'">
             <!-- 判了「待人工改」的题要逐条看 issues 才知道改哪句，所以给的动作是进详情页，
                  不是在这一行里塞一个编辑框 -->
             <NButton v-if="t.precheck_block" size="tiny" type="primary" secondary

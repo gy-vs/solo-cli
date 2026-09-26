@@ -38,7 +38,8 @@ from app.db import session
 from app.events import bus
 from app.models import (
     ANALYSIS_FAILED, ANALYSIS_IDLE, ANALYSIS_RUNNING, ANALYZED, ANALYZING, DISCARDED,
-    FACTCHECK_IDLE, NEEDS_ATTENTION, PRECHECK_IDLE, QC, QUEUED, RUN_DONE,
+    FACTCHECK_FAIL, FACTCHECK_IDLE, FACTCHECK_RUNNING, NEEDS_ATTENTION, PRECHECK_FAIL,
+    PRECHECK_IDLE, PRECHECK_RUNNING, QUEUED, RUN_DONE,
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
     RUN_TIMEOUT, SCHEDULABLE, SETTLING, WATCHED, RunEvent, Task, TaskRun, as_utc, utc_now,
 )
@@ -589,7 +590,15 @@ async def run_quality_gate(task_id: int) -> dict:
     """
     from app.services import gsb_factcheck, gsb_precheck, gsb_verifier
 
-    fact = await gsb_factcheck.run_factcheck(task_id)
+    # 事实那一档已经放行、理由也没再改过，就不再核一遍。只剩措辞没过的题被放回来重跑时，
+    # 整段重核不光白花一次调用，还可能把一段已经核对过的正文又改掉一遍。
+    with session() as db:
+        t = db.get(Task, task_id)
+        facts_fresh = t is not None and gsb_factcheck.settled(t)
+    if facts_fresh:
+        fact = {"ok": True, "passed": True, "skipped": True, "message": "理由没变，事实核验沿用上一次的结论"}
+    else:
+        fact = await gsb_factcheck.run_factcheck(task_id)
     if not fact.get("ok"):
         log.warning("题 %d 事实核验没跑成，继续走措辞质检：%s", task_id, fact.get("message", ""))
     elif fact.get("applied"):
@@ -899,8 +908,9 @@ async def _scan_probe() -> int:
     界面上看是在排队，实际上永远等不到出闸。
 
     只处理「恰好一侧正常跑完、另一侧还在等槽位」的题，判据与留痕都在 difficulty 里。
-    另一侧已经在跑的不碰：那台容器的时间已经花下去了，这时废掉整题省不下什么，
-    却要中断一次正在进行的运行。
+    另一侧已经在跑的一般不碰：那台容器的时间已经花下去了，这时废掉整题省不下什么，
+    却要中断一次正在进行的运行。唯一的例外是先跑完那一侧低于单侧步数硬下限，
+    见 difficulty.below_hard_floor。
     """
     if not difficulty.probe_enabled() or paused():
         return 0
@@ -1150,7 +1160,7 @@ def _blocked_by_llm() -> tuple[int, int]:
     with session() as db:
         for task in db.execute(select(Task).where(
                 Task.analysis_status == ANALYSIS_FAILED)).scalars():
-            if llm.classify(task.auto_error or "")[1] is False:
+            if llm.is_fatal(task.auto_error or ""):
                 analyses += 1  # 不可重试 = 账单 / 鉴权 / 模型名，正是要等恢复的那类
         for task in db.execute(select(Task).where(Task.status.in_(SETTLING))).scalars():
             if _llm_stalled(task.factcheck or {}) or _llm_stalled(task.precheck or {}):
@@ -1204,6 +1214,137 @@ async def _scan_llm_recovery() -> int:
     return freed
 
 
+# ---------------- 失败自愈 ----------------
+# 上面的恢复探测只管「模型不通」那一类。另外三种卡法它够不着，题会一直停在原地：
+#
+# 1. 分析失败但错误是可重试的（模型五分钟没输出、网关抽风、输出解不开）。重试次数在
+#    llm.ask 里就用完了，落到 FAILED 之后再没有任何一步会碰它。
+# 2. 事实核验 / 措辞质检停在 RUNNING。跑它的协程随进程没了（后端重启、CLI 进程被杀），
+#    库里的 RUNNING 留着，skip_reason 一直说「正在跑」，积压扫描永远跳过它。
+# 3. 两道质检判了 FAIL：挑出了问题，但几轮都交不出能过判据的改写稿（多半是超篇幅）。
+#    再问一次往往就能交出来，而 FAIL 是终态，skip_reason 会挡住重跑。
+#
+# 三种都有次数或时长上限，撞到了才真正留给人，并把原因写清楚。
+
+ANALYSIS_AUTO_RETRIES = 3
+ANALYSIS_RETRY_GAP_S = 600
+CHECK_AUTO_RETRIES = 2
+CHECK_RETRY_GAP_S = 600
+# 事实核验最长是两轮各 15 分钟再加交付完整性那几轮，一个半小时还没收尾只能是没人在跑了
+STALE_CHECK_S = 5400
+
+
+def _seconds_since(stamp: str | None) -> float | None:
+    if not stamp:
+        return None
+    try:
+        return (utc_now() - as_utc(datetime.fromisoformat(stamp))).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def _runs_settled(db, task_id: int) -> bool:  # noqa: ANN001
+    """两侧都正常跑完、都不算异常。重新分析只对这种题有意义。"""
+    runs = db.query(TaskRun).filter(TaskRun.task_id == task_id).all()
+    return (len(runs) == 2 and all(r.status == RUN_FINISHED for r in runs)
+            and not any(abnormal_reason(r) for r in runs))
+
+
+def _scan_failed_analyses() -> list[str]:
+    """可重试的分析失败，隔一段时间自动放回流程。返回放回的题号。
+
+    不可重试的（账单、鉴权、模型名）不在这里：那类再试多少次都一样，归恢复探测管，
+    探通了才放。放回去的题由配对扫描照常推进，推产物那一步已经推过的会直接跳过。
+    """
+    out: list[str] = []
+    with session() as db:
+        for task in db.execute(select(Task).where(
+                Task.analysis_status == ANALYSIS_FAILED)).scalars():
+            if llm.is_fatal(task.auto_error or ""):
+                continue
+            failure = (task.analysis or {}).get("failure") or {}
+            count = int(failure.get("count") or 0)
+            if count > ANALYSIS_AUTO_RETRIES:
+                note = f"（已自动重试 {ANALYSIS_AUTO_RETRIES} 次仍失败，需人工）"
+                if note not in (task.auto_error or ""):
+                    task.auto_error = ((task.auto_error or "") + note)[:2000]
+                continue
+            waited = _seconds_since(failure.get("at"))
+            if waited is not None and waited < ANALYSIS_RETRY_GAP_S:
+                continue
+            if not _runs_settled(db, task.id):
+                continue
+            task.analysis_status = ANALYSIS_IDLE
+            task.auto_error = ""
+            if task.status == NEEDS_ATTENTION:
+                task.status = RUN_DONE
+            out.append(task.task_no)
+    if out:
+        log.info("分析失败的题 %s 自动放回流程重试", "、".join(out))
+    return out
+
+
+# (状态列, 报告列, RUNNING, IDLE, FAIL)
+_CHECKS = (
+    ("factcheck_status", "factcheck", FACTCHECK_RUNNING, FACTCHECK_IDLE, FACTCHECK_FAIL),
+    ("precheck_status", "precheck", PRECHECK_RUNNING, PRECHECK_IDLE, PRECHECK_FAIL),
+)
+
+
+def _reset_stale_checks(*, force: bool = False) -> list[str]:
+    """把没人在跑的 RUNNING 质检复位成 IDLE。返回复位的题号。
+
+    force 给开机用：上一个进程的协程一个都不在了，不必等时长。平时按时长判，
+    本进程自己在跑的（占着推进额度的）一律不碰。
+    """
+    out: list[str] = []
+    with session() as db:
+        for task in db.execute(select(Task).where(Task.status.in_(SETTLING))).scalars():
+            if not force and _advancing_now(task.id):
+                continue
+            for status_col, report_col, running, idle, _ in _CHECKS:
+                if getattr(task, status_col) != running:
+                    continue
+                report = getattr(task, report_col) or {}
+                age = _seconds_since(report.get("started_at"))
+                if not force and age is not None and age < STALE_CHECK_S:
+                    continue
+                setattr(task, status_col, idle)
+                setattr(task, report_col, {"auto_retries": report.get("auto_retries") or 0})
+                out.append(task.task_no)
+    if out:
+        log.warning("质检卡在进行中没人收尾，复位重排：%s", "、".join(sorted(set(out))))
+    return out
+
+
+def _retry_failed_checks() -> list[str]:
+    """判了 FAIL 的质检，理由没人动过的，自动再跑有限几次。返回放回的题号。
+
+    人已经改过理由的不用这里管：指纹对不上，skip_reason 本来就会放行重跑。
+    """
+    out: list[str] = []
+    with session() as db:
+        for task in db.execute(select(Task).where(Task.status == ANALYZED)).scalars():
+            if _advancing_now(task.id):
+                continue
+            for status_col, report_col, _, idle, fail in _CHECKS:
+                if getattr(task, status_col) != fail:
+                    continue
+                report = dict(getattr(task, report_col) or {})
+                n = int(report.get("auto_retries") or 0)
+                if n >= CHECK_AUTO_RETRIES:
+                    continue
+                waited = _seconds_since(report.get("finished_at"))
+                if waited is not None and waited < CHECK_RETRY_GAP_S:
+                    continue
+                setattr(task, status_col, idle)
+                setattr(task, report_col, {**report, "auto_retries": n + 1})
+                out.append(task.task_no)
+    if out:
+        log.info("质检判了待改、理由没人动过的题 %s 自动重跑一次", "、".join(sorted(set(out))))
+    return out
+
+
 async def _scan_pairs() -> int:
     """把该推进的题交给后台，不等它跑完。返回这一轮新起了几个。
 
@@ -1245,9 +1386,16 @@ async def tick() -> dict:
     # 探测排在推进前面：账单刚恢复时，这一步会把上一轮卡住的题放回流程，
     # 紧接着的两步扫描当轮就能把它们排上，不必再等一个周期。
     stats["freed"] = await _scan_llm_recovery()
+    # 自愈同理排在推进前面，放回去的题当轮就能被下面两步扫描排上
+    stats["healed"] = (len(_scan_failed_analyses()) + len(_reset_stale_checks())
+                       + len(_retry_failed_checks()))
     advanced = await _scan_pairs()
     # 补跑质检排在配对之后，共用同一份额度：新跑完的题该优先拿到结论
     stats["gated"] = await _scan_quality_backlog()
+    # 录屏协作在后台跑（拉仓库、代传视频都可能慢），不拖住这一轮
+    from app.services import recording
+
+    recording.kick()
     # 台账校正放最后：上面几步可能刚销毁过容器，这时对齐一次正好
     fixed = await _reconcile_containers()
     return {"adopted": adopted, **stats, "advanced": advanced, "container_fixed": fixed}
@@ -1283,10 +1431,11 @@ async def _loop() -> None:
             # 每轮都留一行。巡检绝大多数时候什么都不做，一声不吭的话，「它到底还在不在
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
             log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 转待分析 %s · 转人工 %s"
-                     " · 恢复放回 %s · 起推进 %s · 补质检 %s（在跑 %s） · 耗时 %.1fs",
+                     " · 探路废弃 %s · 恢复放回 %s · 自愈 %s · 起推进 %s · 补质检 %s（在跑 %s）"
+                     " · 耗时 %.1fs",
                      stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
-                     stats["run_done"], stats["settled"], stats["freed"], stats["advanced"],
-                     stats["gated"], len(_advance_tasks),
+                     stats["run_done"], stats["settled"], stats["probed"], stats["freed"],
+                     stats["healed"], stats["advanced"], stats["gated"], len(_advance_tasks),
                      (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise
@@ -1326,6 +1475,10 @@ async def start() -> None:
     _stopping = False
     if stale := reset_stale_analyses():
         log.warning("上次进程留下 %s 道题卡在分析中，已复位重排：%s", len(stale), "、".join(stale))
+    _reset_stale_checks(force=True)
+    from app.services import recording
+
+    recording.reset_stale_generating()
     _task = asyncio.create_task(_loop(), name="watchdog-loop")
 
 

@@ -1,6 +1,6 @@
 import type { FactcheckStatus, PrecheckStatus, RunStatus, Side, Status, Verdict } from './api'
 
-/** 质检排在录屏前面，所以 ANALYZED 是「等质检」、QC 是「质检过了等录屏」。
+/** 质检排在录屏前面，所以 ANALYZED 是「等质检」、QC 是「质检过了等录屏」、READY 是「录屏也齐了等提交」。
  *  这两个的含义换过一次：早先按录屏齐不齐分，措辞一改就得重录。 */
 export const STATUS_LABEL: Record<Status, string> = {
   AVAILABLE: '待领取',
@@ -11,6 +11,7 @@ export const STATUS_LABEL: Record<Status, string> = {
   ANALYZING: '对比中',
   ANALYZED: '待质检',
   QC: '待录屏',
+  READY: '可上传',
   UPLOADED: '已上传',
   DONE: '已完成',
   NEEDS_ATTENTION: '需人工',
@@ -27,6 +28,7 @@ export const STATUS_COLOR: Record<Status, string> = {
   ANALYZING: 'run',
   ANALYZED: 'accent',
   QC: 'ok',
+  READY: 'ok',
   UPLOADED: 'info',
   DONE: 'fg2',
   NEEDS_ATTENTION: 'err',

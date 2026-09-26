@@ -8,6 +8,7 @@ export const router = createRouter({
     { path: '/bank', name: 'bank', component: () => import('./pages/Bank.vue'), meta: { title: '题库' } },
     { path: '/list', name: 'list', component: () => import('./pages/Pipeline.vue'), meta: { title: '题目列表' } },
     { path: '/queue', name: 'queue', component: () => import('./pages/Queue.vue'), meta: { title: '队列' } },
+    { path: '/recording', name: 'recording', component: () => import('./pages/Recording.vue'), meta: { title: '录屏录制处理' } },
     { path: '/runs', name: 'runs', component: () => import('./pages/Runs.vue'), meta: { title: '运行舱' } },
     { path: '/tasks/:id', name: 'task', component: () => import('./pages/TaskDetail.vue'), meta: { title: '题目' } },
     { path: '/settings', name: 'settings', component: () => import('./pages/Settings.vue'), meta: { title: '设置' } },

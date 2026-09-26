@@ -46,7 +46,7 @@ from app.db import session
 from app.events import bus
 from app.models import (
     ANALYZED, PRECHECK_CONFIRMED, PRECHECK_ERROR, PRECHECK_FAIL, PRECHECK_IDLE,
-    PRECHECK_OK, PRECHECK_PASS, PRECHECK_RUNNING, QC, SETTLING, UPLOADABLE, Task, utc_now,
+    PRECHECK_OK, PRECHECK_PASS, PRECHECK_RUNNING, QC, READY, SETTLING, UPLOADABLE, Task, utc_now,
 )
 from app.services import gsb_analyzer, gsb_rules, llm
 
@@ -616,16 +616,22 @@ def sync_stage(db, task: Task) -> bool:  # noqa: ANN001
     理由被人改过（指纹对不上）又退回待质检 —— 「谁动谁写」的做法迟早会留下一批
     质检早就过了却还挂在待质检栏的题，而人正是照着栏目决定下一步做什么。
 
-    只在 ANALYZED 与 QC 之间动。已经上传、已完成、需人工的题不碰：那些状态下
+    只在 SETTLING 三档之间动。已经上传、已完成、需人工的题不碰：那些状态下
     质检结论的新旧不再决定任何事。
+
+    READY 是 QC 往后再走一步：两侧录屏链接也齐了。质检失效直接退回 ANALYZED，不停在
+    QC —— 链接留着，重新放行之后一步回到 READY，录屏不用重录。
     """
-    if task.status == ANALYZED and quality_settled(task):
-        task.status = QC
-        return True
-    if task.status == QC and not quality_settled(task):
-        task.status = ANALYZED
-        return True
-    return False
+    if task.status not in SETTLING:
+        return False
+    if not quality_settled(task):
+        target = ANALYZED
+    else:
+        target = READY if screencast_ready(task) else QC
+    if task.status == target:
+        return False
+    task.status = target
+    return True
 
 
 def sync_all() -> int:
@@ -785,20 +791,22 @@ async def run_precheck(task_id: int, *, apply: bool = True) -> dict:
             return {"ok": False, "message": "题目不存在"}
         if task.precheck_status == PRECHECK_RUNNING:
             return {"ok": False, "message": "这道题的质检正在跑"}
-        if task.status not in (ANALYZED, QC):
+        if task.status not in SETTLING:
             return {"ok": False, "message": f"状态 {task.status} 不用做提交前质检"}
         gsb = dict(task.gsb or {})
         reason, verdict, task_no = gsb.get("reason") or "", gsb.get("verdict") or "", task.task_no
         if not reason.strip():
             return {"ok": False, "message": "还没有理由正文，先跑 GSB 分析"}
         prev_status, prev = task.precheck_status, dict(task.precheck or {})
+        # 看门狗自动重跑待改题的次数，要跨过这一次一直带下去，见 watchdog._retry_failed_checks
+        auto_retries = int(prev.get("auto_retries") or 0)
         task.precheck_status = PRECHECK_RUNNING
-        task.precheck = {"started_at": utc_now().isoformat()}
+        task.precheck = {"started_at": utc_now().isoformat(), "auto_retries": auto_retries}
     bus.publish("tasks", {"type": "task", "id": task_id})
 
     started = time.time()
     base = {"reason_digest": reason_digest(reason), "reason_chars": gsb_rules.visible_chars(reason),
-            "finished_at": utc_now().isoformat()}
+            "finished_at": utc_now().isoformat(), "auto_retries": auto_retries}
 
     # 挑出了毛病却交不出能用的稿子时，把「上一版为什么没被采用」告诉它再问一轮。
     # 不再问的代价是实打实的：库里 69 道判了待改的题，没有一道是稿子被判据拦下的，
@@ -957,7 +965,7 @@ def ready_ids() -> list[int]:
     from app.services import gsb_factcheck
 
     with session() as db:
-        out = [(t.task_no, t.id) for t in db.query(Task).filter(Task.status.in_((ANALYZED, QC))).all()
+        out = [(t.task_no, t.id) for t in db.query(Task).filter(Task.status.in_(SETTLING)).all()
                if not (skip_reason(t) and gsb_factcheck.skip_reason(t))]
         return [tid for _, tid in sorted(out)]
 
@@ -965,7 +973,7 @@ def ready_ids() -> list[int]:
 def submittable_ids() -> list[int]:
     """质检放行、录屏也齐了、可以直接提交的题。批量提交按它取。"""
     with session() as db:
-        return [t.id for t in db.query(Task).filter(Task.status == QC).all()
+        return [t.id for t in db.query(Task).filter(Task.status.in_(UPLOADABLE)).all()
                 if submittable(t)]
 
 

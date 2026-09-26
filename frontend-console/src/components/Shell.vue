@@ -1,19 +1,29 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
-import { RouterLink, RouterView, useRoute } from 'vue-router'
+import { computed, onMounted, watch } from 'vue'
+import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { useGlobalEvents } from '../sse'
 import { refreshStatus, refreshTasks, scheduleRefresh, store, stuckTasks } from '../store'
 
 const route = useRoute()
-const nav = [
+const allNav = [
   { to: '/', label: '总览', key: 'overview', glyph: '◉' },
   { to: '/design', label: '设计题目', key: 'design', glyph: '✎' },
   { to: '/bank', label: '题库', key: 'bank', glyph: '▤' },
   { to: '/list', label: '题目列表', key: 'list', glyph: '▦' },
   { to: '/queue', label: '队列', key: 'queue', glyph: '≡' },
   { to: '/runs', label: '运行舱', key: 'runs', glyph: '▶' },
+  { to: '/recording', label: '录屏录制处理', key: 'recording', glyph: '⏺' },
   { to: '/settings', label: '设置', key: 'settings', glyph: '⚙' },
 ]
+/** 录屏端不跑容器、不出题，侧栏只留录屏页和设置 */
+const recorderOnly = computed(() => !!(store.status?.rec?.enabled && store.status.rec.recorder_only))
+const nav = computed(() => (recorderOnly.value
+  ? allNav.filter((n) => n.key === 'recording' || n.key === 'settings')
+  : allNav))
+const router = useRouter()
+watch([recorderOnly, () => route.name], ([only, name]) => {
+  if (only && name && name !== 'recording' && name !== 'settings') router.replace('/recording')
+})
 const { connected } = useGlobalEvents(() => scheduleRefresh())
 onMounted(() => { refreshStatus(); refreshTasks(); setInterval(refreshStatus, 15000) })
 
@@ -34,6 +44,7 @@ const taskOwner = computed(() => {
   return ['AVAILABLE', 'CLAIMED', 'DISCARDED'].includes(t.status) ? 'bank' : 'runs'
 })
 const slots = computed(() => store.status?.scheduler)
+const readyCount = computed(() => store.tasks.filter((t) => t.status === 'READY').length)
 const probes = computed(() => {
   const s = store.status
   return [
@@ -69,6 +80,7 @@ const probes = computed(() => {
           <span v-else-if="n.key === 'runs' && slots && slots.running" class="ml-auto mono text-[12px] text-run">{{ slots.running }}</span>
           <span v-else-if="n.key === 'queue' && slots?.queued" class="ml-auto mono text-[12px] text-run">{{ slots.queued }}</span>
           <span v-else-if="n.key === 'design' && store.status?.design.running.length" class="ml-auto dot bg-run animate-breathe" />
+          <span v-else-if="n.key === 'recording' && readyCount" class="ml-auto mono text-[12px] text-ok" title="可上传">{{ readyCount }}</span>
         </RouterLink>
       </nav>
       <div class="mt-auto p-4 border-t border-line space-y-1.5">

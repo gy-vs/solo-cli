@@ -33,7 +33,7 @@ import logging
 
 from app import config
 from app.db import session
-from app.models import RUN_OK_STATUSES, RUN_WAITING, Task, TaskRun, as_utc, utc_now
+from app.models import RUN_OK_STATUSES, RUN_RUNNING, RUN_WAITING, Task, TaskRun, as_utc, utc_now
 from app.services import settings_store
 
 log = logging.getLogger("difficulty")
@@ -53,6 +53,10 @@ MID_PEER_STEPS_DEFAULT = 60
 PROBE_DEFAULT = True
 PROBE_STEPS_DEFAULT = 40
 PROBE_MINUTES_DEFAULT = 30
+# 单侧步数硬下限。探路那条线是「步数且用时」都不达标才废，于是一侧 6 步却耗了 30.3 分钟
+# 的题（多半耗在网关重试或空转上）只差 0.3 分钟就放了过去，另一侧照样排队出闸。
+# 步数低到这个程度，用时已经说明不了难度，只看步数。
+HARD_STEPS_DEFAULT = 20
 
 PASS = "pass"            # 值得评，往下走
 DISCARD = "discard"      # 两侧都太轻，不花这次额度
@@ -77,7 +81,13 @@ def thresholds() -> dict:
         "low_steps": settings_store.get_int("difficulty.low_steps", LOW_STEPS_DEFAULT),
         "low_peer_steps": settings_store.get_int("difficulty.low_peer_steps", LOW_PEER_STEPS_DEFAULT),
         "mid_peer_steps": settings_store.get_int("difficulty.mid_peer_steps", MID_PEER_STEPS_DEFAULT),
+        "hard_steps": hard_steps(),
     }
+
+
+def hard_steps() -> int:
+    """单侧步数硬下限，0 表示关掉。"""
+    return max(0, settings_store.get_int("difficulty.hard_steps", HARD_STEPS_DEFAULT))
 
 
 # ---------------- 两个数从哪儿读 ----------------
@@ -153,6 +163,9 @@ def judge(steps: dict, minutes: dict, th: dict) -> tuple[str, str]:
         return UNKNOWN, f"{'、'.join(missing)} 侧的步数或用时读不到，难度筛选放行"
 
     lo, hi = min(steps.values()), max(steps.values())
+    if (hard := th.get("hard_steps") or 0) and lo < hard:
+        return DISCARD, (f"有一侧只用了 {lo} 步，不到单侧硬下限 {hard} 步（{_say_steps(steps)}），"
+                         f"题面没构成难度")
     if max(minutes.values()) < th["min_minutes"]:
         return DISCARD, (f"两侧都在 {th['min_minutes']} 分钟内跑完（{_say_minutes(minutes)}），"
                          f"题面没构成难度")
@@ -304,7 +317,14 @@ def probe_thresholds() -> dict:
     return {
         "probe_steps": settings_store.get_int("difficulty.probe_steps", PROBE_STEPS_DEFAULT),
         "probe_minutes": settings_store.get_int("difficulty.probe_minutes", PROBE_MINUTES_DEFAULT),
+        "hard_steps": hard_steps(),
     }
+
+
+def below_hard_floor(steps: int | None, th: dict) -> bool:
+    """这一侧的步数是不是低于硬下限。读不到步数不算低。"""
+    hard = th.get("hard_steps") or 0
+    return bool(hard) and steps is not None and steps < hard
 
 
 def probe_judge(steps: int | None, minutes: float | None, th: dict) -> tuple[str, str]:
@@ -313,9 +333,13 @@ def probe_judge(steps: int | None, minutes: float | None, th: dict) -> tuple[str
     两个条件要同时不达标才废，这跟两侧都跑完时那套判据不一样——那边「都不到 40 步」
     和「都不到 30 分钟」是各自独立成立的两条线。这里收紧成「且」，因为手上只有一侧
     的信息：一侧 20 步但跑了两小时，说明它在少数几步上啃了很久，那道题未必简单。
+    硬下限例外：步数低到那个程度只看步数，见 HARD_STEPS_DEFAULT。
 
     指标读不到就等着，不当作 0：另一侧还没起，等两侧都跑完之后还有一道更准的关口。
     """
+    if below_hard_floor(steps, th):
+        return DISCARD, (f"先跑完的一侧只用了 {steps} 步，不到单侧硬下限 {th['hard_steps']} 步，"
+                         f"不看用时，另一侧不必再跑")
     if steps is None or minutes is None:
         return PROBE_HOLD, "这一侧的步数或用时还读不到，先不判"
     if steps < th["probe_steps"] and minutes < th["probe_minutes"]:
@@ -329,11 +353,18 @@ def _probe_one(runs: list[TaskRun], th: dict) -> tuple[str, str, str]:
     """一道题的探路结论 → (结论, 原因, 先跑完的是哪一侧)。
 
     只在「恰好一侧正常跑完、另一侧还在等槽位」时给出 PASS 或 DISCARD，别的情形一律
-    HOLD。另一侧已经在跑的时候判它没有意义：那台容器的时间已经花下去了，这时候废掉
-    整道题，省下的只是它剩下的几分钟，却要中断一次正在进行的运行。
+    HOLD。另一侧已经在跑的时候一般不判：那台容器的时间已经花下去了，这时候废掉整道题，
+    省下的只是它剩下的几分钟，却要中断一次正在进行的运行。
+
+    硬下限不受这条限制：一侧十来步就收工，这道题两侧跑完之后也必然被筛掉，另一侧
+    剩下的每一分钟都是白烧，停掉它才是省。
     """
     done = [r for r in runs if r.status in RUN_OK_STATUSES]
     waiting = [r for r in runs if r.status in RUN_WAITING]
+    running = [r for r in runs if r.status == RUN_RUNNING]
+    if len(done) == 1 and len(running) == len(runs) - 1 and below_hard_floor(steps_of(done[0]), th):
+        verdict, reason = probe_judge(steps_of(done[0]), minutes_of(done[0]), th)
+        return verdict, reason, done[0].side
     if len(done) != 1 or len(waiting) != len(runs) - 1:
         return PROBE_HOLD, "两侧的进度不在「一侧跑完、另一侧还没出闸」这个当口", ""
     first = done[0]

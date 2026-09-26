@@ -42,24 +42,24 @@ RUN_DONE = "RUN_DONE"                # 两个 run 都结束，等 push 与分析
 ANALYZING = "ANALYZING"              # GSB 对比进行中
 ANALYZED = "ANALYZED"                # 有结论，等提交前质检（事实核验 + 措辞）
 QC = "QC"                            # 质检已放行，等录屏与提交
+READY = "READY"                      # 质检放行且两侧录屏齐了，等人点提交
 UPLOADED = "UPLOADED"                # 已提交 solo2
 DONE = "DONE"                        # 人工确认完成
 NEEDS_ATTENTION = "NEEDS_ATTENTION"  # 重跑用尽或准备失败，等人工
 DISCARDED = "DISCARDED"              # 人工废弃
 
 ALL_STATUSES = (
-    AVAILABLE, CLAIMED, QUEUED, RUNNING, RUN_DONE, ANALYZING, ANALYZED, QC,
+    AVAILABLE, CLAIMED, QUEUED, RUNNING, RUN_DONE, ANALYZING, ANALYZED, QC, READY,
     UPLOADED, DONE, NEEDS_ATTENTION, DISCARDED,
 )
-# 允许上传的状态。只有 QC —— 提交前质检是提交的必经一步，ANALYZED 表示它还没过。
+# 允许上传的状态。提交前质检是提交的必经一步，ANALYZED 表示它还没过。
 # 把 ANALYZED 留在这里等于给绕过质检开一条路。
 #
-# 录屏齐不齐不由状态承担，由 submit_block 单独判。录屏是在外部录完之后贴进来的，
-# 它不影响质检结论，所以不该决定题落在哪一栏 —— 早先按录屏推状态的做法把质检排到了
-# 录屏后面，措辞一改就得重录一遍。
-UPLOADABLE = frozenset({QC})
-# 结论已经出来、还没提交的两个状态。质检放行与否决定题落在哪一个，见 gsb_precheck.sync_stage。
-SETTLING = frozenset({ANALYZED, QC})
+# QC 也在内：录屏齐不齐由 submit_block 单独判，手工贴完链接直接提交的老路不能断。
+# READY 只是「录屏也齐了」的那一栏，排在质检后面 —— 措辞一改退回 ANALYZED，录屏不用重录。
+UPLOADABLE = frozenset({QC, READY})
+# 结论已经出来、还没提交的状态。落在哪一个见 gsb_precheck.sync_stage。
+SETTLING = frozenset({ANALYZED, QC, READY})
 
 # 还可以往外发容器的题。RUNNING 必须在内：槽位按容器算，一道题的两侧各排各的队，
 # A 先出闸把题带成 RUNNING 之后，B 仍然在队列里等自己那个槽。只认 QUEUED 的话，
@@ -233,6 +233,8 @@ class Task(Base, JsonMixin):
     # 和上面那条是一前一后两道关，都在拦难度不够的题，所以两个字段挨着放。
     scope_json: Mapped[str] = mapped_column(Text, default="{}")
     upload_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 录屏协作：文档生成进度、发布指纹、回收记录。见 recording 模块说明。
+    recording_json: Mapped[str] = mapped_column(Text, default="{}")
 
     # ---- 队列与来源 ----
     priority: Mapped[int] = mapped_column(Integer, default=0, index=True)   # 越小越先出队
@@ -342,6 +344,14 @@ class Task(Base, JsonMixin):
     @upload.setter
     def upload(self, v: dict) -> None:
         self.upload_json = self._dump(v)
+
+    @property
+    def recording(self) -> dict:
+        return self._load(self.recording_json, {})
+
+    @recording.setter
+    def recording(self, v: dict) -> None:
+        self.recording_json = self._dump(v)
 
     @property
     def analysis(self) -> dict:

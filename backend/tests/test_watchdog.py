@@ -891,6 +891,112 @@ def test_a_stale_analysis_is_reset_so_the_pair_can_be_picked_up(task_with_runs):
     assert wd._pairs_ready() == [task_id]
 
 
+# ---------------- 失败自愈 ----------------
+
+def _failed_analysis(task_id: int, error: str, failure: dict | None = None) -> None:
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.status = m.NEEDS_ATTENTION
+        t.analysis_status = m.ANALYSIS_FAILED
+        t.auto_error = f"GSB 分析失败：{error}"
+        t.analysis = {"failure": failure} if failure else {}
+
+
+def test_a_retryable_analysis_failure_goes_back_into_the_flow(task_with_runs):
+    """模型五分钟没输出是可重试的，恢复探测不管它，以前落到 FAILED 就再没人碰。"""
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    _failed_analysis(task_id, "模型 5 分钟没有新输出")
+
+    assert wd._scan_failed_analyses() == ["07"]
+    assert wd._pairs_ready() == [task_id]
+
+
+def test_a_fresh_analysis_failure_waits_out_the_gap(task_with_runs):
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    _failed_analysis(task_id, "模型 5 分钟没有新输出",
+                     {"count": 1, "at": m.utc_now().isoformat()})
+
+    assert wd._scan_failed_analyses() == []
+
+
+def test_analysis_auto_retries_stop_at_the_limit(task_with_runs):
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    _failed_analysis(task_id, "模型 5 分钟没有新输出",
+                     {"count": wd.ANALYSIS_AUTO_RETRIES + 1, "at": "2020-01-01T00:00:00+00:00"})
+
+    assert wd._scan_failed_analyses() == []
+    with session() as db:
+        assert "需人工" in db.get(m.Task, task_id).auto_error
+
+
+def test_a_fatal_analysis_failure_is_left_to_the_recovery_probe(task_with_runs):
+    """落库的是翻译后的中文，原来拿它再过 classify 认不出来，被当成了可重试的。"""
+    task_id, ids = task_with_runs
+    _finish_both(ids)
+    _failed_analysis(task_id, "模型名不被接受，到设置页换一个模型")
+
+    assert wd._scan_failed_analyses() == []
+    assert wd._blocked_by_llm()[0] == 1
+
+
+def _settling(task_id: int, **fields) -> None:
+    from app.db import session
+
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        t.status = m.ANALYZED
+        t.analysis_status = m.ANALYSIS_DONE
+        t.gsb = {"verdict": "A", "reason": "理由正文"}
+        for k, v in fields.items():
+            setattr(t, k, v)
+
+
+def test_a_check_left_running_by_a_dead_process_is_reset(task_with_runs, clean_advances):
+    from app.db import session
+
+    task_id, _ = task_with_runs
+    _settling(task_id, factcheck_status=m.FACTCHECK_RUNNING,
+              factcheck={"started_at": "2020-01-01T00:00:00+00:00"})
+
+    assert wd._reset_stale_checks() == ["07"]
+    with session() as db:
+        assert db.get(m.Task, task_id).factcheck_status == m.FACTCHECK_IDLE
+
+
+def test_a_check_that_just_started_is_left_alone(task_with_runs, clean_advances):
+    task_id, _ = task_with_runs
+    _settling(task_id, precheck_status=m.PRECHECK_RUNNING,
+              precheck={"started_at": m.utc_now().isoformat()})
+
+    assert wd._reset_stale_checks() == []
+    assert wd._reset_stale_checks(force=True) == ["07"]
+
+
+def test_a_failed_check_is_retried_a_limited_number_of_times(task_with_runs, clean_advances):
+    from app.db import session
+
+    task_id, _ = task_with_runs
+    old = "2020-01-01T00:00:00+00:00"
+    _settling(task_id, factcheck_status=m.FACTCHECK_FAIL,
+              factcheck={"finished_at": old, "mismatches": [{"quote": "x"}]})
+
+    assert wd._retry_failed_checks() == ["07"]
+    with session() as db:
+        t = db.get(m.Task, task_id)
+        assert t.factcheck_status == m.FACTCHECK_IDLE
+        assert t.factcheck["auto_retries"] == 1
+        t.factcheck_status = m.FACTCHECK_FAIL
+        t.factcheck = {"finished_at": old, "auto_retries": wd.CHECK_AUTO_RETRIES}
+    assert wd._retry_failed_checks() == []
+
+
 # ---------------- 收养孤儿 ----------------
 
 @pytest.fixture()

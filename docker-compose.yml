@@ -23,6 +23,8 @@ services:
       - CODER_ROOT_HOST=${CODER_ROOT:-/Users/gaoyong/solo-coder-0908}
       - CODER_ROOT_MOUNT=/host/coder
       - SKILL_DIR_MOUNT=/host/skills
+      # 录屏文档的 PowerShell 校验要把 skill 自带的脚本挂进 powershell 容器，同样得给宿主路径
+      - SKILL_DIR_HOST=${SKILL_DIR:-${HOME}/.cursor/skills}
       - SECRET_KEY_FILE=/data/secret.key
       - HOST_PORT=${HOST_PORT:-8788}
       # 以下为首次启动的设置种子（设置表已有值时忽略），之后在界面维护

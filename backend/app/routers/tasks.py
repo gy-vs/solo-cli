@@ -17,8 +17,8 @@ from app import config
 from app.db import session
 from app.events import bus, sse_format
 from app.models import (
-    ANALYSIS_RUNNING, ANALYZED, AVAILABLE, CLAIMED, DISCARDED, DONE, NEEDS_ATTENTION, QC,
-    QUEUED, RUN_DONE, RUN_RUNNING, RUNNING, UPLOADED, RunEvent, Task, TaskRun, utc_now,
+    ANALYSIS_RUNNING, AVAILABLE, CLAIMED, DISCARDED, DONE, NEEDS_ATTENTION,
+    QUEUED, RUN_DONE, RUN_RUNNING, RUNNING, SETTLING, UPLOADED, RunEvent, Task, TaskRun, utc_now,
 )
 from app.schemas import (
     GsbUpdate, IdList, PrecheckConfirm, QueueMove, RerunBatch, RerunRequest,
@@ -238,7 +238,7 @@ async def batch_quality_gate(body: IdList) -> dict:
             t = db.get(Task, tid)
             if t is None:
                 results.append({"id": tid, "ok": False, "message": "题目不存在"})
-            elif t.status not in (ANALYZED, QC):
+            elif t.status not in SETTLING:
                 results.append({"id": tid, "ok": False,
                                 "message": f"状态 {t.status} 不用做提交前质检"})
             else:
@@ -358,7 +358,7 @@ async def batch_advance(body: IdList) -> dict:
             if t is None:
                 results.append({"id": tid, "ok": False, "message": "题目不存在"})
                 continue
-            if t.status not in (RUN_DONE, NEEDS_ATTENTION, ANALYZED, QC):
+            if t.status not in (RUN_DONE, NEEDS_ATTENTION, *SETTLING):
                 results.append({"id": tid, "ok": False,
                                 "message": f"状态 {t.status} 不能推进"})
                 continue
@@ -941,7 +941,7 @@ async def advance(task_id: int) -> dict:
     """手动走一遍「推产物 + 开分析」。正常由巡检自动触发，这里给推送失败后重试用。"""
     with session() as db:
         t = _get(db, task_id)
-        if t.status not in (RUN_DONE, NEEDS_ATTENTION, ANALYZED, QC):
+        if t.status not in (RUN_DONE, NEEDS_ATTENTION, *SETTLING):
             raise HTTPException(409, f"状态 {t.status} 不能推进")
     return await watchdog.advance_pair(task_id)
 
@@ -1119,7 +1119,7 @@ async def quality_gate(task_id: int) -> dict:
     """
     with session() as db:
         t = _get(db, task_id)
-        if t.status not in (ANALYZED, QC):
+        if t.status not in SETTLING:
             raise HTTPException(409, f"状态 {t.status} 不用做提交前质检")
     return await watchdog.run_quality_gate(task_id)
 
@@ -1174,7 +1174,7 @@ async def complete(task_id: int, force: bool = Query(default=False)) -> dict:
         runs = _runs(db, task_id)
         if any(r.status == RUN_RUNNING for r in runs):
             raise HTTPException(409, "还有容器在跑，请先停止")
-        if t.status not in (RUN_DONE, ANALYZED, QC, UPLOADED, NEEDS_ATTENTION):
+        if t.status not in (RUN_DONE, *SETTLING, UPLOADED, NEEDS_ATTENTION):
             raise HTTPException(409, f"状态 {t.status} 不能标记完成")
         if not force and t.status != UPLOADED:
             raise HTTPException(409, "尚未上传，若确认放弃该题请带 force=true")

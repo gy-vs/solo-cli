@@ -209,6 +209,18 @@ def classify(text: str) -> tuple[str, bool]:
     return blob[-400:] or "模型调用失败，没有输出", True
 
 
+def is_fatal(text: str) -> bool:
+    """这句报错是不是「再试也一样」那一类。
+
+    CLI 原文和 classify 翻出来的中文都得认：落进 auto_error 的是翻译后的那句，
+    拿它再过一遍 classify 认不出任何英文关键字，于是「模型名不被接受」被当成可重试的，
+    看门狗的恢复探测就永远挑不到这道题。
+    """
+    if not classify(text)[1]:
+        return True
+    return any(message in (text or "") for _, message in _FATAL_PATTERNS)
+
+
 def _parse_envelope(stdout: str) -> tuple[str, str, dict]:
     """从 CLI 输出里抽出模型正文。json 和 stream-json 都认。
 

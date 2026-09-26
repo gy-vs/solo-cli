@@ -39,7 +39,7 @@ from app.db import session
 from app.events import bus
 from app.models import (
     ANALYSIS_DONE, ANALYSIS_FAILED, ANALYSIS_RUNNING, ANALYZED, ANALYZING, FACTCHECK_IDLE,
-    NEEDS_ATTENTION, PRECHECK_IDLE, QC, Task, TaskRun, utc_now,
+    NEEDS_ATTENTION, PRECHECK_IDLE, SETTLING, Task, TaskRun, utc_now,
 )
 from app.services import dockerx, gsb_evidence, gsb_repo, gsb_rules, llm, trace
 
@@ -1368,6 +1368,11 @@ async def analyze_task(task_id: int) -> dict:
                 t.analysis_status = ANALYSIS_FAILED
                 t.status = NEEDS_ATTENTION
                 t.auto_error = f"GSB 分析失败：{exc}"[:2000]
+                # 看门狗按这笔账决定要不要、什么时候再自动试一次，见 watchdog._scan_failed_analyses
+                prev = dict(t.analysis or {})
+                count = int((prev.get("failure") or {}).get("count") or 0) + 1
+                t.analysis = {**prev, "failure": {"count": count, "at": utc_now().isoformat(),
+                                                  "error": str(exc)[:300]}}
         bus.publish("tasks", {"type": "task", "id": task_id})
         return {"ok": False, "error": str(exc)}
 
@@ -1384,7 +1389,7 @@ async def backfill_delivery(task_id: int) -> dict:
         t = db.get(Task, task_id)
         if t is None:
             return {"ok": False, "message": "任务不存在"}
-        if t.status not in (ANALYZED, QC):
+        if t.status not in SETTLING:
             return {"ok": False, "message": f"状态 {t.status} 不能补交付完整性"}
         gsb = dict(t.gsb or {})
         if not str(gsb.get("reason") or "").strip():
