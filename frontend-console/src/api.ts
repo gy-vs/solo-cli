@@ -686,6 +686,10 @@ export const api = {
   rec: () => get<RecOverview>('/api/rec'),
   recSync: () => post<{ ok: boolean; message?: string; stats?: Record<string, any> }>('/api/rec/sync'),
   recGenerate: (taskId: number) => post<{ ok: boolean; message: string }>(`/api/rec/tasks/${taskId}/generate`),
+  recBatchGenerate: (ids: number[]) => post<{ results: RecBatchResult[] }>('/api/rec/batch/generate', { ids }),
+  recBatchWithdraw: (ids: number[]) => post<{ results: RecBatchResult[] }>('/api/rec/batch/withdraw', { ids }),
+  recBatchClaim: (keys: string[]) => post<{ results: RecBatchResult[] }>('/api/rec/batch/claim', { keys }),
+  recBatchRelease: (keys: string[]) => post<{ results: RecBatchResult[] }>('/api/rec/batch/release', { keys }),
   recWithdraw: (taskId: number) => post<{ ok: boolean; message: string }>(`/api/rec/tasks/${taskId}/withdraw`),
   recLocalReport: async (taskId: number) => {
     const res = await fetch(`/api/rec/tasks/${taskId}/report`)
@@ -767,6 +771,7 @@ export interface RecLocal {
     collected_at?: string
     collect_error?: string
     recorded_by?: string
+    wanted?: boolean
   }
   generating: boolean
   collecting: boolean
@@ -789,6 +794,14 @@ export interface RecOverview {
   last_scan: { at?: string; error?: string; generated?: number; collected?: number; withdrawn?: number }
   local: RecLocal[]
   queue: RecQueueItem[]
+}
+
+export interface RecBatchResult {
+  id?: number
+  key?: string | number
+  task_no?: string
+  ok: boolean
+  message: string
 }
 
 export interface RecReport {

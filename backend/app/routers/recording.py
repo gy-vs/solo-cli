@@ -20,6 +20,11 @@ class KeyBody(BaseModel):
     key: str
 
 
+class BatchBody(BaseModel):
+    ids: list[int] = []
+    keys: list[str] = []
+
+
 def _raise(res: dict, code: int = 409) -> dict:
     if not res.get("ok"):
         raise HTTPException(code, res.get("message") or "操作失败")
@@ -45,6 +50,26 @@ async def sync() -> dict:
 @router.post("/tasks/{task_id}/generate")
 async def generate(task_id: int) -> dict:
     return _raise(recording.start_generate(task_id, force=True))
+
+
+@router.post("/batch/generate")
+async def batch_generate(body: BatchBody) -> dict:
+    return {"results": recording.queue_generate(body.ids)}
+
+
+@router.post("/batch/withdraw")
+async def batch_withdraw(body: BatchBody) -> dict:
+    return {"results": await recording.batch("withdraw", body.ids)}
+
+
+@router.post("/batch/claim")
+async def batch_claim(body: BatchBody) -> dict:
+    return {"results": await recording.batch("claim", body.keys)}
+
+
+@router.post("/batch/release")
+async def batch_release(body: BatchBody) -> dict:
+    return {"results": await recording.batch("release", body.keys)}
 
 
 @router.post("/tasks/{task_id}/withdraw")

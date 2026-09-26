@@ -417,3 +417,39 @@ def test_claim_reports_when_someone_else_got_there_first(stub_repo, monkeypatch)
     res = asyncio.run(recording.claim("dev1/101"))
     assert not res["ok"] and "rec2" in res["message"]
     assert [e["type"] for e in stub_repo["appended"]] == ["claimed"]
+
+
+# ---------------- 批量 ----------------
+
+def test_batch_generate_starts_within_quota_and_queues_the_rest(tmp_db, monkeypatch):
+    from app.db import session
+
+    ids = [_add(no, m.QC) for no in ("101", "102", "103")]
+    bad = _add("104", m.ANALYZED)
+    started = []
+
+    def fake_start(tid, force=False):
+        started.append(tid)
+        recording._gen_jobs[tid] = object()
+        return {"ok": True, "message": "已开始生成录屏文档"}
+
+    monkeypatch.setattr(rec_repo, "available", lambda: (True, ""))
+    monkeypatch.setattr(recording, "max_parallel", lambda: 2)
+    monkeypatch.setattr(recording, "start_generate", fake_start)
+    monkeypatch.setattr(recording, "_gen_jobs", {})
+    res = recording.queue_generate([*ids, bad])
+    assert started == ids[:2]
+    assert [r["ok"] for r in res] == [True, True, True, False]
+    with session() as db:
+        queued = db.get(m.Task, ids[2])
+        assert queued.recording["wanted"] is True
+        assert recording.needs_generation(queued) == "手动排队，等生成额度"
+
+
+def test_scan_runs_manual_queue_first_even_when_auto_generate_is_off(stub_repo, monkeypatch):
+    auto = _add("101", m.QC)
+    manual = _add("102", m.QC, recording={"wanted": True})
+    monkeypatch.setattr(recording.settings_store, "get_bool",
+                        lambda k, d=False: False if k == "rec.auto_generate" else d)
+    asyncio.run(recording.scan())
+    assert stub_repo["started"] == [manual] and auto not in stub_repo["started"]

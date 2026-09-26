@@ -93,6 +93,8 @@ def needs_generation(task: Task) -> str:
     if task.id in _gen_jobs:
         return ""
     rec = task.recording or {}
+    if rec.get("wanted"):
+        return "手动排队，等生成额度"
     state = rec.get("state")
     same = rec.get("digest") == current_digest(task)
     if state in (PUBLISHED, COLLECTED) and same:
@@ -138,12 +140,62 @@ def start_generate(task_id: int, *, force: bool = False) -> dict:
             return {"ok": False, "message": "题目不存在"}
         if task.status != QC:
             return {"ok": False, "message": f"只有待录屏的题能生成录屏文档（当前 {task.status}）"}
-    _update(task_id, state=GENERATING, stage="queued", note="排队", error="",
+    _update(task_id, state=GENERATING, stage="queued", note="排队", error="", wanted=False,
             started_at=utc_now().isoformat())
     job = asyncio.create_task(_generate(task_id), name=f"rec-gen-{task_id}")
     _gen_jobs[task_id] = job
     job.add_done_callback(lambda _: _gen_jobs.pop(task_id, None))
     return {"ok": True, "message": "已开始生成录屏文档"}
+
+
+def queue_generate(task_ids: list[int]) -> list[dict]:
+    """批量生成：额度内的当场开跑，其余打上手动排队标记，由巡检按额度接着起。
+
+    不像单题那样跳过额度：一次勾几十道全部同时调模型，账单和限流都扛不住。
+    手动排队不受「自动生成」开关、失败冷却、文档已是最新这几条限制 —— 人点了就是要重写。
+    """
+    ok, why = rec_repo.available()
+    if not ok:
+        return [{"id": tid, "ok": False, "message": why} for tid in task_ids]
+    results = []
+    for tid in task_ids:
+        with session() as db:
+            task = db.get(Task, tid)
+            if task is None:
+                results.append({"id": tid, "ok": False, "message": "题目不存在"})
+                continue
+            if task.status != QC:
+                results.append({"id": tid, "ok": False, "task_no": task.task_no,
+                                "message": f"只有待录屏的题能生成（当前 {task.status}）"})
+                continue
+            no = task.task_no
+        if tid in _gen_jobs:
+            results.append({"id": tid, "ok": True, "task_no": no, "message": "已在生成"})
+            continue
+        if len(_gen_jobs) < max_parallel():
+            res = start_generate(tid)
+            results.append({"id": tid, "task_no": no, **res})
+            continue
+        _update(tid, wanted=True, note="手动排队")
+        results.append({"id": tid, "ok": True, "task_no": no, "message": "额度已满，排队等巡检接着跑"})
+    return results
+
+
+async def batch(action: str, keys: list) -> list[dict]:
+    """逐条跑同一个动作。认领、放回、撤回都要推仓库，串行跑，避免自己和自己抢推送。"""
+    out = []
+    for k in keys:
+        if action == "withdraw":
+            res = await withdraw_task(int(k))
+        elif action == "claim":
+            res = await claim(str(k))
+            res = {"ok": res["ok"], "message": "已认领" if res["ok"] else res["message"]}
+        elif action == "release":
+            res = await release(str(k))
+        else:
+            res = {"ok": False, "message": f"不认识的动作 {action}"}
+        out.append({"key": k, **res})
+    return out
 
 
 async def _generate(task_id: int) -> None:
@@ -295,8 +347,10 @@ async def scan() -> dict:
                     continue
                 _start_collect(task.id, entry)
                 stats["collected"] += 1
-        wanted = sorted((t for t in tasks.values() if needs_generation(t)), key=lambda t: t.task_no)
-        wanted_ids = [t.id for t in wanted]
+        # 人手动排的排前面，而且不看自动生成开关
+        wanted = sorted((t for t in tasks.values() if needs_generation(t)),
+                        key=lambda t: (not (t.recording or {}).get("wanted"), t.task_no))
+        wanted_ids = [(t.id, bool((t.recording or {}).get("wanted"))) for t in wanted]
 
     if withdraw:
         r = await rec_repo.append(withdraw, subject=f"withdraw {len(withdraw)}")
@@ -315,12 +369,13 @@ async def scan() -> dict:
             stats["cleaned"] += 1
             _update(task_id, branch_deleted=True)
 
-    if auto_generate():
-        for tid in wanted_ids:
-            if len(_gen_jobs) >= max_parallel():
-                break
-            if start_generate(tid)["ok"]:
-                stats["generated"] += 1
+    for tid, manual in wanted_ids:
+        if len(_gen_jobs) >= max_parallel():
+            break
+        if not (manual or auto_generate()):
+            continue
+        if start_generate(tid)["ok"]:
+            stats["generated"] += 1
     _last_scan.clear()
     _last_scan.update(stats)
     if any(stats[k] for k in ("generated", "collected", "withdrawn", "cleaned")):

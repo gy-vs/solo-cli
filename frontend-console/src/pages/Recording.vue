@@ -114,6 +114,7 @@ function docLine(t: RecLocal): { text: string; cls: string } {
     return { text: `生成失败（第 ${r.fails ?? 1} 次）：${r.error || '原因不明'}${auto}`, cls: 'text-err' }
   }
   if (r.state === 'withdrawn') return { text: `文档已撤回：${r.note || ''}，等重新生成`, cls: 'text-warn' }
+  if (r.wanted) return { text: '手动排队，等生成额度', cls: 'text-run' }
   if (!data.value?.auto_generate) return { text: '自动生成已关闭，手动点「生成」', cls: 'text-fg1' }
   return { text: t.need || '排队等生成额度', cls: 'text-fg1' }
 }
@@ -148,20 +149,70 @@ function withdraw(t: RecLocal) {
   })
 }
 
-// 可上传栏的勾选与提交
-const picked = ref(new Set<number>())
-const readyIds = computed(() => lists.value.ready.map((t) => t.id))
-watch(readyIds, (ids) => {
-  const keep = [...picked.value].filter((id) => ids.includes(id))
+const queueRows = computed<RecQueueItem[]>(() => (['queue', 'mine', 'done'].includes(tab.value)
+  ? lists.value[tab.value as 'queue' | 'mine' | 'done'] : []))
+const localRows = computed<RecLocal[]>(() => (['docs', 'waiting', 'returned', 'ready'].includes(tab.value)
+  ? lists.value[tab.value as 'docs' | 'waiting' | 'returned' | 'ready'] : []))
+
+// ---------------- 勾选与批量 ----------------
+// 本机题目按题 id 勾，录制队列按录屏仓库的 key 勾，统一存成字符串。切栏清空：
+// 两栏的批量动作不一样，勾选带过去只会让人对着「批量撤回」按下去，选中的却是上一栏的题。
+const BATCH_TABS: TabKey[] = ['docs', 'waiting', 'ready', 'queue', 'mine']
+const canPick = computed(() => BATCH_TABS.includes(tab.value))
+const picked = ref(new Set<string>())
+const tabKeys = computed(() => (['queue', 'mine', 'done'].includes(tab.value)
+  ? queueRows.value.map((e) => e.key)
+  : localRows.value.map((t) => String(t.id))))
+watch(tab, () => { picked.value = new Set() })
+// 轮询一刷新，题会流到下一栏；已经不在这栏的勾选要删掉，否则批量动作会带着它们发出去
+watch(tabKeys, (keys) => {
+  const keep = [...picked.value].filter((k) => keys.includes(k))
   if (keep.length !== picked.value.size) picked.value = new Set(keep)
 })
-function toggle(id: number, on: boolean) {
+function toggle(key: string | number, on: boolean) {
   const next = new Set(picked.value)
-  on ? next.add(id) : next.delete(id)
+  on ? next.add(String(key)) : next.delete(String(key))
   picked.value = next
 }
-const allPicked = computed(() => readyIds.value.length > 0 && readyIds.value.every((id) => picked.value.has(id)))
-function toggleAll(on: boolean) { picked.value = new Set(on ? readyIds.value : []) }
+const allPicked = computed(() => tabKeys.value.length > 0 && tabKeys.value.every((k) => picked.value.has(k)))
+function toggleAll(on: boolean) { picked.value = new Set(on ? tabKeys.value : []) }
+const pickedIds = () => [...picked.value].map(Number)
+const pickedKeys = () => [...picked.value]
+
+async function runBatch(label: string, fn: () => Promise<{ results: { ok: boolean; message: string }[] }>) {
+  busy.value = 'batch'
+  try {
+    const r = await fn()
+    const failed = r.results.filter((x) => !x.ok)
+    const done = r.results.length - failed.length
+    if (failed.length) msg.warning(`${label}：成功 ${done} 道，失败 ${failed.length} 道。${failed[0].message}`)
+    else msg.success(`${label} ${done} 道`)
+    picked.value = new Set()
+    await load()
+  } catch (e) {
+    msg.error((e as Error).message)
+  } finally {
+    busy.value = ''
+  }
+}
+const batchGenerate = () => runBatch('已发起生成', () => api.recBatchGenerate(pickedIds()))
+const batchClaim = () => runBatch('已认领', () => api.recBatchClaim(pickedKeys()))
+function batchWithdraw() {
+  dialog.warning({
+    title: `撤回 ${picked.value.size} 道题的录屏文档？`,
+    content: '录屏端手上的这些文档会作废（已经在录的也一样）。题回到待录屏、理由改完后会自动重新生成。',
+    positiveText: '撤回', negativeText: '取消',
+    onPositiveClick: () => { runBatch('已撤回', () => api.recBatchWithdraw(pickedIds())) },
+  })
+}
+function batchRelease() {
+  dialog.warning({
+    title: `放回 ${picked.value.size} 道题？`,
+    content: '放回后别的录屏端可以认领。',
+    positiveText: '放回', negativeText: '取消',
+    onPositiveClick: () => { runBatch('已放回', () => api.recBatchRelease(pickedKeys())) },
+  })
+}
 
 async function submit(ids: number[]) {
   const chosen = lists.value.ready.filter((t) => ids.includes(t.id))
@@ -312,10 +363,6 @@ const ENTRY_LABEL: Record<string, { text: string; cls: string }> = {
   withdrawn: { text: '已撤回', cls: 'text-fg2 border-line' },
 }
 const verdict = (v: string) => VERDICT_LABEL[v as 'A'] || v || '—'
-const queueRows = computed<RecQueueItem[]>(() => (['queue', 'mine', 'done'].includes(tab.value)
-  ? lists.value[tab.value as 'queue' | 'mine' | 'done'] : []))
-const localRows = computed<RecLocal[]>(() => (['docs', 'waiting', 'returned', 'ready'].includes(tab.value)
-  ? lists.value[tab.value as 'docs' | 'waiting' | 'returned' | 'ready'] : []))
 const scanNote = computed(() => {
   const s = data.value?.last_scan
   if (!s?.at) return ''
@@ -346,9 +393,15 @@ const scanNote = computed(() => {
           </template>
           两端共用的私有录屏仓库：main 放事件流，每题一个 rec/设备/题号 分支
         </NTooltip>
-        <NButton size="small" type="primary" secondary :loading="syncing" :disabled="!data?.available" @click="syncNow">
-          立即同步
-        </NButton>
+        <NTooltip>
+          <template #trigger>
+            <NButton size="small" type="primary" secondary :loading="syncing" :disabled="!data?.available" @click="syncNow">
+              立即同步
+            </NButton>
+          </template>
+          <template v-if="isRecorder">只拉取：把录屏仓库最新的队列拉下来。认领、回传这些动作点下去当场就推了，不用同步</template>
+          <template v-else>先拉取录屏仓库，再立刻跑一遍巡检：收回已回传的视频、撤回失效的文档、给新题排队生成——这几步的结果会推上去。平时巡检每轮自动做一次</template>
+        </NTooltip>
       </div>
     </div>
 
@@ -404,19 +457,44 @@ const scanNote = computed(() => {
         <span class="ml-auto text-[12px] text-fg2" :class="data.last_scan?.error ? '!text-err' : ''">{{ scanNote }}</span>
       </div>
 
-      <div v-if="tab === 'ready' && picked.size" class="card px-4 py-2.5 flex items-center gap-3 text-xs border-accent/40">
-        <span class="text-fg0">已选 <span class="mono nums font-semibold">{{ picked.size }}</span> 道</span>
-        <NButton size="small" type="info" :loading="busy === 'submit'" @click="submit([...picked])">
-          批量提交（{{ picked.size }}）
-        </NButton>
-        <NButton size="small" quaternary class="ml-auto" @click="picked = new Set()">清空选择</NButton>
+      <!-- 批量条：勾了才出现，按钮随栏变。录制队列是卡片墙，没有表头，全选放在这里 -->
+      <div v-if="canPick && (picked.size || ['queue', 'mine'].includes(tab)) && tabKeys.length"
+        class="card px-4 py-2.5 flex items-center gap-3 text-xs"
+        :class="picked.size ? 'border-accent/40' : ''">
+        <NCheckbox :checked="allPicked" :indeterminate="picked.size > 0 && !allPicked" @update:checked="toggleAll">
+          <span class="text-xs text-fg1">全选本栏 {{ tabKeys.length }} 道</span>
+        </NCheckbox>
+        <template v-if="picked.size">
+          <span class="text-fg0">已选 <span class="mono nums font-semibold">{{ picked.size }}</span> 道</span>
+          <NButton v-if="tab === 'docs'" size="small" type="primary" :loading="busy === 'batch'"
+            :disabled="!!data.skill_missing.length" @click="batchGenerate">
+            批量生成（{{ picked.size }}）
+          </NButton>
+          <span v-if="tab === 'docs' && picked.size > data.max_parallel" class="text-fg2">
+            额度 {{ data.max_parallel }}，超出的排队由巡检接着跑
+          </span>
+          <NButton v-if="tab === 'waiting'" size="small" type="warning" secondary :loading="busy === 'batch'" @click="batchWithdraw">
+            批量撤回（{{ picked.size }}）
+          </NButton>
+          <NButton v-if="tab === 'ready'" size="small" type="info" :loading="busy === 'submit'" @click="submit(pickedIds())">
+            批量提交（{{ picked.size }}）
+          </NButton>
+          <NButton v-if="tab === 'queue'" size="small" type="primary" :loading="busy === 'batch'" @click="batchClaim">
+            批量认领（{{ picked.size }}）
+          </NButton>
+          <NButton v-if="tab === 'mine'" size="small" secondary :loading="busy === 'batch'" @click="batchRelease">
+            批量放回（{{ picked.size }}）
+          </NButton>
+          <NButton size="small" quaternary class="ml-auto" @click="picked = new Set()">清空选择</NButton>
+        </template>
       </div>
 
       <!-- 本机题目（出题端四栏） -->
       <div v-if="localRows.length || ['docs', 'waiting', 'returned', 'ready'].includes(tab)" class="card">
         <template v-if="['docs', 'waiting', 'returned', 'ready'].includes(tab)">
           <div class="px-4 h-10 grid items-center gap-3 border-b border-line text-[12px] text-fg2 rec-local-cols">
-            <NCheckbox v-if="tab === 'ready'" :checked="allPicked" :disabled="!lists.ready.length" @update:checked="toggleAll" />
+            <NCheckbox v-if="canPick" :checked="allPicked" :indeterminate="picked.size > 0 && !allPicked"
+              :disabled="!localRows.length" @update:checked="toggleAll" />
             <span v-else />
             <span>题号</span>
             <span>状态</span>
@@ -427,7 +505,7 @@ const scanNote = computed(() => {
           <div v-if="!localRows.length" class="empty">{{ current?.empty }}</div>
           <div v-for="t in localRows" :key="t.id"
             class="px-4 py-2.5 border-b border-line last:border-0 grid items-center gap-3 hover:bg-bg3/40 rec-local-cols">
-            <NCheckbox v-if="tab === 'ready'" :checked="picked.has(t.id)" @update:checked="(v: boolean) => toggle(t.id, v)" />
+            <NCheckbox v-if="canPick" :checked="picked.has(String(t.id))" @update:checked="(v: boolean) => toggle(t.id, v)" />
             <span v-else />
             <button class="mono text-xs text-fg0 text-left hover:text-accent" @click="router.push(`/tasks/${t.id}`)">
               #{{ t.task_no }}
@@ -493,8 +571,11 @@ const scanNote = computed(() => {
       <!-- 录制队列（两种角色共用） -->
       <div v-if="['queue', 'mine', 'done'].includes(tab)" class="grid gap-3 grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3">
         <div v-if="!queueRows.length" class="card empty lg:col-span-2 2xl:col-span-3">{{ current?.empty }}</div>
-        <div v-for="e in queueRows" :key="e.key" class="card card-hover p-4 flex flex-col gap-3 transition-all">
+        <div v-for="e in queueRows" :key="e.key" class="card card-hover p-4 flex flex-col gap-3 transition-all"
+          :class="picked.has(e.key) ? 'ring-2 ring-accent/40' : ''">
           <div class="flex items-start gap-3">
+            <NCheckbox v-if="canPick" class="mt-2.5" :checked="picked.has(e.key)"
+              @update:checked="(v: boolean) => toggle(e.key, v)" />
             <div class="w-10 h-10 rounded-inner grid place-items-center shrink-0 border"
               :class="e.state === 'claimed' ? 'bg-run/10 border-run/30 text-run' : e.state === 'open' ? 'bg-accent/10 border-accent/30 text-accent' : 'bg-ok/10 border-ok/30 text-ok'">
               <span class="mono text-xs font-semibold">{{ e.task_no.slice(0, 4) }}</span>
