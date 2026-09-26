@@ -28,7 +28,7 @@ _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 # 理由里对文件的引用：带目录的路径，或者带常见扩展名的文件名
 _FILE_REF = re.compile(
     r"\b(?:[\w.\-]+/)+[\w.\-]+\.\w{1,6}\b"
-    r"|\b[\w\-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|rb|php|c|h|cc|cpp|hpp|cs|swift|kt"
+    r"|(?<![\w.\-/])[\w\-]+(?:\.[\w\-]+)*\.(?:py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|rb|php|c|h|cc|cpp|hpp|cs|swift|kt"
     r"|json|ya?ml|toml|ini|cfg|md|txt|sh|sql|html|css|scss|vue|svelte)\b")
 
 
