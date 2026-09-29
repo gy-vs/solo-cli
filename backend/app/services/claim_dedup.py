@@ -32,6 +32,7 @@ FRESH_S = 1800          # 通过的结论管多久。平台历史一直在长，
 IN_FLIGHT = (CLAIMED, QUEUED, RUNNING, RUN_DONE, ANALYZING, ANALYZED, QC, READY, NEEDS_ATTENTION)
 
 PASS, HIT, SKIPPED = "pass", "hit", "skipped"
+DATASET = "gsb"
 
 
 def enabled() -> bool:
@@ -52,7 +53,8 @@ def cached(task: Task) -> dict | None:
         return None
     if d.get("state") == SKIPPED:
         return d
-    if d.get("state") == PASS and _age(d.get("checked_at") or "") < FRESH_S:
+    # 没带 dataset 的是桥接改口径之前比的上一期旧池，那种「通过」不作数
+    if d.get("state") == PASS and d.get("dataset") == DATASET and _age(d.get("checked_at") or "") < FRESH_S:
         return d
     return None
 
@@ -109,7 +111,7 @@ async def check(task_ids: list[int]) -> dict:
                   + (f"，另有 {len(hits) - 1} 处" if len(hits) > 1 else "")) if hits else "规则 A 查重通过"
         results[tid] = {"stage": STAGE, "state": state, "verdict": "discard" if hits else "pass",
                         "passed": not hits, "reason": reason, "hits": hits[:5],
-                        "prompt_hash": hashes[tid], "checked_at": now}
+                        "prompt_hash": hashes[tid], "checked_at": now, "dataset": DATASET}
     with session() as db:
         for tid in order:
             if (t := db.get(Task, tid)) is not None:

@@ -1,15 +1,22 @@
-"""查重桥接：只跑 solo-qa 的查重规则 A 与规则 C。
+"""查重桥接：按 solo2 的 GSB 口径只跑查重规则 A 与规则 C。
 
 这个文件不在 solo-cli 的进程里运行，而是挂进 solo-qa 的后端镜像执行
 （那套依赖 pin 了 sqlalchemy/pydantic 的具体版本，跟 solo-cli 的直接混装会冲突）。
 因此只用标准库 + solo-qa 自己的包，不要 import solo-cli 的任何模块。
 
+必须走 GSB 这一期的口径（`backend.gsb.qc.dedup` / `backend.gsb.qc.semantic`），
+不能直接调服务层：GSB 的字段在池里叫 `gsb_user_prompt`、落在自己的 `gsb_prompt_pool`，
+在途与同仓库候选从 `gsb_submission` 取。以前这里传的是不带前缀的 `user_prompt`、
+候选取的是上一期的 `submission` 表，比的是上一期的旧数据，本期的题一条都比不到 ——
+478 就是这样查出「通过、相似度 0」，交上去被平台按规则 A 废掉。
+
 只读口径（对应 solo-qa 的 docs/DedupPlan.md）：
-- 只调 `dedup.service.run_dedup` 与 `dedup.semantic.review`，这两条路径只发 SELECT；
-- 不调 `runner.run_batch` / `apply_result` / `pool_membership.sync_after_qc`
-  / `lark.sync_service`，所以不写结论、不入查重池、不碰飞书；
-- 关掉模型缓存，避免规则 C 的模型调用写 `qc_llm_cache`；
-- 待查题目用 `MAX(id)` 之上的虚拟 row_id，只存在于内存，不落库。
+- 只调 `run_dedup`、`gsb_dedup._inflight_targets`、`gsb_semantic.load_peers` 与
+  `review_peers`，这几条路径只发 SELECT；
+- 不调 `push` / `save_hits` / GSB 的 `runner`，所以不写结论、不入查重池、不碰飞书；
+- 关掉模型缓存，避免规则 C 的模型调用写缓存表；
+- 待查题目用 `MAX(gsb_submission.id)` 之上的虚拟 row_id，只存在于内存，不落库。
+  取在最大值之上是为了让在途比对把它们当成「后提交的」—— 平台只判后来者。
 
 唯一不可避免的写操作是查重池客户端初始化时的 `CREATE TABLE IF NOT EXISTS`
 （`dedup/pool.py:ensure_schema`），表已存在时它不改结构。
@@ -39,10 +46,13 @@ async def run(payload: dict) -> dict:
 
     from backend import config_center
     from backend.db import dispose_engine, get_session_factory
-    from backend.dedup import semantic
-    from backend.dedup.service import DedupTarget, DedupUnavailable, run_dedup
-    from backend.models import Submission
-    from backend.states import FIELD_USER_PROMPT, SUBMITTED
+    from backend.dedup import semantic as legacy_semantic
+    from backend.dedup.service import DedupUnavailable, run_dedup
+    from backend.gsb.models import GsbSubmission
+    from backend.gsb.qc import dedup as gsb_dedup
+    from backend.gsb.qc import semantic as gsb_semantic
+    from backend.states import RULE_A as SERVICE_RULE_A
+    from backend.states import SUBMITTED
 
     items = payload.get("items") or []
     rules = [r.upper() for r in (payload.get("rules") or ["A", "C"])]
@@ -52,110 +62,91 @@ async def run(payload: dict) -> dict:
     factory = get_session_factory()
     async with factory() as db:
         await config_center.refresh(db)
-        # 规则 C 的模型判定默认读写 qc_llm_cache 表，这里只读所以关掉
+        # 规则 C 的模型判定默认读写缓存表，这里只读所以关掉
         config_center.set_local_override("qc.llm_cache_enabled", False)
-        max_id = (await db.execute(select(func.max(Submission.id)))).scalar() or 0
+        max_id = (await db.execute(select(func.max(GsbSubmission.id)))).scalar() or 0
 
-    # 虚拟 ID 取真实最大值之上，让在途查重把这些题当成「后提交的」
     base = int(max_id) + 1000
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    submitter = str(payload.get("submitter") or "solo-cli")
     for idx, it in enumerate(items):
         it["_row_id"] = base + idx
 
     results: dict[int, dict] = {
         it["_row_id"]: {"key": it.get("key") or str(it["_row_id"]), "rules": {}} for it in items
     }
-    meta: dict = {"max_submission_id": int(max_id), "rules": rules}
+    meta: dict = {"max_submission_id": int(max_id), "rules": rules, "dataset": "gsb"}
 
-    # ---------- 规则 A：字面/近字面查重，批内互查 + 历史池 ----------
+    # ---------- 规则 A：GSB 池 + GSB 在途 + 批内互查 ----------
     if "A" in rules:
-        targets = [
-            DedupTarget(
-                row_id=it["_row_id"],
-                repo_id=(it.get("repo_id") or "").strip(),
-                seq=f"new:{it.get('key') or it['_row_id']}",
-                submit_date=today,
-                submitter=str(payload.get("submitter") or "solo-cli"),
-                texts={FIELD_USER_PROMPT: it.get("user_prompt") or ""},
-            )
-            for it in items
-        ]
+        targets = []
+        for it in items:
+            t = gsb_dedup.to_target(None, {
+                "user_prompt": it.get("user_prompt") or "",
+                "repo_id": (it.get("repo_id") or "").strip(),
+                "submitted_date": today,
+                "submitter_name": submitter,
+            }, row_id=it["_row_id"])
+            # to_target 把 seq 设成 row_id，而虚拟 row_id 出了这个进程就没意义；
+            # 换成调用方的 key，批内命中的证据才能指回是哪道题
+            t.seq = f"new:{it.get('key') or it['_row_id']}"
+            t.texts = {k: v for k, v in t.texts.items() if v.strip()}
+            targets.append(t)
         try:
-            outcomes = await run_dedup(targets)
+            async with factory() as db:
+                inflight = await gsb_dedup._inflight_targets(db, exclude_ids=set())
+            meta["inflight"] = len(inflight)
+            outcomes = await run_dedup(targets, inflight=inflight)
         except DedupUnavailable as e:
             # fail closed：查重没跑成不能当通过
             return {"ok": False, "error": f"规则 A 未完成（查重池不可用）：{e}"}
         for rid, oc in outcomes.items():
-            hits = [json.loads(h.evidence_json()) for h in oc.hits if h.rule == "A"]
+            a_hits = [h for h in oc.hits if h.rule == SERVICE_RULE_A]
             results[rid]["rules"]["A"] = {
                 "passed": not oc.hit_rule_a,
-                "summary": oc.summary() or "查重 A 通过",
-                "hits": hits,
-                "top_similarity": max((h.similarity for h in oc.hits if h.rule == "A"), default=0.0),
+                "summary": gsb_dedup._summary_of(oc) if oc.hit_rule_a else "查重 A 通过",
+                "hits": [json.loads(h.evidence_json()) for h in a_hits],
+                "top_similarity": max((h.similarity for h in a_hits), default=0.0),
             }
 
-    # ---------- 规则 C：同仓库语义雷同，历史库 + 同批其他题 ----------
+    # ---------- 规则 C：同仓库语义雷同，GSB 已通过/在途 + 同批其他题 ----------
     if "C" in rules:
-        original_load_peers = semantic.load_peers
-
-        async def load_peers_with_batch(db, submission):
-            """在库内候选之外，追加同批的其他题目。
-
-            同一批设计出来的题目彼此也不能功能雷同，但它们都还没入库，
-            `load_peers` 的 SQL 查不到，所以在这里补进去。
-            批内题用负数 submission_id 标识，便于结论里区分。
-            """
-            peers = list(await original_load_peers(db, submission))
-            repo = (submission.repo_id or "").strip()
-            for pos, other in enumerate(items):
-                if other["_row_id"] == submission.id:
-                    continue
-                if (other.get("repo_id") or "").strip() != repo:
-                    continue
-                text = (other.get("user_prompt") or "").strip()
-                if not text:
-                    continue
-                peers.append(
-                    semantic.Peer(
-                        submission_id=-(pos + 1),
-                        session_id=str(other.get("session_id") or ""),
-                        round_no=1,
+        async with factory() as db:
+            for it in items:
+                sub = GsbSubmission()
+                sub.id = it["_row_id"]
+                sub.repo_id = (it.get("repo_id") or "").strip()
+                sub.user_prompt = it.get("user_prompt") or ""
+                peers = list(await gsb_semantic.load_peers(db, sub))
+                # 同一批设计出来的题彼此也不能雷同，但它们都还没入库，SQL 查不到，
+                # 在这里补进去。批内题用负数 submission_id 标识，便于结论里区分
+                for pos, other in enumerate(items):
+                    if other["_row_id"] == sub.id or (other.get("repo_id") or "").strip() != sub.repo_id:
+                        continue
+                    text = (other.get("user_prompt") or "").strip()
+                    if not text:
+                        continue
+                    peers.append(legacy_semantic.Peer(
+                        submission_id=-(pos + 1), session_id="", round_no=0,
                         submitter_name=f"同批题 {other.get('key') or pos + 1}",
-                        submitted_at=None,
-                        user_prompt=text,
-                        status=SUBMITTED,
-                    )
+                        submitted_at=None, user_prompt=text, status=SUBMITTED,
+                    ))
+                oc = await legacy_semantic.review_peers(
+                    peers=peers, submission_id=sub.id, user_prompt=sub.user_prompt,
+                    repo_id=sub.repo_id, session_id="",
                 )
-            return peers
-
-        semantic.load_peers = load_peers_with_batch
-        try:
-            async with factory() as db:
-                for it in items:
-                    sub = Submission()
-                    sub.id = it["_row_id"]
-                    sub.repo_id = (it.get("repo_id") or "").strip()
-                    sub.user_prompt = it.get("user_prompt") or ""
-                    sub.session_id = str(it.get("session_id") or "")
-                    sub.status = SUBMITTED
-                    sub.round_no = 1
-                    sub.submitter_name = str(payload.get("submitter") or "solo-cli")
-                    sub.deleted_at = None
-                    oc = await semantic.review(db, sub)
-                    results[it["_row_id"]]["rules"]["C"] = {
-                        "passed": oc.passed and not oc.skipped,
-                        "skipped": oc.skipped,
-                        "error": oc.error,
-                        "summary": oc.summary(),
-                        "detail": oc.detail(),
-                        "peers_total": oc.peers_total,
-                        "sent": oc.sent,
-                        "task_type": oc.target_task_type,
-                        "judged": oc.judged,
-                    }
-                    meta.setdefault("model", oc.model)
-        finally:
-            semantic.load_peers = original_load_peers
+                results[it["_row_id"]]["rules"]["C"] = {
+                    "passed": oc.passed and not oc.skipped,
+                    "skipped": oc.skipped,
+                    "error": oc.error,
+                    "summary": oc.summary(),
+                    "detail": oc.detail(),
+                    "peers_total": oc.peers_total,
+                    "sent": oc.sent,
+                    "task_type": oc.target_task_type,
+                    "judged": oc.judged,
+                }
+                meta.setdefault("model", oc.model)
 
     # ---------- 汇总裁决：A 或 C 命中即废弃，未跑完即 unknown ----------
     out = []
