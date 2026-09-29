@@ -329,6 +329,8 @@ const payloadPreview = computed<[string, string][]>(() => {
     ['harness', t.harness || 'Claude Code'], ['harness_version', `${t.harness_version}（上传时以镜像实测为准）`],
     ['os_platform', t.os_platform], ['repro_level', t.repro_level], ['env_snapshot', t.env_snapshot],
     ['a_session_id', a?.session_id || ''], ['b_session_id', b?.session_id || ''],
+    ['a_model_name', `${a?.model || '镜像自带'}（上传时以轨迹实测为准）`],
+    ['b_model_name', `${b?.model || '镜像自带'}（上传时以轨迹实测为准）`],
     ['a_artifact_snapshot', a?.artifact_url || ''], ['b_artifact_snapshot', b?.artifact_url || ''],
     ['a_trace_file', a?.trace_file ? a.trace_file.split('/').pop() || '' : ''],
     ['b_trace_file', b?.trace_file ? b.trace_file.split('/').pop() || '' : ''],

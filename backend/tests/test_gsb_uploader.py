@@ -133,6 +133,76 @@ def test_values_take_screencast_from_task(ready_task):
     assert v["a_screencast"] == "https://v.example/a"
 
 
+def _write_trace(path, *models):
+    import json as _json
+    lines = [_json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}})]
+    lines += [_json.dumps({"type": "assistant", "message": {"role": "assistant", "model": mo}})
+              for mo in models]
+    path.write_text("\n".join(lines) + "\nnot json\n", encoding="utf-8")
+
+
+def test_trace_model_takes_the_most_common_assistant_model(tmp_path):
+    f = tmp_path / "t.jsonl"
+    _write_trace(f, "<synthetic>", "ark/urm-03", "auto_model/urm", "auto_model/urm", "<synthetic>")
+    assert up.trace_model(str(f)) == "auto_model/urm"
+
+
+def test_trace_model_is_empty_when_unreadable(tmp_path):
+    assert up.trace_model(str(tmp_path / "missing.jsonl")) == ""
+    assert up.trace_model("") == ""
+
+
+def test_values_take_model_name_from_each_sides_trace(ready_task):
+    """B 侧换了模型的题，两侧要各报各的，不能都填镜像自带的那个。"""
+    from pathlib import Path
+
+    from app.db import session
+
+    task_id, _ = ready_task
+    with session() as db:
+        runs = {r.side: r for r in db.query(m.TaskRun).filter(m.TaskRun.task_id == task_id)}
+        _write_trace(Path(runs["A"].trace_file), "auto_model/urm")
+        _write_trace(Path(runs["B"].trace_file), "ark/urm-03")
+    v = _values(task_id)
+    assert v["a_model_name"] == "auto_model/urm"
+    assert v["b_model_name"] == "ark/urm-03"
+
+
+def test_values_fall_back_to_run_model_without_trace_model(ready_task):
+    from app.db import session
+
+    task_id, ids = ready_task
+    with session() as db:
+        db.get(m.TaskRun, ids["B"]).model = "ark/urm-03"
+    v = _values(task_id)
+    assert v["a_model_name"] == "" and v["b_model_name"] == "ark/urm-03"
+
+
+_MODEL_FIELDS = {"fields": [
+    {"field_key": "x_a_model_name", "label": "A-模型名称", "side": "A", "field_type": "select",
+     "is_required": True, "is_enabled": True, "options": ["auto_model/urm", "ark/urm-03"]},
+    {"field_key": "x_b_model_name", "label": "B-模型名称", "side": "B", "field_type": "select",
+     "is_required": True, "is_enabled": True, "options": ["auto_model/urm", "ark/urm-03"]},
+]}
+
+
+def test_resolve_maps_model_name_onto_platform_custom_keys():
+    """平台的 key 是后台自定义的 x_ 前缀，按 side 和标签认，并且不再算作未知必填。"""
+    values = {"a_model_name": "auto_model/urm", "b_model_name": "ARK/urm-03"}
+    out = up.resolve_fields(_MODEL_FIELDS, values)
+    assert out["x_a_model_name"] == "auto_model/urm"
+    assert out["x_b_model_name"] == "ark/urm-03"
+    assert up.unknown_required(_MODEL_FIELDS, out) == []
+    assert up.missing_required(_MODEL_FIELDS, out) == []
+
+
+def test_resolve_leaves_model_name_empty_when_not_an_option():
+    """轨迹里的模型不在平台选项里时不挑一个「最像的」，留空让必填校验报出来。"""
+    out = up.resolve_fields(_MODEL_FIELDS, {"a_model_name": "glm-9", "b_model_name": ""})
+    assert out["x_a_model_name"] == "" and out["x_b_model_name"] == ""
+    assert up.missing_required(_MODEL_FIELDS, out) == ["x_a_model_name", "x_b_model_name"]
+
+
 def test_values_fill_fixed_platform_choices(ready_task):
     task_id, _ = ready_task
     v = _values(task_id)

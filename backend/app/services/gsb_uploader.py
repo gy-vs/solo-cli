@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import httpx
@@ -99,6 +101,32 @@ async def build_values_for(task_id: int) -> dict:
         return await build_values(task, runs)
 
 
+def trace_model(path: str) -> str:
+    """轨迹里 assistant 消息实际报的模型名，取出现最多的那个；读不到返回空串。
+
+    `<synthetic>` 是 Claude Code 自己补的占位消息，不是哪个模型答的，不算。
+    """
+    if not path:
+        return ""
+    seen: Counter[str] = Counter()
+    try:
+        with open(path, encoding="utf-8") as fp:
+            for line in fp:
+                if '"model"' not in line:
+                    continue
+                try:
+                    msg = json.loads(line).get("message")
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    name = str(msg.get("model") or "").strip()
+                    if name and name != "<synthetic>":
+                        seen[name] += 1
+    except OSError:
+        return ""
+    return seen.most_common(1)[0][0] if seen else ""
+
+
 async def build_values(task: Task, runs: dict[str, TaskRun]) -> dict:
     """算出所有能自动填的字段值。轨迹附件要先上传拿到引用，所以不在这里。"""
     gsb = task.gsb or {}
@@ -127,6 +155,9 @@ async def build_values(task: Task, runs: dict[str, TaskRun]) -> dict:
         run = runs[side]
         low = side.lower()
         values[f"{low}_session_id"] = run.session_id
+        # 以轨迹实测为准；run.model 只是入队时抄下的覆盖值，A 侧和单模型题都是空串
+        values[f"{low}_model_name"] = (await asyncio.to_thread(trace_model, run.trace_file)
+                                       or (run.model or "").strip())
         values[f"{low}_artifact_snapshot"] = run.artifact_url or gsb_repo.commit_url(
             task.repo_url, run.artifact_sha)
         values[f"{low}_screencast"] = screencast.get(side, "")
@@ -160,6 +191,32 @@ def _delivery_target(f: dict) -> str:
     return f"{side}_{kind}_delivery" if side and kind else ""
 
 
+def _model_target(f: dict) -> str:
+    """平台「A/B-模型名称」字段对应的本地字段名，认不出来返回空串。
+
+    这对字段是后台自定义加的，key 带 x_ 前缀、随时可能换，所以按 side 和标签认。
+    """
+    key = _field_key(f).lower()
+    label = str(f.get("label") or "")
+    if "模型名称" not in label and not key.endswith("model_name"):
+        return ""
+    side = str(f.get("side") or "").strip().lower()
+    if side not in ("a", "b"):
+        m = re.search(r"(?:^|_)([ab])_model_name$", key) or re.match(r"\s*([AB])\s*[-－]", label)
+        side = m.group(1).lower() if m else ""
+    return f"{side}_model_name" if side else ""
+
+
+def _option_value(f: dict, want: str):
+    """在下拉选项里找和 want 一致的那个（忽略大小写），对不上返回空串。"""
+    for o in f.get("options") or []:
+        v = o.get("value") if isinstance(o, dict) else o
+        lab = o.get("label") if isinstance(o, dict) else o
+        if want.lower() in (str(v).strip().lower(), str(lab).strip().lower()):
+            return v
+    return ""
+
+
 def _score_value(f: dict, score):
     """评分按字段类型给：数字类型给整数，下拉给能对上的那个选项值，其余给字符串。"""
     if score in ("", None):
@@ -176,10 +233,18 @@ def _score_value(f: dict, score):
 
 
 def resolve_fields(schema: dict, values: dict) -> dict:
-    """按 schema 把交付完整性的值挂到平台实际用的 key 上，评分按字段类型换成对应的形态。"""
+    """按 schema 把交付完整性、模型名称的值挂到平台实际用的 key 上，评分按字段类型换成对应的形态。
+
+    模型名称只填平台选项里有的值。轨迹里的模型名不在选项里时留空，交给 missing_required
+    报出来：选一个「最像的」填上去，这一单就成了拿错模型的记录。
+    """
     out = dict(values)
     for f in enabled_fields(schema):
         key = _field_key(f)
+        if (model := _model_target(f)) and model in values:
+            want = str(values[model] or "").strip()
+            out[key] = (_option_value(f, want) if f.get("options") else want) if want else ""
+            continue
         target = key if key in values and key.endswith("_delivery") else _delivery_target(f)
         if not target or target not in values:
             continue
@@ -426,6 +491,15 @@ async def upload_task(task_id: int) -> dict:
                              fields={k: "本地无此字段" for k in unknown})
             if missing := missing_required(schema, values):
                 human = {"a_screencast": "A 侧录屏链接", "b_screencast": "B 侧录屏链接"}
+                for f in enabled_fields(schema):
+                    if (model := _model_target(f)) and _field_key(f) in missing:
+                        side = model[0].upper()
+                        got = str(values.get(model) or "").strip()
+                        opts = "、".join(str(o.get("value") if isinstance(o, dict) else o)
+                                        for o in f.get("options") or [])
+                        human[_field_key(f)] = (
+                            f"{side} 侧模型名称（轨迹里是 {got}，平台选项只有 {opts}）" if got
+                            else f"{side} 侧模型名称（轨迹里读不到模型名）")
                 names = [human.get(k, k) for k in missing]
                 return _fail(task_id, record, f"字段缺失：{', '.join(names)}",
                              fields={k: "缺值" for k in missing})
