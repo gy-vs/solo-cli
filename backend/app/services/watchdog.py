@@ -43,13 +43,17 @@ from app.models import (
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
     RUN_TIMEOUT, SCHEDULABLE, SETTLING, WATCHED, RunEvent, Task, TaskRun, as_utc, utc_now,
 )
-from app.services import difficulty, dockerx, gsb_repo, llm, settings_store
+from app.services import breaker, difficulty, dockerx, gsb_repo, llm, settings_store
 
 log = logging.getLogger("watchdog")
 
 INTERVAL_DEFAULT = 300
 MAX_RETRIES_DEFAULT = 3
 MAX_TIMEOUTS_DEFAULT = 2
+# 同一侧因断网被退回、不计次数的上限。断网本不该算到题头上，但熔断探活只看得到
+# 网关和 GitHub 通不通，看不到某一道题自己的仓库是不是一直连不上；超过这个数就当成
+# 这道题自己的问题，回到按次数算。
+NET_RETRIES_MAX = 3
 
 # 「零改动」是代价最大的一条异常：它会把整侧清掉重跑。而收尾那一刻读到的零改动
 # 未必作数，所以动手之前要实测复核一次。这里留常量是为了让判定和复核认的是同一句话。
@@ -105,6 +109,7 @@ def status() -> dict:
     return {
         "interval_seconds": max(30, settings_store.get_int("watchdog.interval_seconds", INTERVAL_DEFAULT)),
         "paused": paused(),
+        "breaker": breaker.state() if breaker.tripped() else None,
         "max_retries": settings_store.get_int("watchdog.max_retries", MAX_RETRIES_DEFAULT),
         "max_timeouts": settings_store.get_int("watchdog.max_timeouts", MAX_TIMEOUTS_DEFAULT),
         "alive": alive(),
@@ -186,6 +191,12 @@ def abnormal_reason(run: TaskRun, container_alive: bool | None = None) -> str:
     if not artifact.get("changed_files") and not (run.git_diff_stat or "").strip():
         return f"{ZERO_CHANGE_REASON}，疑似戛然而止{_gateway_note(process)}"
     return ""
+
+
+def network_failed(run: TaskRun) -> bool:
+    """这一侧是不是因为连不上模型网关才跑挂的。只对已经判出异常的侧有意义。"""
+    process = (run.verdict or {}).get("process") or {}
+    return breaker.network_failure(process.get("api_error") or "")
 
 
 def can_retry(run: TaskRun, max_retries: int | None = None) -> bool:
@@ -277,7 +288,7 @@ def clear_analysis(task: Task) -> None:
 
 
 async def requeue_run(run_id: int, *, reason: str, reset_attempt: bool = False,
-                      full: bool = True) -> dict:
+                      full: bool = True, count: bool = True) -> dict:
     """把一侧退回起点重新排队。
 
     顺序不能变：先销毁容器（不然容器名占着起不来），再归档轨迹（镜像拒绝非空目录，
@@ -291,6 +302,8 @@ async def requeue_run(run_id: int, *, reason: str, reset_attempt: bool = False,
     详见 gsb_repo.rebuild_side。重跑出来的这一跑必须跟第一次跑站在同一个起点上，
     不然两边就没有可比性；留下任何上一跑的痕迹——工作区的文件、`.git` 里的对象、
     远端分支上的提交、容器里的会话记录——都算污染。
+
+    count 为假时不加 attempt：这一跑是断网跑挂的，不是这道题的问题。
     """
     with session() as db:
         run = db.get(TaskRun, run_id)
@@ -315,7 +328,8 @@ async def requeue_run(run_id: int, *, reason: str, reset_attempt: bool = False,
     else:
         rst = await gsb_repo.reset_side(task_no, side, snapshot)
     if not rst.get("ok"):
-        return {"ok": False, "message": f"{side} 侧回退失败：{rst.get('message')}"}
+        return {"ok": False, "network": bool(rst.get("network")),
+                "message": f"{side} 侧回退失败：{rst.get('message')}"}
 
     with session() as db:
         run = db.get(TaskRun, run_id)
@@ -328,7 +342,10 @@ async def requeue_run(run_id: int, *, reason: str, reset_attempt: bool = False,
         # 超时单独记一笔再清掉状态，不然重跑一次这笔账就没了，超时上限永远撞不到
         if run.status == RUN_TIMEOUT:
             run.timeouts = (run.timeouts or 0) + 1
-        run.attempt = 1 if reset_attempt else run.attempt + 1
+        if reset_attempt:
+            run.attempt = 1
+        elif count:
+            run.attempt += 1
         if reset_attempt:
             run.timeouts = 0
         run.status = RUN_QUEUED
@@ -818,6 +835,10 @@ async def _scan_abnormal() -> dict:
             reason = abnormal_reason(run, alive)
             over_budget = discard_reason(run, max_retries, max_timeouts)
             recorded = dict(run.abnormal or {})
+            net_used = int(recorded.get("net_retries") or 0)
+            # 断网跑挂的不算这道题的账，但只给 NET_RETRIES_MAX 次，理由见常量
+            net = bool(reason) and network_failed(run) and net_used < NET_RETRIES_MAX
+            fresh = breaker.after_reset(run.finished_at)
         if not reason:
             # 判过异常、现在又不成立了：要么是我们判错撤销了，要么是人把环境修好了。
             # 记录留着不清，这一侧会一直挂着一条过期的异常。
@@ -826,6 +847,10 @@ async def _scan_abnormal() -> dict:
             continue
         if recorded.get("gave_up"):
             continue
+        if net and fresh and not held_only:
+            breaker.trip(f"run {run_id} 连不上模型网关：{reason}")
+        # 熔断拉着时和人按暂停是同一种处理：只记不动手，等探活放开
+        held_only = held_only or breaker.tripped()
         if held_only:
             # 模型或网关停机时开的那个开关。判定照做、异常照记，但一步都不动手：
             # 重跑会把这一侧连 .git 一起删掉重建，停机期间每一侧都会跑挂，真让它跑起来
@@ -837,15 +862,37 @@ async def _scan_abnormal() -> dict:
         if reason.startswith(ZERO_CHANGE_REASON) and await _recount_output(run_id):
             # 收尾那一刻读到的零改动未必作数，详见 runner.workspace_output
             continue
-        if over_budget:
+        if over_budget and not net:
             log.warning("run %s 异常（%s），%s，废弃整题", run_id, reason, over_budget)
             await give_up(run_id, f"{reason}（{over_budget}）")
             stats["discarded"] += 1
             continue
-        log.info("run %s 异常（%s），重跑", run_id, reason)
-        r = await requeue_run(run_id, reason=reason)
+        if net:
+            log.info("run %s 断网跑挂（%s），不计次数重跑", run_id, reason)
+            r = await requeue_run(run_id, reason=reason, count=False)
+        else:
+            log.info("run %s 异常（%s），重跑", run_id, reason)
+            r = await requeue_run(run_id, reason=reason)
         if r["ok"]:
+            if net:
+                with session() as db:
+                    run = db.get(TaskRun, run_id)
+                    if run is not None:
+                        run.abnormal = {**(run.abnormal or {}), "net_retries": net_used + 1}
             stats["requeued"] += 1
+            continue
+        net_prep = int(recorded.get("net_prep_failures") or 0)
+        if r.get("network") and net_prep < NET_RETRIES_MAX:
+            # clone、推送是断网断掉的：拉闸等探活，不往废弃那条路上攒次数。每次都是探活
+            # 说已经通了之后才会再走到这儿，所以同样给一个上限，防一个仓库自己连不上。
+            breaker.trip(f"run {run_id} 重跑准备断网：{r['message']}")
+            with session() as db:
+                run = db.get(TaskRun, run_id)
+                if run is not None:
+                    run.abnormal = {**recorded, "reason": reason, "at": utc_now().isoformat(),
+                                    "attempt": run.attempt, "net_prep_failures": net_prep + 1,
+                                    "prep_error": r["message"]}
+            stats["held"] += 1
             continue
         # 重跑准备失败不是这道题的错，是 clone、回退这类环境动作没做成，多半下一轮
         # 就好了，所以不占重跑次数。但也不能无限试下去：连着失败到重跑上限那么多次，
@@ -912,7 +959,7 @@ async def _scan_probe() -> int:
     却要中断一次正在进行的运行。唯一的例外是先跑完那一侧低于单侧步数硬下限，
     见 difficulty.below_hard_floor。
     """
-    if not difficulty.probe_enabled() or paused():
+    if not difficulty.probe_enabled() or paused() or breaker.tripped():
         return 0
     with session() as db:
         candidates = [t.id for t in db.execute(
@@ -1371,8 +1418,21 @@ async def _scan_pairs() -> int:
     return started
 
 
+async def _check_breaker() -> None:
+    """熔断拉着就探一次，通了就放开。排在异常扫描前面，放开的当轮就能把挂起的侧重跑掉。"""
+    if not breaker.tripped():
+        return
+    ok, msg = await breaker.probe()
+    if ok:
+        log.info("网络探活通过（%s），放开熔断", msg)
+        breaker.reset()
+    else:
+        log.warning("网络熔断中，%s", msg)
+
+
 async def tick() -> dict:
     """跑一轮定时任务。三步的先后都不能换，理由见上面那段注释。"""
+    await _check_breaker()
     adopted = await _scan_orphans()
     stats = await _scan_abnormal()
     # 收题级状态的两步都排在异常扫描之后：它们靠「这一侧不算异常」这个结论做排除，
@@ -1444,6 +1504,9 @@ async def _loop() -> None:
             _last_error = f"{type(exc).__name__}: {exc}"
             log.exception("巡检异常")
         interval = max(30, settings_store.get_int("watchdog.interval_seconds", INTERVAL_DEFAULT))
+        if breaker.tripped():
+            # 熔断期间调度整个停着，探活越勤队列越早恢复
+            interval = min(interval, 60)
         try:
             await asyncio.wait_for(_wake.wait(), timeout=interval)
         except asyncio.TimeoutError:
@@ -1549,6 +1612,43 @@ def queue_advance(task_id: int) -> dict:
     wake()
     return {"ok": True, "started": False,
             "message": f"分析并发已满，排在第 {len(_advance_wanted)} 位等额度"}
+
+
+async def revive_discarded(task_id: int) -> dict:
+    """把跑到一半被废弃的题捞回来：两侧正常跑完的留着，其余侧按人工重跑的规矩重来。
+
+    废弃时两侧的 run 都还在，一侧可能已经好好跑完了。退回待领取的话 run 原样挂着，
+    再领取也只会补建缺的那侧，跑挂的那侧永远停在结束状态上，调度发不出去。
+    """
+    with session() as db:
+        task = db.get(Task, task_id)
+        if task is None:
+            return {"ok": False, "message": "题目不存在"}
+        runs = db.query(TaskRun).filter(TaskRun.task_id == task_id).all()
+        if len(runs) != len(config.SIDES):
+            return {"ok": False, "message": "两侧的运行记录不齐，没法接着跑"}
+        redo = [r for r in runs if r.status != RUN_FINISHED or abnormal_reason(r)]
+        sides = tuple(r.side for r in redo)
+        # 「已放弃」的记号先摘掉：万一下面重建到一半失败、题已经回到队列里，
+        # 巡检还能接着按重跑准备失败处理它，而不是当成废弃过的侧永远跳过
+        for r in redo:
+            r.abnormal = {}
+    if not sides:
+        with session() as db:
+            task = db.get(Task, task_id)
+            task.status, task.auto_error = RUN_DONE, ""
+            task.discarded_from, task.discarded_at = "", None
+        bus.publish("tasks", {"type": "task", "id": task_id})
+        return {"ok": True, "status": RUN_DONE, "message": "两侧都已正常跑完，放回等分析"}
+    res = await manual_rerun(task_id, sides)
+    with session() as db:
+        task = db.get(Task, task_id)
+        if task.status != DISCARDED:
+            task.discarded_from, task.discarded_at = "", None
+        status = task.status
+    if not res["ok"]:
+        return {**res, "status": status}
+    return {"ok": True, "status": status, "message": f"已重跑 {'、'.join(sides)} 侧：{res['message']}"}
 
 
 async def manual_rerun(task_id: int, sides: tuple[str, ...] = config.SIDES) -> dict:

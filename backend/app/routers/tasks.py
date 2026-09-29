@@ -518,12 +518,26 @@ async def discard(task_id: int, reason: str = Query(default="人工废弃")) -> 
 
 @router.post("/{task_id}/restore")
 async def restore(task_id: int) -> dict:
-    """恢复废弃的题：回到废弃前的状态，从未跑过的回到待领取。"""
+    """恢复废弃的题：回到废弃前的状态，从未跑过的回到待领取。
+
+    跑到一半被废弃的（多半是巡检自动废弃的），两侧 run 还在：正常跑完的那侧留着，
+    其余侧直接重跑，见 watchdog.revive_discarded。
+    """
     with session() as db:
         t = _get(db, task_id)
         if t.status != DISCARDED:
             raise HTTPException(409, "只有已废弃的题可以恢复")
         back = t.discarded_from or AVAILABLE
+        has_runs = len(_runs(db, task_id)) == len(config.SIDES)
+        if back in (RUNNING, QUEUED) and has_runs:
+            released = difficulty.override(t)
+    if back in (RUNNING, QUEUED) and has_runs:
+        res = await watchdog.revive_discarded(task_id)
+        if not res["ok"]:
+            raise HTTPException(400, res["message"])
+        return {**res, "message": res["message"] + ("，难度筛选不再拦它" if released else "")}
+    with session() as db:
+        t = _get(db, task_id)
         if back in (RUNNING, QUEUED):   # 废弃前的运行态已不存在，退回待领取
             back = AVAILABLE
         t.status = back

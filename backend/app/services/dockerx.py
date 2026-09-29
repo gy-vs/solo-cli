@@ -78,6 +78,14 @@ async def image_label(image: str, label: str) -> str:
     return r.out.strip() if r.ok else ""
 
 
+async def image_env(image: str) -> dict[str, str]:
+    r = await run(["docker", "image", "inspect", image, "--format",
+                   "{{range .Config.Env}}{{println .}}{{end}}"], timeout=15)
+    if not r.ok:
+        return {}
+    return dict(line.split("=", 1) for line in r.out.splitlines() if "=" in line)
+
+
 _version_cache: dict[str, str] = {}
 
 

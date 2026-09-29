@@ -29,6 +29,15 @@ def no_container_side_effects(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def breaker_closed(monkeypatch):
+    """熔断状态在进程内，一个用例拉了闸会让后面所有用例的调度和巡检都停着。"""
+    from app.services import breaker
+
+    monkeypatch.setattr(breaker, "_state", {})
+    monkeypatch.setattr(breaker, "_reset_at", None)
+
+
+@pytest.fixture(autouse=True)
 def tmp_coder_root(tmp_path, monkeypatch):
     """把工作区根目录指到临时目录，和 no_container_side_effects 是同一类保护。
 

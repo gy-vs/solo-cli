@@ -799,6 +799,9 @@ async def finalize(run_id: int, *, exit_code: int | None, result_event: dict,
     verdict = {
         "process": {"exit_code": exit_code, "timed_out": timed_out, "manual_stop": manual_stop,
                     "gateway_errors": gw, "attempt": attempt, "retries": retries,
+                    # 巡检靠这句认出「连不上模型网关」，见 breaker
+                    "api_error": (str(result_event.get("result") or "")[:300]
+                                  if result_event.get("is_error") else ""),
                     # 这一侧的 result 是采到的还是收尾时从日志补回来的，排查时要分得清
                     "result_recovered": result_recovered,
                     "container_status": snap.get("status", ""),

@@ -24,7 +24,7 @@ from app.models import (
     RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING, RUN_WAITING, SCHEDULABLE, Task, TaskRun,
     as_utc, derive_task_status, utc_now,
 )
-from app.services import difficulty, dockerx, runner, settings_store
+from app.services import breaker, difficulty, dockerx, runner, settings_store
 
 log = logging.getLogger("scheduler")
 
@@ -50,7 +50,7 @@ class Scheduler:
 
     @property
     def paused(self) -> bool:
-        return settings_store.get_bool("scheduler.paused", False)
+        return settings_store.get_bool("scheduler.paused", False) or breaker.tripped()
 
     # ---------------- 队列视图 ----------------
 
@@ -119,6 +119,7 @@ class Scheduler:
             "queued_tasks": len({q["task_id"] for q in queue}),
             "queue": queue[:200],
             "paused": self.paused,
+            "breaker": breaker.state() if breaker.tripped() else None,
             "alive": self.alive,
             "last_tick_at": beat.isoformat() if beat else None,
             "last_error": self.last_error,

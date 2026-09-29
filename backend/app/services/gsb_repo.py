@@ -123,6 +123,21 @@ def push_failure(res: dockerx.CmdResult) -> str:
     return "原因不明，检查网络与 Token 的 repo 写权限"
 
 
+def clone_failure(res: dockerx.CmdResult) -> str:
+    """clone 失败的说法。和 push 共用特征表，只是兜底那句换成读权限。"""
+    human = push_failure(res)
+    if human.startswith("原因不明"):
+        return "原因不明，检查网络与 Token 的仓库读权限"
+    return human.replace("写权限", "读权限")
+
+
+def network_error(res: dockerx.CmdResult) -> bool:
+    """这次 git 失败是不是断网。巡检据此拉熔断，而不是把它记成这道题的失败。"""
+    from app.services import breaker
+
+    return breaker.network_failure(f"{res.out}\n{res.err}")
+
+
 def diverged(res: dockerx.CmdResult) -> bool:
     """push 是不是因为本地与远端分叉而被拒。"""
     blob = f"{res.out}\n{res.err}".lower()
@@ -366,7 +381,8 @@ async def rebuild_side(task_no: str, repo_url: str, side: str, snapshot: str) ->
         ["git", *credential_args(repo_url), "clone", "--single-branch", repo_url, str(ws)],
         timeout=600)
     if not cl.ok:
-        return {"ok": False, "message": f"{side} 侧重新 clone 主干失败，检查仓库与 Token 权限"}
+        return {"ok": False, "network": network_error(cl),
+                "message": f"{side} 侧重新 clone 主干失败：{clone_failure(cl)}"}
 
     co = await _git(ws, "checkout", "-B", side, snapshot, timeout=120)
     if not co.ok:
@@ -379,7 +395,7 @@ async def rebuild_side(task_no: str, repo_url: str, side: str, snapshot: str) ->
         ["git", "-C", str(ws), *credential_args(repo_url), "push", "--force", "origin",
          f"{snapshot}:refs/heads/{side}"], timeout=300)
     if not push.ok:
-        return {"ok": False,
+        return {"ok": False, "network": network_error(push),
                 "message": f"{side} 侧远端分支退回初始快照失败：{push_failure(push)}"}
 
     hv = await verify_head(task_no, side, snapshot)
