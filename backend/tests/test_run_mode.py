@@ -81,6 +81,65 @@ def test_cycle_follows_the_settings(tmp_db):
     assert _dispatch(["auto"] * 4) == ["dual", "single", "dual", "single"]
 
 
+def _b(db, tid: int) -> m.TaskRun:  # noqa: ANN001
+    return db.query(m.TaskRun).filter(m.TaskRun.task_id == tid, m.TaskRun.side == "B").one()
+
+
+def test_switch_all_rewrites_queued_and_leaves_started_b_alone(tmp_db):
+    settings_store.set_one("cc.model_b", "new/model")
+    with session() as db:
+        queued = _task(db, "1", "single")
+        a_running = _task(db, "2", "single")
+        b_running = _task(db, "3", "single")
+    Scheduler()._mark_running([_run(a_running, "A"), _run(b_running, "B")])
+    with session() as db:
+        res = run_mode.switch_all(db, "dual", "new/model")
+    assert sorted(res["changed"]) == sorted([queued, a_running]) and res["locked"] == ["3"]
+    with session() as db:
+        for tid in (queued, a_running):
+            assert db.get(m.Task, tid).run_mode == "dual" and _b(db, tid).model == "new/model"
+        assert db.get(m.Task, b_running).run_mode == "single" and _b(db, b_running).model == ""
+
+
+def test_b_that_ran_once_stays_locked_after_requeue(tmp_db):
+    """B 侧被看护退回重跑，前一次的轨迹是按旧模型跑的，不能再换。"""
+    with session() as db:
+        tid = _task(db, "1", "single")
+        b = _b(db, tid)
+        b.status, b.attempt = m.RUN_QUEUED, 2
+    with session() as db:
+        assert run_mode.switch_all(db, "dual", "new/model")["locked"] == ["1"]
+
+
+def test_switch_to_auto_keeps_unstarted_pending_and_assigns_started_now(tmp_db):
+    settings_store.set_one("cc.model_b", "new/model")
+    with session() as db:
+        queued = _task(db, "1", "single")
+        started = _task(db, "2", "single")
+    Scheduler()._mark_running([_run(started, "A")])
+    with session() as db:
+        run_mode.switch_all(db, "auto", "new/model")
+    with session() as db:
+        assert db.get(m.Task, queued).run_mode == "auto" and db.get(m.Task, queued).mode_at is None
+        # 今天第一道开跑的，按 3 双 6 单派到双模型
+        assert db.get(m.Task, started).run_mode == "dual" and _b(db, started).model == "new/model"
+
+
+def test_switch_back_to_single_clears_b_model(tmp_db):
+    with session() as db:
+        tid = _task(db, "1", "dual")
+        _b(db, tid).model = "new/model"
+    with session() as db:
+        run_mode.switch_all(db, "single", "")
+    with session() as db:
+        assert db.get(m.Task, tid).run_mode == "single" and _b(db, tid).model == ""
+
+
+def _run(tid: int, side: str) -> int:
+    with session() as db:
+        return db.query(m.TaskRun).filter(m.TaskRun.task_id == tid, m.TaskRun.side == side).one().id
+
+
 def test_scheduler_settles_the_mode_before_the_container_starts(tmp_db):
     settings_store.set_one("cc.model_b", "new/model")
     with session() as db:

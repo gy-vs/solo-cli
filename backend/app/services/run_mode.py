@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app import config
-from app.models import DISCARDED, Task, TaskRun, utc_now
+from app.models import DISCARDED, RUN_PENDING, SCHEDULABLE, Task, TaskRun, utc_now
 from app.services import settings_store
 
 log = logging.getLogger("run_mode")
@@ -94,6 +94,65 @@ def settle(db, task_id: int) -> str | None:  # noqa: ANN001
     task.mode_at = utc_now()
     db.flush()
     return mode
+
+
+def switchable(task: Task, runs: list[TaskRun]) -> bool:
+    """这道题还能不能改模式：只看 B 侧有没有真正起过容器。
+
+    两种模式下 A 侧都用镜像自带模型，差别全在 B 侧的模型名上，所以 A 在跑、甚至跑完都不妨碍。
+    B 侧只要起过一次就不行，哪怕后来被退回重跑（attempt > 1）：前一次的轨迹是按旧模型跑的。
+    """
+    if task.status not in SCHEDULABLE:
+        return False
+    b = next((r for r in runs if r.side == "B"), None)
+    return b is not None and b.status == RUN_PENDING and b.attempt <= 1 and b.started_at is None
+
+
+def switch(db, task: Task, runs: list[TaskRun], mode: str, model_b: str) -> str:  # noqa: ANN001
+    """把一道可切换的题改成 mode，返回改完后的 run_mode。调用方先用 switchable 判过。
+
+    还没开跑的题直接换标签，auto 照旧等出闸时再定。已经开跑（A 侧出过闸）的题 settle 不会
+    再来，选 auto 就得当场按当天循环派一个：先把自己标成 auto，统计里就不会把它算进去。
+    """
+    if task.mode_at is not None and mode == MODE_AUTO:
+        task.run_mode = MODE_AUTO
+        db.flush()
+        mode = next_mode(db)
+        if mode == config.RUN_MODE_DUAL and not model_b:
+            mode = config.RUN_MODE_SINGLE
+    for r in runs:
+        r.model = model_b if mode == config.RUN_MODE_DUAL and r.side == "B" else ""
+    task.run_mode = mode
+    db.flush()
+    return mode
+
+
+def switch_all(db, mode: str, model_b: str) -> dict:  # noqa: ANN001
+    """把队列里所有还能切换的题统一改成 mode。
+
+    必须在事件循环里同步做完、中间不能 await：调度器出闸（标 RUNNING + settle）也是同步的，
+    两边不交错，才不会出现判的时候 B 还在排队、改完它已经按旧模型起了容器。
+    """
+    tasks = db.query(Task).filter(Task.status.in_(SCHEDULABLE)).order_by(Task.priority, Task.claimed_at).all()
+    by_task: dict[int, list[TaskRun]] = {}
+    for r in db.query(TaskRun).filter(TaskRun.task_id.in_([t.id for t in tasks] or [-1])):
+        by_task.setdefault(r.task_id, []).append(r)
+    changed: list[int] = []
+    locked: list[str] = []
+    same = 0
+    for t in tasks:
+        runs = by_task.get(t.id, [])
+        if not switchable(t, runs):
+            locked.append(t.task_no)
+            continue
+        before = (t.run_mode, next((r.model for r in runs if r.side == "B"), ""))
+        switch(db, t, runs, mode, model_b)
+        if (t.run_mode, next((r.model for r in runs if r.side == "B"), "")) == before:
+            same += 1
+        else:
+            changed.append(t.id)
+            log.info("题 %s 运行模式 %s → %s", t.task_no, before[0], t.run_mode)
+    return {"changed": changed, "same": same, "locked": locked}
 
 
 def quota(db) -> dict:  # noqa: ANN001

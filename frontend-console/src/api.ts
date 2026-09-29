@@ -114,6 +114,8 @@ export interface TaskBrief {
   run_mode: ClaimMode
   /** 模式定死的时刻，即第一个容器出闸的时刻 */
   mode_at: string | null
+  /** 还能不能改模式：在队列或运行中，且 B 侧从没起过容器 */
+  mode_switchable: boolean
   analysis_status: 'IDLE' | 'RUNNING' | 'DONE' | 'FAILED'
   question_type: string
   difficulty: string
@@ -704,6 +706,7 @@ export const api = {
   queuePause: (paused: boolean) => post<{ ok: boolean; paused: boolean; message: string }>(`/api/tasks/queue/pause?paused=${paused}`),
   watchdogPause: (paused: boolean) => post<{ ok: boolean; paused: boolean; message: string }>(`/api/tasks/watchdog/pause?paused=${paused}`),
   queueParallel: (value: number) => post<{ ok: boolean; max_parallel: number; message: string }>(`/api/tasks/queue/parallel?value=${value}`),
+  queueMode: (mode: ClaimMode) => post<{ ok: boolean; mode: ClaimMode; changed: number; same: number; locked: string[]; message: string }>(`/api/tasks/queue/mode?mode=${mode}`),
 
   // ---- 题目设计 ----
   designPreflight: () => get<{ checks: DesignCheck[]; ready: boolean; default_count: number; auto_dedup: boolean }>('/api/design/preflight'),

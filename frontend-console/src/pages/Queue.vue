@@ -1,11 +1,12 @@
 <script setup lang="ts">
 /** 队列管理台：容器视角看谁在跑、谁在等第几个，顺带盯调度与看护的心跳。 */
-import { NButton, NInputNumber, NSwitch, useMessage } from 'naive-ui'
+import { NButton, NInputNumber, NRadioButton, NRadioGroup, NSwitch, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, type TaskBrief } from '../api'
+import { api, type ClaimMode, type TaskBrief } from '../api'
+import ModeBadge from '../components/ModeBadge.vue'
 import { fmtTime, SIDE_HEX } from '../status'
-import { liveTasks, nowMs, refreshStatus, refreshTasks, store } from '../store'
+import { claimMode, liveTasks, MODE_TEXT, nowMs, refreshStatus, refreshTasks, store } from '../store'
 
 const router = useRouter()
 const msg = useMessage()
@@ -89,6 +90,34 @@ async function toggleWatchdog(v: boolean) {
     await refreshStatus()
   } catch (e: any) { msg.error(e.message) }
 }
+/** 队列里的题按能不能改模式分两拨：B 侧起过容器的就锁在原模式 */
+const inQueue = computed(() => liveTasks.value.filter((t) => t.status === 'QUEUED' || t.status === 'RUNNING'))
+const modeStats = computed(() => {
+  const free = inQueue.value.filter((t) => t.mode_switchable)
+  const count = (m: ClaimMode) => free.filter((t) => t.run_mode === m).length
+  return { free: free.length, locked: inQueue.value.length - free.length,
+    auto: count('auto'), single: count('single'), dual: count('dual') }
+})
+const quota = computed(() => store.status?.dual_quota)
+const MODE_TIPS = computed<Record<ClaimMode, string>>(() => {
+  const [d, s] = quota.value?.cycle || [3, 6]
+  return {
+    auto: `按当天循环派：先 ${d} 道双模型、再 ${s} 道单模型。还没开跑的等出闸时定，A 侧已开跑的当场派`,
+    single: 'A、B 两侧用镜像里同一个模型各跑一次',
+    dual: 'A 侧用镜像自带模型，B 侧用设置里填的新模型',
+  }
+})
+const switching = ref(false)
+async function switchMode(v: ClaimMode) {
+  switching.value = true
+  try {
+    const r = await api.queueMode(v)
+    claimMode.value = v
+    msg.success(r.message, { duration: r.locked.length ? 5000 : 3000 })
+    await Promise.all([refreshTasks(), refreshStatus()])
+  } catch (e: any) { msg.error(e.message) } finally { switching.value = false }
+}
+
 async function setParallel(v: number | null) {
   if (!v) return
   try {
@@ -123,6 +152,27 @@ async function setParallel(v: number | null) {
           <span class="text-fg1" title="模型或网关停机时打开：跑挂的只记一笔，不重跑也不废弃">暂停异常处理</span>
           <NSwitch size="small" :value="!!wd?.paused" @update:value="toggleWatchdog" />
         </div>
+      </div>
+    </div>
+
+    <div class="card px-4 py-3 flex items-center gap-4 flex-wrap">
+      <div class="min-w-0">
+        <div class="text-xs text-fg0 font-semibold">运行模式</div>
+        <div class="text-[12px] text-fg2 mt-0.5">
+          一键切换队列里所有排队中、以及 B 侧还没开跑的题，之后领取的题也默认按这个模式入队
+        </div>
+      </div>
+      <NRadioGroup class="ml-auto" size="small" :value="claimMode" :disabled="switching"
+        @update:value="switchMode">
+        <NRadioButton v-for="m in (['single', 'dual', 'auto'] as const)" :key="m" :value="m" :title="MODE_TIPS[m]">
+          {{ MODE_TEXT[m] }}
+        </NRadioButton>
+      </NRadioGroup>
+      <div class="text-[12px] text-fg1 nums whitespace-nowrap">
+        可切换 <span class="mono text-fg0">{{ modeStats.free }}</span> 道
+        <span class="text-fg2">（单 {{ modeStats.single }} · 双 {{ modeStats.dual }} · 待定 {{ modeStats.auto }}）</span>
+        <span v-if="modeStats.locked" class="text-warn ml-1"
+          title="B 侧已经起过容器，轨迹是按原模型跑的，不再改">· B 侧已开跑 {{ modeStats.locked }} 道</span>
       </div>
     </div>
 
@@ -174,9 +224,12 @@ async function setParallel(v: number | null) {
         @click="byTaskNo[r.task_no] && router.push(`/tasks/${byTaskNo[r.task_no].id}`)">
         <span class="mono text-xs text-fg0">#{{ r.task_no }}</span>
         <span class="mono text-[12px] font-semibold" :style="{ color: SIDE_HEX[r.side] }">{{ r.side }} 侧</span>
-        <div class="min-w-0 text-xs text-fg1 truncate">
-          {{ byTaskNo[r.task_no]?.question_type }} · {{ byTaskNo[r.task_no]?.languages }}
-          <span v-if="r.attempt > 1" class="text-warn ml-1">第 {{ r.attempt }} 次</span>
+        <div class="min-w-0 text-xs text-fg1 flex items-center gap-2">
+          <ModeBadge v-if="byTaskNo[r.task_no]" :task="byTaskNo[r.task_no]" small />
+          <span class="truncate">
+            {{ byTaskNo[r.task_no]?.question_type }} · {{ byTaskNo[r.task_no]?.languages }}
+            <span v-if="r.attempt > 1" class="text-warn ml-1">第 {{ r.attempt }} 次</span>
+          </span>
         </div>
         <span class="mono text-[12px] text-fg2 nums">{{ r.minutes }} 分钟</span>
         <div class="flex items-center gap-1">
@@ -203,8 +256,9 @@ async function setParallel(v: number | null) {
             title="探路：这道题的另一侧还没出结论，先让别的题的首侧走。轮到它时照样出闸">探路靠后</span>
         </span>
         <div class="min-w-0 cursor-pointer" @click="router.push(`/tasks/${q.task_id}`)">
-          <div class="text-xs text-fg0 truncate">
-            {{ byTaskNo[q.task_no]?.question_type }} · {{ byTaskNo[q.task_no]?.languages }}
+          <div class="text-xs text-fg0 flex items-center gap-2">
+            <ModeBadge v-if="byTaskNo[q.task_no]" :task="byTaskNo[q.task_no]" small />
+            <span class="truncate">{{ byTaskNo[q.task_no]?.question_type }} · {{ byTaskNo[q.task_no]?.languages }}</span>
           </div>
           <div class="text-[12px] text-fg2 truncate">{{ byTaskNo[q.task_no]?.prompt_preview }}</div>
         </div>

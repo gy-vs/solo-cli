@@ -14,7 +14,8 @@ export const store = reactive({
 let pending: number | null = null
 
 /** 领取时按哪种模式入队，默认自动配比。题库页、详情页、门禁弹窗共用一份，记在本机，
- *  否则在题库页选了双模型、门禁弹窗里重新检查通过后却按别的模式入了队 */
+ *  否则在题库页选了双模型、门禁弹窗里重新检查通过后却按别的模式入了队。
+ *  队列页切换运行模式后也写回这里，之后领取的题跟着走 */
 const MODE_KEY = 'solo.claimMode'
 const savedMode = localStorage.getItem(MODE_KEY)
 export const claimMode = ref<ClaimMode>(

@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.models import SETTLING, Task, TaskRun
-from app.services import gsb_factcheck, gsb_precheck, gsb_repo, scope
+from app.services import gsb_factcheck, gsb_precheck, gsb_repo, run_mode, scope
 
 
 class SettingsUpdate(BaseModel):
@@ -154,6 +154,7 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "status": t.status,
         "run_mode": t.run_mode or "single",
         "mode_at": _iso(t.mode_at),
+        "mode_switchable": run_mode.switchable(t, runs or []),
         "analysis_status": t.analysis_status,
         "question_type": t.question_type,
         "difficulty": t.difficulty,

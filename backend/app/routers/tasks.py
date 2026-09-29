@@ -36,6 +36,7 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 # 领取被别的设备抢先时的错误码。界面靠它区分「这题没了」和普通的领取失败：
 # 前者要提示一句并立刻刷新列表，后者停在原地让人看门禁报告。
 POOL_TAKEN = "POOL_TAKEN"
+_MODE_TEXT = {run_mode.MODE_AUTO: "自动配比", config.RUN_MODE_SINGLE: "单模型", config.RUN_MODE_DUAL: "双模型"}
 
 
 def _get(db, task_id: int) -> Task:  # noqa: ANN001
@@ -141,6 +142,23 @@ async def queue_parallel(value: int = Query(...)) -> dict:
     settings_store.set_one("scheduler.max_parallel", str(value))
     bus.publish("tasks", {"type": "scheduler"})
     return {"ok": True, "max_parallel": value, "message": f"同时最多 {value} 个容器"}
+
+
+@router.post("/queue/mode")
+async def queue_mode(mode: str = Query(...)) -> dict:
+    """把队列里还能切换的题统一改成 mode：排队中的，以及 A 侧已出闸、B 侧还没起过容器的。"""
+    model_b = _check_mode(mode)
+    with session() as db:
+        res = run_mode.switch_all(db, mode, model_b)
+    for tid in res["changed"]:
+        bus.publish("tasks", {"type": "task", "id": tid})
+    bus.publish("tasks", {"type": "scheduler"})
+    n = len(res["changed"])
+    message = f"已切换 {n} 道为{_MODE_TEXT[mode]}" if n else f"可切换的题本来就是{_MODE_TEXT[mode]}"
+    if res["locked"]:
+        message += f"；{len(res['locked'])} 道 B 侧已开跑，保持原模式"
+    return {"ok": True, "mode": mode, "changed": n, "same": res["same"],
+            "locked": res["locked"], "message": message}
 
 
 @router.post("/batch/upload")
