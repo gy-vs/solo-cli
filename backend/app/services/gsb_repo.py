@@ -454,6 +454,78 @@ def clear_stale_index_lock(ws: Path) -> bool:
     return True
 
 
+# 包管理器的缓存与依赖目录，永远不是产物。仓库的 .gitignore 未必写了它们：pnpm 发现
+# 工作区和 home 不在同一个文件系统（工作区是挂进容器的）时，会把整个 store 建在仓库根上，
+# 一次 install 就是三万个文件。add -A 照单全收的话，产物分支被灌进几百万行，分析的
+# prompt 跟着涨到上千万字符，CLI 当场读崩。
+_JUNK_DIRS = (".pnpm-store", "node_modules", ".npm", "__pycache__", ".pytest_cache", ".venv")
+_JUNK_PATHS = (".yarn/cache",)
+_ALL_JUNK = (*_JUNK_DIRS, *_JUNK_PATHS)
+
+
+def _under(path: str, junk: str) -> bool:
+    if "/" in junk:
+        return f"/{junk}/" in f"/{path}"
+    return junk in path.split("/")[:-1]
+
+
+def is_junk(path: str, dirs: tuple[str, ...] = _ALL_JUNK) -> bool:
+    return any(_under(path, d) for d in dirs)
+
+
+async def junk_dirs(ws: Path, snapshot: str) -> tuple[str, ...]:
+    """这个仓库里算缓存的目录。初始快照自己就跟踪着的不算。
+
+    Node-RED 的源码整个放在 packages/node_modules/@node-red 下，一刀切地挡 node_modules，
+    模型在那儿新写的源文件就进不了产物，分析也看不到它改了什么。
+    """
+    if not snapshot:
+        return _ALL_JUNK
+    r = await _git(ws, "ls-tree", "-r", "-z", "--name-only", snapshot, timeout=120)
+    tracked = {d for p in r.out.split("\0") if p for d in _ALL_JUNK if _under(p, d)}
+    return tuple(d for d in _ALL_JUNK if d not in tracked)
+
+
+def junk_pathspecs(dirs: tuple[str, ...]) -> list[str]:
+    """git diff 用的排除写法，接在 `--` 之后。"""
+    return [f":(glob,exclude)**/{d}/**" for d in dirs]
+
+
+def _ignore_junk(ws: Path, dirs: tuple[str, ...]) -> None:
+    """写进 .git/info/exclude：只在本机生效、不进提交，也只挡未跟踪的文件。"""
+    exclude = ws / ".git" / "info" / "exclude"
+    have = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
+    managed = {f"{d}/" for d in _ALL_JUNK}
+    want = [f"{d}/" for d in dirs]
+    kept = [line for line in have if line not in managed or line in want]
+    lines = kept + [w for w in want if w not in kept]
+    if lines != have:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+async def _unstage_junk(ws: Path, snapshot: str, dirs: tuple[str, ...]) -> int:
+    """暂存区里相对初始快照新增的缓存文件摘掉，返回摘了几个。
+
+    比的是快照而不是 HEAD：上一次产物提交里已经混进去的（加 exclude 之前提交的）
+    也要摘，随后 amend 就把它们从产物里拿掉了。
+    """
+    if not dirs:
+        return 0
+    r = await _git(ws, "diff", "--cached", "--name-only", "-z", "--diff-filter=A", snapshot,
+                   timeout=120)
+    junk = [p for p in r.out.split("\0") if p and is_junk(p, dirs)]
+    if not junk:
+        return 0
+    rm = await dockerx.run(["git", "-C", str(ws), "rm", "--cached", "--quiet",
+                            "--pathspec-from-file=-", "--pathspec-file-nul"],
+                           stdin="\0".join(junk).encode(), timeout=300)
+    if not rm.ok:
+        raise RuntimeError(f"摘除缓存文件失败：{rm.err.strip()[:300]}")
+    log.warning("%s 的产物里有 %d 个包管理器缓存文件，已摘出不提交", ws, len(junk))
+    return len(junk)
+
+
 def commit_message(task_no: str, side: str, session_id: str) -> str:
     return (f"solo {task_no} · {side}\n\n"
             f"SessionID: {session_id or '-'}\n")
@@ -468,6 +540,8 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
     ws = config.TaskPaths(task_no, side).workspace
     if not (ws / ".git").exists():
         return {"ok": False, "message": f"{side} 侧不是 git 仓库"}
+    junk = await junk_dirs(ws, snapshot)
+    _ignore_junk(ws, junk)
     slug = repo_slug(repo_url)
     if not slug:
         return {"ok": False, "message": f"仓库地址解析不出 org/repo：{repo_url}"}
@@ -487,7 +561,11 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
                     "message": f"{side} 侧的 origin（{origin_slug or '无法识别'}）"
                                f"与题块仓库 {slug} 对不上，不能推送"}
 
-    st = await _git(ws, "status", "--porcelain", "--untracked-files=all", timeout=60)
+    # 挂载盘上几万个文件的仓库，一次 status 就要几十秒。超时读到的是空输出，
+    # 会被当成「没有改动」，把一次做满了活的运行挡在推送门外
+    st = await _git(ws, "status", "--porcelain", "--untracked-files=all", timeout=300)
+    if not st.ok:
+        return {"ok": False, "message": f"{side} 侧 git status 失败：{(st.err or st.out).strip()[:300]}"}
     changed = len([x for x in st.out.splitlines() if x.strip()])
     # 产物可能上一轮就已经提交过了（提交成了但推送没成，或者收尾重来了一次）。这时工作区
     # 干干净净，只看 status 会把一次做满了活的运行判成「没有产出」，把人挡在推送门外。
@@ -504,12 +582,26 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
     if not changed and not committed_already:
         return {"ok": False, "message": f"{side} 侧工作区没有改动，这一跑没有产出，不能当作产物提交"}
 
+    # 已经推过的那个产物提交如果这里被 amend 改写了，推送要带 lease 覆盖它
+    rewritten_from = ""
+    clear_stale_index_lock(ws)
     if changed:
-        clear_stale_index_lock(ws)
         # add / commit 的参数里没有凭据，stderr 可以带给调用方帮人定位问题
         add = await _git(ws, "add", "-A", timeout=180)
         if not add.ok:
             return {"ok": False, "message": f"git add 失败：{add.err.strip()[:300]}"}
+    try:
+        await _unstage_junk(ws, snapshot, junk)
+    except RuntimeError as exc:
+        return {"ok": False, "message": str(exc)}
+    pending = not (await _git(ws, "diff", "--cached", "--quiet", timeout=60)).ok
+    if pending:
+        if committed_already:
+            rewritten_from = head_now
+            # 摘完缓存什么都不剩了：上一次提交的全是缓存，这一跑其实没有产出
+            if (await _git(ws, "diff", "--cached", "--quiet", snapshot, timeout=60)).ok:
+                return {"ok": False,
+                        "message": f"{side} 侧产物里只有包管理器缓存，这一跑没有产出"}
         # --amend：产物必须是初始快照之上恰好一个提交，否则平台规则 G3 会打回。已经提交过
         # 又冒出新改动时，追加第二个提交会让父提交对不上，只能并进原来那个。
         # --no-verify：跳过仓库自己的提交钩子。husky 这类钩子要 npx、要装依赖，这个容器里
@@ -519,6 +611,8 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
                         "commit", "--no-verify", *extra, timeout=180)
         if not ci.ok:
             return {"ok": False, "message": f"git commit 失败：{(ci.err or ci.out).strip()[:300]}"}
+    elif not committed_already:
+        return {"ok": False, "message": f"{side} 侧改动全是包管理器缓存，这一跑没有产出"}
 
     head = (await _git(ws, "rev-parse", "HEAD", timeout=30)).out.strip()
     parent = (await _git(ws, "rev-parse", "HEAD^", timeout=30)).out.strip()
@@ -538,10 +632,16 @@ async def commit_and_push(task_no: str, repo_url: str, side: str, snapshot: str,
     # 而测试里的 origin 是本地裸仓库，这样不用联网也能走通整条 push 链路。
     # --no-verify 和 commit 那边同一个理由：husky 的 pre-push 要 yarn / npx，这个容器里
     # 没有，钩子一挂推送就失败，而且每轮巡检都照样失败一次。
-    push = await dockerx.run(
-        ["git", "-C", str(ws), *credential_args(repo_url), "push", "--no-verify", "origin",
-         f"HEAD:refs/heads/{side}"], timeout=300,
-    )
+    def push_cmd(*extra: str) -> list[str]:
+        return ["git", "-C", str(ws), *credential_args(repo_url), "push", "--no-verify", *extra,
+                "origin", f"HEAD:refs/heads/{side}"]
+
+    push = await dockerx.run(push_cmd(), timeout=300)
+    if not push.ok and rewritten_from and diverged(push):
+        # 改写的是已经推上去的那个产物提交。lease 钉在改写前的提交上：远端若已不是它
+        # （别的设备推过），照样被拒，不会盖掉别人的
+        push = await dockerx.run(
+            push_cmd(f"--force-with-lease=refs/heads/{side}:{rewritten_from}"), timeout=300)
     if not push.ok:
         why = push_failure(push)
         if diverged(push):

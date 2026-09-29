@@ -157,9 +157,13 @@ async def collect_side(task_no: str, side: str, run: TaskRun, snapshot: str) -> 
         # 产物已经提交并推上分支时比 snapshot..HEAD；还没提交就比工作区
         base = snapshot if (snapshot and head and head.lower() != snapshot.lower()) else ""
         rng = [f"{base}..HEAD"] if base else []
-        material["diff_stat"] = (await _git(ws, "diff", "--stat", *rng)).strip()
-        material["files"] = [f for f in (await _git(ws, "diff", "--name-status", *rng)).splitlines() if f.strip()]
-        raw_patch = await _git(ws, "diff", *rng, "--", ".")
+        # 包管理器缓存万一混进了产物（老的提交），不能让它进材料：一个 pnpm store 就是
+        # 三万个文件名，prompt 会涨到上千万字符
+        spec = ["--", ".", *gsb_repo.junk_pathspecs(await gsb_repo.junk_dirs(ws, snapshot))]
+        material["diff_stat"] = (await _git(ws, "diff", "--stat", *rng, *spec)).strip()
+        material["files"] = [f for f in (await _git(ws, "diff", "--name-status", *rng, *spec)).splitlines()
+                             if f.strip()]
+        raw_patch = await _git(ws, "diff", *rng, *spec)
         patch, cut = _truncate_patch(raw_patch)
         material["patch"] = patch
         material["patch_truncated"] = cut

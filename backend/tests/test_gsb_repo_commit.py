@@ -452,3 +452,108 @@ def test_rebuild_refuses_a_snapshot_that_is_not_on_the_trunk(cloned):
     r = asyncio.run(gsb_repo.rebuild_side("07", _remote(cloned), "A", "f" * 40))
     assert r["ok"] is False
     assert "主干" in r["message"]
+
+
+# ---------------- 包管理器缓存不进产物 ----------------
+
+def _pnpm_store(ws, n=3):
+    d = ws / ".pnpm-store" / "v3" / "files" / "00"
+    d.mkdir(parents=True)
+    for i in range(n):
+        (d / f"blob{i}").write_text("x\n", encoding="utf-8")
+
+
+def _files_in_head(ws):
+    return _git(ws, "show", "--name-only", "--format=", "HEAD").splitlines()
+
+
+def test_a_pnpm_store_in_the_worktree_is_left_out_of_the_artifact(cloned):
+    """pnpm 在挂载的工作区里会把 store 建在仓库根上，一次 install 三万个文件。"""
+    ws = cloned["ws"]
+    (ws / "fix.ts").write_text("export {}\n", encoding="utf-8")
+    _pnpm_store(ws)
+    (ws / "pkg" / "node_modules" / "left-pad").mkdir(parents=True)
+    (ws / "pkg" / "node_modules" / "left-pad" / "index.js").write_text("1\n", encoding="utf-8")
+
+    r = asyncio.run(gsb_repo.commit_and_push("07", cloned["repo"], "A", cloned["sha"], message="m"))
+
+    assert r["ok"] is True, r["message"]
+    assert _files_in_head(ws) == ["fix.ts"]
+    assert r["changed_files"] == 1
+
+
+def test_a_store_already_pushed_is_stripped_and_the_branch_overwritten(cloned):
+    """题 440 的情形：缓存早就随产物提交推上去了，重推时要摘掉并覆盖远端那个提交。"""
+    ws = cloned["ws"]
+    (ws / "fix.ts").write_text("export {}\n", encoding="utf-8")
+    _pnpm_store(ws)
+    _git(ws, "add", "-A")
+    _git(ws, "-c", f"user.name={gsb_repo.COMMIT_USER}", "-c", f"user.email={gsb_repo.COMMIT_EMAIL}",
+         "commit", "-m", "solo 07 · A")
+    _git(ws, "push", "origin", "HEAD:refs/heads/A")
+    dirty = _git(ws, "rev-parse", "HEAD")
+
+    r = asyncio.run(gsb_repo.commit_and_push("07", cloned["repo"], "A", cloned["sha"], message="m"))
+
+    assert r["ok"] is True, r["message"]
+    assert _files_in_head(ws) == ["fix.ts"]
+    assert _git(ws, "rev-parse", "HEAD^") == cloned["sha"]
+    remote = _git(cloned["url"], "rev-parse", "refs/heads/A")
+    assert remote == r["sha"] != dirty
+
+
+def test_the_overwrite_still_refuses_someone_elses_push(cloned, tmp_path):
+    """lease 钉在本机上一次推的提交上：远端若已被别处推过，照样拒绝。"""
+    ws = cloned["ws"]
+    (ws / "fix.ts").write_text("export {}\n", encoding="utf-8")
+    _pnpm_store(ws)
+    _git(ws, "add", "-A")
+    _git(ws, "-c", f"user.name={gsb_repo.COMMIT_USER}", "-c", f"user.email={gsb_repo.COMMIT_EMAIL}",
+         "commit", "-m", "solo 07 · A")
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-b", "A", cloned["url"], str(other)], check=True, capture_output=True)
+    (other / "theirs.txt").write_text("t\n", encoding="utf-8")
+    _git(other, "add", "-A")
+    _git(other, "-c", "user.name=o", "-c", "user.email=o@o", "commit", "-m", "theirs")
+    _git(other, "push", "origin", "HEAD:refs/heads/A")
+    theirs = _git(other, "rev-parse", "HEAD")
+
+    asyncio.run(gsb_repo.commit_and_push("07", cloned["repo"], "A", cloned["sha"], message="m"))
+    assert _git(cloned["url"], "rev-parse", "refs/heads/A") == theirs
+
+
+def test_a_run_that_only_produced_a_store_has_no_output(cloned):
+    _pnpm_store(cloned["ws"])
+    r = asyncio.run(gsb_repo.commit_and_push("07", cloned["repo"], "A", cloned["sha"], message="m"))
+    assert r["ok"] is False
+    assert _git(cloned["url"], "rev-parse", "refs/heads/A") == cloned["sha"]
+
+
+def test_a_repo_whose_source_lives_in_node_modules_keeps_new_files_there(cloned):
+    """Node-RED 的源码在 packages/node_modules/@node-red 下，新写的源文件也是产物。"""
+    ws = cloned["ws"]
+    src = ws / "packages" / "node_modules" / "@node-red" / "runtime"
+    src.mkdir(parents=True)
+    (src / "index.js").write_text("1\n", encoding="utf-8")
+    _git(ws, "add", "-f", "-A")
+    _git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "vendor")
+    base = _git(ws, "rev-parse", "HEAD")
+    (src / "index.js").write_text("2\n", encoding="utf-8")
+    (src / "added.js").write_text("new\n", encoding="utf-8")
+    _pnpm_store(ws)
+
+    r = asyncio.run(gsb_repo.commit_and_push("07", cloned["repo"], "A", base, message="m"))
+    assert r["ok"] is True, r["message"]
+    assert sorted(_files_in_head(ws)) == ["packages/node_modules/@node-red/runtime/added.js",
+                                          "packages/node_modules/@node-red/runtime/index.js"]
+
+
+@pytest.mark.parametrize("path,junk", [
+    (".pnpm-store/v3/files/00/abc", True),
+    ("packages/web/node_modules/x/index.js", True),
+    (".yarn/cache/x.zip", True),
+    ("src/node_modules.ts", False),
+    ("docs/pnpm-store.md", False),
+])
+def test_is_junk(path, junk):
+    assert gsb_repo.is_junk(path) is junk
