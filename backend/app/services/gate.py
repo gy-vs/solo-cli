@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 
 from app import config
 from app.models import Task
-from app.services import dockerx, gsb_repo, scope, settings_store
+from app.services import claim_dedup, dockerx, gsb_repo, scope, settings_store
 # 快照 sha 的解析归仓库模块管，这里只是用；保留 gate.snapshot_sha 这个名字给现有调用方
 from app.services.gsb_repo import snapshot_sha  # noqa: F401
 
@@ -104,6 +104,22 @@ def _scope_check(task: Task) -> Check:
         else Check("scope", "ok", scope.summary(report))
 
 
+def _dedup_check(task: Task) -> Check:
+    """领取查重的结论，只读不查。拦人在领取那一步做，门禁上只把结论摆出来。"""
+    if not claim_dedup.enabled():
+        return Check("dedup", "ok", "领取前查重已关闭")
+    d = claim_dedup.cached(task) or {}
+    if d.get("state") == claim_dedup.SKIPPED:
+        return Check("dedup", "warn", f"查重已略过：{d.get('reason') or '人工略过'}")
+    if d.get("state") == claim_dedup.PASS:
+        return Check("dedup", "ok", d.get("reason") or "规则 A 查重通过")
+    last = task.dedup or {}
+    if last.get("stage") == claim_dedup.STAGE and last.get("state") == claim_dedup.HIT \
+            and last.get("prompt_hash") == task.prompt_hash:
+        return Check("dedup", "warn", last.get("reason") or "规则 A 查重命中")
+    return Check("dedup", "warn", "还没做领取查重，领取时会先查一次")
+
+
 async def run_checks(task: Task) -> list[Check]:
     checks: list[Check] = []
 
@@ -154,6 +170,7 @@ async def run_checks(task: Task) -> list[Check]:
         checks.append(Check("repro_level", "warn",
                             f"可复现等级「{task.repro_level or '空'}」不在平台选项里，上传前需要改题块"))
     checks.append(_scope_check(task))
+    checks.append(_dedup_check(task))
 
     # 3. 仓库与分支
     if not task.repo_url:

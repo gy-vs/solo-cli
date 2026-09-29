@@ -359,6 +359,21 @@ export interface GateReport {
   checks: GateCheck[]
 }
 
+/** 领取前查重的结论。unavailable 是没查成（solo2 没启动之类），hit 是撞了；两种都要人看过再带 skip 重发 */
+export interface ClaimDedup {
+  state: 'pass' | 'hit' | 'skipped' | 'unavailable'
+  reason: string
+  hits?: { peer: string; similarity: number; rule: string }[]
+}
+
+export interface ClaimResult {
+  queued: boolean
+  run_mode: ClaimMode | ''
+  prepare: PrepareResult | null
+  gate: GateReport | null
+  dedup?: ClaimDedup
+}
+
 /** 领题时先 clone 两侧，分支不合规就不往下走 */
 export interface PrepareResult {
   ok: boolean
@@ -567,11 +582,12 @@ export const api = {
 
   // ---- 领取与门禁 ----
   gate: (id: number) => post<GateReport>(`/api/tasks/${id}/gate`),
-  claim: (id: number, force = false, mode: ClaimMode = 'single') =>
-    post<{ queued: boolean; run_mode: ClaimMode | ''; prepare: PrepareResult; gate: GateReport | null }>(
-      `/api/tasks/${id}/claim?force=${force}&mode=${mode}`),
+  claim: (id: number, force = false, mode: ClaimMode = 'single', skip?: { reason: string }) =>
+    post<ClaimResult>(`/api/tasks/${id}/claim?force=${force}&mode=${mode}`
+      + (skip ? `&skip_dedup=true&skip_reason=${encodeURIComponent(skip.reason)}` : '')),
   release: (id: number) => post<{ ok: boolean }>(`/api/tasks/${id}/release`),
-  discard: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/discard`),
+  discard: (id: number, reason?: string) => post<{ ok: boolean; message: string }>(
+    `/api/tasks/${id}/discard` + (reason ? `?reason=${encodeURIComponent(reason)}` : '')),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
   fix: (id: number, action: 'clone_sides' | 'reset_sides' | 'archive_traces' | 'remove_containers'
     | 'scope_check' | 'scope_override') =>
@@ -668,7 +684,9 @@ export const api = {
   // ---- 上传与收尾 ----
   upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),
   batchUpload: (ids: number[]) => post<{ results: BatchResult[] }>('/api/tasks/batch/upload', { ids }),
-  batchClaim: (ids: number[], mode: ClaimMode = 'single') => post<{ results: any[] }>('/api/tasks/batch/claim', { ids, mode }),
+  batchClaim: (ids: number[], mode: ClaimMode = 'single', skip?: { reason: string }) =>
+    post<{ results: any[]; dedup_unavailable?: string }>('/api/tasks/batch/claim',
+      { ids, mode, skip_dedup: !!skip, skip_reason: skip?.reason ?? '' }),
   /** 批量重跑。sides 留空表示每道题两侧都重跑 */
   batchRerun: (ids: number[], sides: Side[] = []) =>
     post<{ results: BatchResult[] }>('/api/tasks/batch/rerun', { ids, sides }),

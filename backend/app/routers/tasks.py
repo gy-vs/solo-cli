@@ -25,7 +25,7 @@ from app.schemas import (
     ScreencastDeliver, ScreencastUpdate, task_brief, task_detail,
 )
 from app.services import (
-    difficulty, dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo,
+    claim_dedup, difficulty, dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo,
     gsb_rules, gsb_uploader, gsb_verifier, pool, pool_bank, prompt_bank, run_mode, runner,
     scheduler, scope, settings_store, trace, watchdog,
 )
@@ -302,11 +302,22 @@ async def batch_claim(body: ClaimBatch) -> dict:
     完之后下面每道题读的都是缓存。
     """
     _check_mode(body.mode)
-    await scope.warm(body.ids)
-    results = []
-    for tid in body.ids:
+    # 查重整批一次跑：同批互查要一起送，而且桥接每调一次都要起一个容器
+    hits: dict[int, str] = {}
+    if claim_dedup.enabled() and not body.skip_dedup:
+        dd = await claim_dedup.check(body.ids)
+        if not dd["ok"]:
+            # 一道都还没动：人确认之后带着 skip_dedup 再发一次就照常领
+            return {"results": [], "dedup_unavailable": dd["error"]}
+        hits = {tid: v["reason"] for tid, v in dd["results"].items() if v["state"] == claim_dedup.HIT}
+    ids = [tid for tid in body.ids if tid not in hits]
+    await scope.warm(ids)
+    results = [{"id": tid, "queued": False, "code": "DEDUP_HIT", "error": why} for tid, why in hits.items()]
+    for tid in ids:
         try:
-            results.append({"id": tid, **(await _claim(tid, force=False, mode=body.mode))})
+            results.append({"id": tid, **(await _claim(tid, force=False, mode=body.mode,
+                                                        skip_dedup=body.skip_dedup,
+                                                        skip_reason=body.skip_reason))})
         except HTTPException as exc:
             # 被别的设备抢先时 detail 是结构化的，拆出错误码让界面能单独统计一句
             # 「N 道被其他设备领走」，混在门禁未过里报会让人以为是自己这边有问题。
@@ -384,13 +395,17 @@ async def gate_check(task_id: int) -> dict:
 
 @router.post("/{task_id}/claim")
 async def claim(task_id: int, force: bool = Query(default=False),
-                mode: str = Query(default=config.RUN_MODE_SINGLE)) -> dict:
-    """领取：校验分支、clone 两侧、跑门禁，通过就建两个 run 进队列。
+                mode: str = Query(default=config.RUN_MODE_SINGLE),
+                skip_dedup: bool = Query(default=False),
+                skip_reason: str = Query(default="")) -> dict:
+    """领取：查重、校验分支、clone 两侧、跑门禁，通过就建两个 run 进队列。
 
     mode 取值见 run_mode.MODES：dual 时 A 用镜像自带模型、B 用设置里的 cc.model_b；
     auto 先标成待定，等第一个容器出闸时按当天的双/单循环定，见 run_mode 模块。
+
+    查重命中或没跑成时返回 dedup 且不动这道题，人看过之后带 skip_dedup 再发一次。
     """
-    return await _claim(task_id, force, mode)
+    return await _claim(task_id, force, mode, skip_dedup=skip_dedup, skip_reason=skip_reason)
 
 
 def _check_mode(mode: str) -> str:
@@ -438,13 +453,44 @@ async def _take_remote(task_id: int) -> None:
                                      "task_no": task_no, "message": res["message"]})
 
 
-async def _claim(task_id: int, force: bool, mode: str = config.RUN_MODE_SINGLE) -> dict:
-    """领取的实际动作。进程内的调用方一律走这里，见 batch_claim 的说明。"""
+async def _dedup_gate(task_id: int, skip: bool, reason: str) -> dict | None:
+    """领取前查重。返回非空就是要人先看一眼的结论，这道题原样不动。
+
+    放在占远端之前：撞了的题不该先挂到本机名下、再 clone 两个分支，最后还得人去放回。
+    """
+    if not claim_dedup.enabled():
+        return None
+    if skip:
+        with session() as db:
+            done = claim_dedup.cached(_get(db, task_id))
+        if not (done and done["state"] == claim_dedup.PASS):
+            claim_dedup.skip(task_id, reason or "领取时人工略过查重")
+        return None
+    r = await claim_dedup.check([task_id])
+    if not r["ok"]:
+        return {"queued": False, "prepare": None, "gate": None,
+                "dedup": {"state": "unavailable", "reason": r["error"]}}
+    res = r["results"][task_id]
+    if res["state"] == claim_dedup.HIT:
+        bus.publish("tasks", {"type": "task", "id": task_id})
+        return {"queued": False, "prepare": None, "gate": None, "dedup": res}
+    return None
+
+
+async def _claim(task_id: int, force: bool, mode: str = config.RUN_MODE_SINGLE, *,
+                 skip_dedup: bool = False, skip_reason: str = "") -> dict:
+    """领取的实际动作。进程内的调用方一律走这里，见 batch_claim 的说明。
+
+    强制启动不再查重：它只会发生在门禁弹窗上，那之前的第一次领取已经查过了。
+    """
     model_b = _check_mode(mode)
     with session() as db:
         t = _get(db, task_id)
         if t.status not in (AVAILABLE, CLAIMED):
             raise HTTPException(409, f"当前状态 {t.status} 不能领取")
+
+    if not force and (held := await _dedup_gate(task_id, skip_dedup, skip_reason)):
+        return held
 
     await _take_remote(task_id)
 

@@ -7,6 +7,7 @@ import GateModal from '../components/GateModal.vue'
 import LaunchModal from '../components/LaunchModal.vue'
 import TaskCard from '../components/TaskCard.vue'
 import ClaimModePicker from '../components/ClaimModePicker.vue'
+import { askUnavailable, claimWithDedup } from '../claimDedup'
 import { claimMode, discardedTasks, liveTasks, MODE_TEXT, refreshStatus, refreshTasks, store } from '../store'
 
 const router = useRouter()
@@ -66,7 +67,12 @@ function takenBy(e: unknown): string {
 async function claim(t: TaskBrief) {
   busyId.value = t.id
   try {
-    const r = await api.claim(t.id, false, claimMode.value)
+    const { result: r, discarded } = await claimWithDedup(dialog, t.id, t.task_no, claimMode.value)
+    if (!r) {
+      if (discarded) msg.success(`题 ${t.task_no} 查重命中，已废弃`)
+      await refreshTasks()
+      return
+    }
     if (r.queued) {
       msg.success(`题 ${t.task_no} 的 A、B 两侧已按${MODE_TEXT[r.run_mode]}模式进入队列`)
       await Promise.all([refreshTasks(), refreshStatus()])
@@ -169,13 +175,20 @@ function batchClaim(ids: number[], title: string) {
     onPositiveClick: async () => {
       batching.value = true
       try {
-        const r = await api.batchClaim(ids, mode)
+        let r = await api.batchClaim(ids, mode)
+        if (r.dedup_unavailable !== undefined) {
+          if (!await askUnavailable(dialog, r.dedup_unavailable, `这 ${ids.length} 道题`)) return
+          r = await api.batchClaim(ids, mode, { reason: `未查重，人工确认后照常领取（${r.dedup_unavailable}）` })
+        }
         const ok = r.results.filter((x) => x.queued).length
         const taken = r.results.filter((x) => x.code === 'POOL_TAKEN').length
+        const dup = r.results.filter((x) => x.code === 'DEDUP_HIT')
+        const rest = ids.length - ok - taken - dup.length
         // 被其他设备领走的单独报一句：混在「门禁未过」里会让人以为是本机环境有问题
         msg.info(`${ok} 题按${MODE_TEXT[mode]}入队`
           + (taken ? `，${taken} 题已被其他设备领走` : '')
-          + (ids.length - ok - taken ? `，${ids.length - ok - taken} 题门禁未过` : ''))
+          + (dup.length ? `，${dup.length} 题查重命中未领取（单独点领取可废弃或略过）` : '')
+          + (rest ? `，${rest} 题门禁未过` : ''), { duration: dup.length ? 8000 : 3000 })
         await Promise.all([refreshTasks(), refreshStatus()])
       } catch (e: any) { msg.error(e.message) } finally { batching.value = false }
     },

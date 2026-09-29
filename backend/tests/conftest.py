@@ -29,6 +29,15 @@ def no_container_side_effects(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_claim_dedup(monkeypatch):
+    """领取查重默认关着：开着的话每个领取用例都会去起一个 solo2 桥接容器、连远端库。
+    测查重本身的用例自己打开，并把桥接换成桩。"""
+    from app.services import claim_dedup
+
+    monkeypatch.setattr(claim_dedup, "enabled", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def breaker_closed(monkeypatch):
     """熔断状态在进程内，一个用例拉了闸会让后面所有用例的调度和巡检都停着。"""
     from app.services import breaker

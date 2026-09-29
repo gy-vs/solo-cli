@@ -135,6 +135,11 @@ SPECS: tuple[Spec, ...] = (
     Spec("qc.image", "质检镜像", "题目查重", default="solo2-backend:latest",
          help="复用 solo-qa 自己的后端镜像（它的 compose 里就叫这个名），避免依赖版本冲突"),
     Spec("qc.timeout_minutes", "质检超时（分钟）", "题目查重", default="15", kind="number"),
+    Spec("claim.dedup", "领取前查重（规则 A）", "题目查重", default="1", kind="bool",
+         help="领取前拿题面对平台历史、本机在做的题和同批前面的题跑一次规则 A。命中时可以废弃或略过；"
+              "solo2 没启动或查重没跑成时先提示，确认后照常领取"),
+    Spec("claim.dedup_container", "solo2 后端容器名", "题目查重", default="solo2-backend-1",
+         help="领取查重前先看这个容器在不在跑，不在就提示 solo2 没启动。留空则不探测"),
     Spec("design.count", "默认设计题数", "题目设计", default="5", kind="number"),
     Spec("design.model", "设计模型", "题目设计", default="claude-opus-5-thinking-high", kind="select"),
     Spec("design.timeout_minutes", "设计超时（分钟）", "题目设计", default="90", kind="number"),

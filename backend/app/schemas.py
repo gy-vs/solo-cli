@@ -72,6 +72,9 @@ class ClaimBatch(IdList):
     """批量领取：mode 取值见 run_mode.MODES，auto 时每道都等开跑那一刻按当天循环定。"""
 
     mode: str = "single"
+    # 人看过查重提示（solo2 没启动、或命中了但决定照领）之后再发一次时带上
+    skip_dedup: bool = False
+    skip_reason: str = ""
 
 
 class RerunBatch(IdList):

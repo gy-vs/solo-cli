@@ -4,6 +4,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, SIDES, type GateReport, type Gsb, type Side, type TaskDetail, type TaskRunDetail, type VerifyReport } from '../api'
 import ClaimModePicker from '../components/ClaimModePicker.vue'
+import { claimWithDedup } from '../claimDedup'
 import ContainerLive from '../components/ContainerLive.vue'
 import ContainerTerminal from '../components/ContainerTerminal.vue'
 import FactcheckPanel from '../components/FactcheckPanel.vue'
@@ -199,8 +200,10 @@ function rerun(sides: Side[]) {
 async function claim() {
   busy.value = 'claim'
   try {
-    const r = await api.claim(id, false, claimMode.value)
-    if (r.queued) {
+    const { result: r, discarded } = await claimWithDedup(dialog, id, task.value?.task_no ?? String(id), claimMode.value)
+    if (!r) {
+      if (discarded) msg.success('查重命中，已废弃')
+    } else if (r.queued) {
       msg.success(`两侧已按${MODE_TEXT[r.run_mode]}模式进入队列，等待空闲槽位`)
     } else {
       gateReport.value = r.gate
