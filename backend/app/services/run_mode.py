@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app import config
-from app.models import DISCARDED, RUN_PENDING, SCHEDULABLE, Task, TaskRun, utc_now
+from app.models import DISCARDED, RUN_WAITING, SCHEDULABLE, Task, TaskRun, utc_now
 from app.services import settings_store
 
 log = logging.getLogger("run_mode")
@@ -100,12 +100,12 @@ def switchable(task: Task, runs: list[TaskRun]) -> bool:
     """这道题还能不能改模式：只看 B 侧有没有真正起过容器。
 
     两种模式下 A 侧都用镜像自带模型，差别全在 B 侧的模型名上，所以 A 在跑、甚至跑完都不妨碍。
-    B 侧只要起过一次就不行，哪怕后来被退回重跑（attempt > 1）：前一次的轨迹是按旧模型跑的。
+    B 侧在排队不等于没跑过：看护重跑也是退回 QUEUED，只能靠 attempt 分辨，重跑过的一律不改。
     """
     if task.status not in SCHEDULABLE:
         return False
     b = next((r for r in runs if r.side == "B"), None)
-    return b is not None and b.status == RUN_PENDING and b.attempt <= 1 and b.started_at is None
+    return b is not None and b.status in RUN_WAITING and b.attempt <= 1 and b.started_at is None
 
 
 def switch(db, task: Task, runs: list[TaskRun], mode: str, model_b: str) -> str:  # noqa: ANN001

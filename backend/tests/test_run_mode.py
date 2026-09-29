@@ -111,6 +111,14 @@ def test_b_that_ran_once_stays_locked_after_requeue(tmp_db):
         assert run_mode.switch_all(db, "dual", "new/model")["locked"] == ["1"]
 
 
+def test_b_queued_for_the_first_time_is_switchable(tmp_db):
+    with session() as db:
+        tid = _task(db, "1", "single")
+        _b(db, tid).status = m.RUN_QUEUED
+    with session() as db:
+        assert run_mode.switch_all(db, "dual", "new/model")["changed"] == [tid]
+
+
 def test_switch_to_auto_keeps_unstarted_pending_and_assigns_started_now(tmp_db):
     settings_store.set_one("cc.model_b", "new/model")
     with session() as db:
