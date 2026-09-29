@@ -13,6 +13,7 @@ import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, SIDES, type BatchResult, type Side, type Status, type TaskBrief } from '../api'
 import LaunchModal from '../components/LaunchModal.vue'
+import ModeBadge from '../components/ModeBadge.vue'
 import PrecheckPill from '../components/PrecheckPill.vue'
 import SideStats from '../components/SideStats.vue'
 import StatusPill from '../components/StatusPill.vue'
@@ -535,10 +536,13 @@ const cols = computed(() => (current.value.pick
         <StatusPill :status="t.status" small />
 
         <div class="min-w-0">
-          <div class="text-xs text-fg0 truncate">
-            {{ t.question_type || '未标任务类型' }}
-            <span class="text-fg2">·</span>
-            <span class="text-fg1">{{ t.languages || '—' }}</span>
+          <div class="flex items-center gap-1.5 min-w-0">
+            <ModeBadge :task="t" small />
+            <div class="text-xs text-fg0 truncate">
+              {{ t.question_type || '未标任务类型' }}
+              <span class="text-fg2">·</span>
+              <span class="text-fg1">{{ t.languages || '—' }}</span>
+            </div>
           </div>
           <div class="text-[12px] truncate" :class="stage(t).cls" :title="stage(t).text">{{ stage(t).text }}</div>
         </div>

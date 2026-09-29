@@ -2,6 +2,7 @@
 import { NButton } from 'naive-ui'
 import { computed } from 'vue'
 import type { TaskBrief } from '../api'
+import ModeBadge from './ModeBadge.vue'
 import SideStrip from './SideStrip.vue'
 import StatusPill from './StatusPill.vue'
 import { fmtTime, HEX, VERDICT_LABEL } from '../status'
@@ -31,6 +32,7 @@ const branchBad = computed(() => props.task.branch_check?.ok === false)
         </span>
       </div>
       <div class="flex items-center gap-2">
+        <ModeBadge :task="task" small />
         <span class="pill h-6 text-[12px]" :style="{ color: diffColor(task.difficulty), borderColor: diffColor(task.difficulty) + '66' }">{{ task.difficulty || '未标难度' }}</span>
         <StatusPill v-if="task.status !== 'AVAILABLE'" :status="task.status" small />
       </div>

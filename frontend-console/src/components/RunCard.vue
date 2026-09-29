@@ -7,6 +7,7 @@ import { api, SIDES, type Side, type TaskBrief, type TaskRunBrief } from '../api
 import { useRunFeed } from '../sse'
 import { fmtDuration, HEX, RUN_COLOR, RUN_LABEL, SIDE_HEX, STATUS_COLOR, STATUS_LABEL } from '../status'
 import { nowMs } from '../store'
+import ModeBadge from './ModeBadge.vue'
 import StatusPill from './StatusPill.vue'
 
 const props = defineProps<{ task: TaskBrief }>()
@@ -56,6 +57,7 @@ async function stop(side?: Side) {
       <div class="flex items-center gap-2">
         <span class="mono text-xs px-2 h-6 inline-flex items-center rounded-md bg-bg3 text-fg0 border border-line">#{{ task.task_no }}</span>
         <span class="text-fg0 font-medium">{{ stage }}</span>
+        <ModeBadge :task="task" small />
         <StatusPill :status="task.status" small class="ml-auto" />
       </div>
       <div class="grid grid-cols-2 gap-2">

@@ -1,5 +1,5 @@
 /** 轻量全局状态：系统状态 + 任务列表，供各页面共享并由 SSE 驱动刷新。 */
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { api, SIDES, type HostHealth, type SystemStatus, type TaskBrief } from './api'
 
 export const store = reactive({
@@ -12,6 +12,12 @@ export const store = reactive({
 })
 
 let pending: number | null = null
+
+/** 领取时是否按双模型模式入队。题库页、详情页、门禁弹窗共用一个开关，记在本机，
+ *  否则在题库页打开了、门禁弹窗里重新检查通过后却按单模型入了队 */
+const DUAL_KEY = 'solo.claimDual'
+export const claimDual = ref(localStorage.getItem(DUAL_KEY) === '1')
+watch(claimDual, (v) => localStorage.setItem(DUAL_KEY, v ? '1' : '0'))
 
 export async function refreshStatus() {
   try { store.status = await api.status() } catch { /* 顶栏会显示断连 */ }

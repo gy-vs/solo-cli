@@ -91,17 +91,73 @@ def test_clone_failure_stops_before_the_gate(one_task, monkeypatch):
 def test_batch_claim_never_forces(one_task, monkeypatch):
     """「全部领取并启动」以前是直接调路由函数的，force 拿到的是 Query 对象——它是真值，
     于是整批题都被强制领取。09 就是这么在 clone 失败的情况下跑起来的。"""
-    from app.schemas import IdList
+    from app.schemas import ClaimBatch
     from app.services.gate import Check
 
     _stub_gate(monkeypatch, prepared=False, checks=[
         Check("workspace_A", "block", "A 侧还没 clone 到 …", fix="clone_sides", hard=True),
     ])
 
-    r = asyncio.run(tasks_router.batch_claim(IdList(ids=[one_task])))
+    r = asyncio.run(tasks_router.batch_claim(ClaimBatch(ids=[one_task])))
     assert r["results"][0]["queued"] is False
     with session() as db:
         assert db.get(m.Task, one_task).status == m.CLAIMED
+        assert db.query(m.TaskRun).count() == 0
+
+
+# ---------------- 双模型模式 ----------------
+
+def test_dual_claim_puts_the_new_model_on_b_only(one_task, monkeypatch):
+    from app.services import settings_store
+    from app.services.gate import Check
+
+    settings_store.set_one("cc.model_b", "new/model")
+    _stub_gate(monkeypatch, prepared=True, checks=[Check("workspace_A", "ok", "就绪")])
+
+    assert asyncio.run(tasks_router._claim(one_task, force=False, dual=True))["queued"] is True
+    with session() as db:
+        assert db.get(m.Task, one_task).run_mode == "dual"
+        models = {r.side: r.model for r in db.query(m.TaskRun).all()}
+    assert models == {"A": "", "B": "new/model"}
+
+
+def test_single_claim_keeps_both_sides_on_the_image_model(one_task, monkeypatch):
+    """设置里填了新模型也不影响旧模式：没勾双模型就一侧都不换。"""
+    from app.services import settings_store
+    from app.services.gate import Check
+
+    settings_store.set_one("cc.model_b", "new/model")
+    _stub_gate(monkeypatch, prepared=True, checks=[Check("workspace_A", "ok", "就绪")])
+
+    assert asyncio.run(tasks_router._claim(one_task, force=False))["queued"] is True
+    with session() as db:
+        assert db.get(m.Task, one_task).run_mode == "single"
+        assert {r.model for r in db.query(m.TaskRun).all()} == {""}
+
+
+def test_dual_claim_without_a_model_is_refused_before_anything_happens(one_task, monkeypatch):
+    """没填新模型就按双模型领取，要在占题、clone 之前拒掉，而不是悄悄按单模型跑。"""
+    async def boom(*a, **k):
+        raise AssertionError("没配新模型还去准备工作区了")
+
+    monkeypatch.setattr(tasks_router.gate, "prepare_workspaces", boom)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(tasks_router._claim(one_task, force=False, dual=True))
+    assert exc.value.status_code == 400
+    with session() as db:
+        assert db.get(m.Task, one_task).status == m.AVAILABLE
+
+
+def test_release_returns_the_task_to_single_mode(one_task, monkeypatch):
+    from app.services import settings_store
+    from app.services.gate import Check
+
+    settings_store.set_one("cc.model_b", "new/model")
+    _stub_gate(monkeypatch, prepared=True, checks=[Check("workspace_A", "ok", "就绪")])
+    asyncio.run(tasks_router._claim(one_task, force=False, dual=True))
+    asyncio.run(tasks_router.release(one_task))
+    with session() as db:
+        assert db.get(m.Task, one_task).run_mode == "single"
         assert db.query(m.TaskRun).count() == 0
 
 
@@ -168,7 +224,7 @@ def test_batch_claim_counts_a_vanished_task_as_taken(pooled_task, monkeypatch):
 
     归到「门禁未过」里会让人去查本机环境，而本机什么毛病都没有。
     """
-    from app.schemas import IdList
+    from app.schemas import ClaimBatch
 
     async def claim_remote(entry_id, *, task_no=""):
         with session() as db:
@@ -180,7 +236,7 @@ def test_batch_claim_counts_a_vanished_task_as_taken(pooled_task, monkeypatch):
         "added": [], "removed": [], "adopted": [], "skipped": [], "total": 0, "claimed": 0})
 
     # 同一个 id 领两次：第一次把它删掉，第二次就只剩 404 这一个线索
-    r = asyncio.run(tasks_router.batch_claim(IdList(ids=[pooled_task, pooled_task])))
+    r = asyncio.run(tasks_router.batch_claim(ClaimBatch(ids=[pooled_task, pooled_task])))
     assert [x["code"] for x in r["results"]] == [tasks_router.POOL_TAKEN, tasks_router.POOL_TAKEN]
 
 

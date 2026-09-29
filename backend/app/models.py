@@ -189,6 +189,9 @@ class Task(Base, JsonMixin):
     # 远端分支校验结果。校验失败题会停在 CLAIMED，把原因存下来是为了题卡能直接
     # 显示缺哪个分支，而不是让人翻日志。
     branch_check_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 运行模式，取值见 config.RUN_MODE_*。领取入队时定下，放回题库时回到 single。
+    # server_default 让老库补列后的历史题都读成 single，它们确实都是单模型跑的。
+    run_mode: Mapped[str] = mapped_column(String(16), default="single", server_default="single")
     # 废弃前的状态，恢复时按它回退；不属于单跑字段，所以留在题级
     discarded_from: Mapped[str] = mapped_column(String(16), default="")
 
@@ -407,6 +410,9 @@ class TaskRun(Base, JsonMixin):
     container_name: Mapped[str] = mapped_column(String(64), default="")
     container_exists: Mapped[bool] = mapped_column(Boolean, default=False)
     image_tag: Mapped[str] = mapped_column(String(128), default="")
+    # 覆盖镜像自带模型的模型名，空串表示用镜像里的。入队时从设置里抄下来而不是跑时现读：
+    # 重跑、自动重建都复用这一行，中途改了设置也不会让同一侧前后换成两个模型。
+    model: Mapped[str] = mapped_column(String(128), default="")
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     session_id: Mapped[str] = mapped_column(String(128), default="")

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { NButton, NTag, useDialog, useMessage } from 'naive-ui'
+import { NButton, NSwitch, NTag, useDialog, useMessage } from 'naive-ui'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, SIDES, type GateReport, type Gsb, type Side, type TaskDetail, type TaskRunDetail, type VerifyReport } from '../api'
@@ -8,6 +8,7 @@ import ContainerTerminal from '../components/ContainerTerminal.vue'
 import FactcheckPanel from '../components/FactcheckPanel.vue'
 import GateChecks from '../components/GateChecks.vue'
 import GsbEditor from '../components/GsbEditor.vue'
+import ModeBadge from '../components/ModeBadge.vue'
 import PrecheckPanel from '../components/PrecheckPanel.vue'
 import PrecheckPill from '../components/PrecheckPill.vue'
 import ScreencastPanel from '../components/ScreencastPanel.vue'
@@ -17,7 +18,7 @@ import Timeline from '../components/Timeline.vue'
 import VerifyBar from '../components/VerifyBar.vue'
 import { useGlobalEvents, useRunEvents } from '../sse'
 import { fmtDuration, fmtMs, fmtTime, HEX, RUN_END, RUN_LABEL, SIDE_HEX, VERDICT_LABEL } from '../status'
-import { nowMs, refreshTasks, store } from '../store'
+import { claimDual, nowMs, refreshTasks, store } from '../store'
 
 const route = useRoute()
 const router = useRouter()
@@ -197,9 +198,9 @@ function rerun(sides: Side[]) {
 async function claim() {
   busy.value = 'claim'
   try {
-    const r = await api.claim(id)
+    const r = await api.claim(id, false, claimDual.value)
     if (r.queued) {
-      msg.success('两侧已进入队列，等待空闲槽位')
+      msg.success(`两侧已按${claimDual.value ? '双模型' : '单模型'}模式进入队列，等待空闲槽位`)
     } else {
       gateReport.value = r.gate
       const bad = Object.entries(r.prepare?.sides || {}).filter(([, v]) => !v.ok)
@@ -301,6 +302,10 @@ const paramRows = computed<[string, string][]>(() => {
     ['任务类型', t.question_type], ['任务难度', t.difficulty], ['语言/框架', t.languages],
     ['Harness', t.harness], ['Harness 版本', t.harness_version], ['操作系统', t.os_platform],
     ['复现等级', t.repro_level], ['仓库', t.repo_url], ['初始快照', t.env_snapshot],
+    ...(t.runs.length ? [
+      ['运行模式', t.run_mode === 'dual' ? '双模型（A 旧模型 / B 新模型）' : '单模型（两侧同一模型）'],
+      ...SIDES.map((s): [string, string] => [`${s} 侧模型`, run(s)?.model || '镜像自带']),
+    ] as [string, string][] : []),
   ]
 })
 const timeRows = computed<[string, string][]>(() => {
@@ -347,6 +352,7 @@ const payloadPreview = computed<[string, string][]>(() => {
       <div class="flex items-center gap-3 flex-wrap">
         <span class="mono text-sm px-2.5 h-7 inline-flex items-center rounded-md bg-bg3 text-fg0 border border-line">#{{ task.task_no }}</span>
         <StatusPill :status="task.status" />
+        <ModeBadge :task="task" />
         <span v-if="task.analysis_status === 'RUNNING'" class="pill text-run border-run/50"><span class="dot bg-run animate-breathe" />对比分析中</span>
         <span v-else-if="task.analysis_status === 'FAILED'" class="pill text-err border-err/50">分析失败</span>
         <PrecheckPill v-if="['QC', 'READY', 'ANALYZED'].includes(task.status)"
@@ -362,6 +368,11 @@ const payloadPreview = computed<[string, string][]>(() => {
       </div>
       <div class="mt-3 flex items-center gap-2 flex-wrap">
         <NButton size="small" quaternary @click="router.back()">← 返回</NButton>
+        <label v-if="claimable" class="flex items-center gap-1.5 text-xs cursor-pointer"
+          :class="claimDual ? 'text-accent' : 'text-fg1'"
+          title="打开后按双模型模式入队：A 侧用镜像自带模型，B 侧用设置里填的新模型">
+          <NSwitch v-model:value="claimDual" size="small" />双模型
+        </label>
         <NButton v-if="claimable" size="small" type="primary" :loading="busy === 'claim'" @click="claim">领取并启动两侧</NButton>
         <NButton v-if="claimable" size="small" secondary :loading="gateChecking" @click="runGate">门禁检查</NButton>
         <NButton v-if="discarded" size="small" type="primary" secondary :loading="busy === 'restore'" @click="restore">恢复该题</NButton>

@@ -58,6 +58,8 @@ export interface TaskRunBrief {
   container_name: string
   container_exists: boolean
   image_tag: string
+  /** 覆盖镜像自带模型的模型名，空串表示用的是镜像里那个 */
+  model: string
   exit_code: number | null
   session_id: string
   turn_id: string
@@ -100,10 +102,14 @@ export interface DifficultyScreen {
   override_at?: string
 }
 
+export type RunMode = 'single' | 'dual'
+
 export interface TaskBrief {
   id: number
   task_no: string
   status: Status
+  /** single 是同一模型跑两侧，dual 是 A 旧模型、B 新模型 */
+  run_mode: RunMode
   analysis_status: 'IDLE' | 'RUNNING' | 'DONE' | 'FAILED'
   question_type: string
   difficulty: string
@@ -555,8 +561,9 @@ export const api = {
 
   // ---- 领取与门禁 ----
   gate: (id: number) => post<GateReport>(`/api/tasks/${id}/gate`),
-  claim: (id: number, force = false) =>
-    post<{ queued: boolean; prepare: PrepareResult; gate: GateReport | null }>(`/api/tasks/${id}/claim${force ? '?force=true' : ''}`),
+  claim: (id: number, force = false, dual = false) =>
+    post<{ queued: boolean; prepare: PrepareResult; gate: GateReport | null }>(
+      `/api/tasks/${id}/claim?force=${force}&dual=${dual}`),
   release: (id: number) => post<{ ok: boolean }>(`/api/tasks/${id}/release`),
   discard: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/discard`),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
@@ -655,7 +662,7 @@ export const api = {
   // ---- 上传与收尾 ----
   upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),
   batchUpload: (ids: number[]) => post<{ results: BatchResult[] }>('/api/tasks/batch/upload', { ids }),
-  batchClaim: (ids: number[]) => post<{ results: any[] }>('/api/tasks/batch/claim', { ids }),
+  batchClaim: (ids: number[], dual = false) => post<{ results: any[] }>('/api/tasks/batch/claim', { ids, dual }),
   /** 批量重跑。sides 留空表示每道题两侧都重跑 */
   batchRerun: (ids: number[], sides: Side[] = []) =>
     post<{ results: BatchResult[] }>('/api/tasks/batch/rerun', { ids, sides }),

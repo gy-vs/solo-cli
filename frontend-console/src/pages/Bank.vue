@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { NButton, NInput, NInputNumber, useDialog, useMessage } from 'naive-ui'
+import { NButton, NInput, NInputNumber, NSwitch, useDialog, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, ApiError, type GateReport, type Status, type TaskBrief } from '../api'
 import GateModal from '../components/GateModal.vue'
 import LaunchModal from '../components/LaunchModal.vue'
 import TaskCard from '../components/TaskCard.vue'
-import { discardedTasks, liveTasks, refreshTasks, store } from '../store'
+import { claimDual, discardedTasks, liveTasks, refreshTasks, store } from '../store'
 
 const router = useRouter()
 const msg = useMessage()
@@ -65,9 +65,9 @@ function takenBy(e: unknown): string {
 async function claim(t: TaskBrief) {
   busyId.value = t.id
   try {
-    const r = await api.claim(t.id)
+    const r = await api.claim(t.id, false, claimDual.value)
     if (r.queued) {
-      msg.success(`题 ${t.task_no} 的 A、B 两侧已进入队列`)
+      msg.success(`题 ${t.task_no} 的 A、B 两侧已按${claimDual.value ? '双模型' : '单模型'}模式进入队列`)
       await refreshTasks()
       router.push('/runs')
     } else {
@@ -91,7 +91,7 @@ async function recheck() {
   gateReport.value = null
   gateReport.value = await api.gate(gateTask.value.id)
   if (gateReport.value.passed) {
-    const r = await api.claim(gateTask.value.id)
+    const r = await api.claim(gateTask.value.id, false, claimDual.value)
     if (r.queued) { msg.success('门禁通过，两侧已进入队列'); gateShow.value = false; await refreshTasks() }
   }
 }
@@ -148,16 +148,18 @@ function claimAll() {
 
 function batchClaim(ids: number[], title: string) {
   if (!ids.length) return
+  const dual = claimDual.value
   dialog.info({
-    title,
+    title: `${title}（${dual ? '双模型' : '单模型'}）`,
     content: `将对 ${ids.length} 道题逐个在远端登记领取，再拉取 A、B 分支并执行门禁，通过的进队列。`
-      + '一道题占两个容器槽位，排不下的会在队列里等。门禁不通过的保持「已领取」，需单独处理。',
+      + '一道题占两个容器槽位，排不下的会在队列里等。门禁不通过的保持「已领取」，需单独处理。'
+      + (dual ? 'A 侧用镜像自带模型，B 侧用设置里的新模型。' : ''),
     positiveText: '开始',
     negativeText: '取消',
     onPositiveClick: async () => {
       batching.value = true
       try {
-        const r = await api.batchClaim(ids)
+        const r = await api.batchClaim(ids, dual)
         const ok = r.results.filter((x) => x.queued).length
         const taken = r.results.filter((x) => x.code === 'POOL_TAKEN').length
         // 被其他设备领走的单独报一句：混在「门禁未过」里会让人以为是本机环境有问题
@@ -190,6 +192,11 @@ function batchClaim(ids: number[], title: string) {
         <NButton size="small" secondary :loading="syncing" @click="doSync">
           {{ pool?.enabled ? '同步远端题库' : '重新扫描' }}
         </NButton>
+        <label class="flex items-center gap-1.5 text-xs cursor-pointer"
+          :class="claimDual ? 'text-accent' : 'text-fg1'"
+          title="打开后领取的题按双模型模式入队：A 侧用镜像自带模型，B 侧用设置里填的新模型">
+          <NSwitch v-model:value="claimDual" size="small" />双模型
+        </label>
         <NInputNumber v-model:value="claimN" size="small" :min="1" :max="counts.available || 1"
           :disabled="!counts.available" class="!w-24" />
         <NButton size="small" type="primary" secondary :loading="batching" :disabled="!counts.available" @click="claimSome">

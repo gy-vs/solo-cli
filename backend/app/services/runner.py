@@ -323,6 +323,7 @@ async def run_side(run_id: int) -> None:
         task_id, side, task_no = task.id, run.side, task.task_no
         prompt = task.user_prompt or ""
         snapshot = gsb_repo.snapshot_sha(task.env_snapshot)
+        model = (run.model or "").strip()
     paths = config.TaskPaths(task_no, side)
     image = settings_store.get("cc.image")
     api_key = settings_store.get("cc.api_key")
@@ -360,18 +361,23 @@ async def run_side(run_id: int) -> None:
         "-v", f"{paths.traces_host}:{config.CONTAINER_PROJECTS}",
         "--memory", settings_store.get("cc.memory") or "4g",
         "--cpus", settings_store.get("cc.cpus") or "2",
-        image, "print",
     ]
+    for var in config.MODEL_ENV_VARS if model else ():
+        cmd += ["-e", f"{var}={model}"]
+    cmd += [image, "print"]
     # 每一侧的事件从 1 开始独立编号，重跑前 watchdog 会清掉这一侧的旧事件，
     # 界面上 A、B 两栏各是一条干净的时间线
     sink = OutputSink(task_id, side)
     with session() as db:
         attempt = (db.get(TaskRun, run_id).attempt if db.get(TaskRun, run_id) else 1)
     label = f"启动容器 {paths.container_name} · {image}"
+    if model:
+        label += f" · 模型 {model}"
     if attempt > 1:
         label = f"第 {attempt} 次尝试 · " + label
     sink.record("lifecycle", label,
                 {"type": "lifecycle", "image": image, "container": paths.container_name,
+                 "model": model,
                  "side": side, "attempt": attempt, "prompt_preview": prompt[:2000]})
 
     proc = await asyncio.create_subprocess_exec(

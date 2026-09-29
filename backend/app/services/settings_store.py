@@ -43,6 +43,10 @@ SPECS: tuple[Spec, ...] = (
     Spec("cc.image", "镜像", "Claude Code 容器", default="adminfather/benzhi-claude-code:20260915-mount"),
     Spec("cc.memory", "容器内存上限", "Claude Code 容器", default="4g"),
     Spec("cc.cpus", "容器 CPU 上限", "Claude Code 容器", default="2"),
+    Spec("cc.model_b", "双模型模式 B 侧模型名", "Claude Code 容器", default="",
+         help="领取时勾选「双模型」的题，A 侧照旧用镜像自带的模型，B 侧换成这里填的模型名，"
+              "key、网关、镜像都不变。只在领取入队那一刻抄进题里，之后改这里不影响已入队的题。"
+              "留空时不能按双模型领取"),
     Spec("cursor.api_key", "Cursor API Key", "Cursor CLI 分析", secret=True, help="cursor.com/dashboard/api 创建的 User API Key"),
     Spec("cursor.model", "分析模型", "Cursor CLI 分析", default="claude-opus-5-thinking-high", kind="select"),
     Spec("cursor.timeout_minutes", "分析超时（分钟）", "Cursor CLI 分析", default="40", kind="number"),

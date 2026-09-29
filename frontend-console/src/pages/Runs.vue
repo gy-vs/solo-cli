@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, SIDES, type Side, type TaskBrief } from '../api'
 import LaunchModal from '../components/LaunchModal.vue'
+import ModeBadge from '../components/ModeBadge.vue'
 import RunCard from '../components/RunCard.vue'
 import StatusPill from '../components/StatusPill.vue'
 import { fmtDuration, fmtTime, RUN_END, SIDE_HEX, VERDICT_LABEL } from '../status'
@@ -125,7 +126,10 @@ async function rerunSide(t: TaskBrief, s: Side) {
         <span class="mono text-xs text-fg0">#{{ t.task_no }}</span>
         <StatusPill :status="t.status" small />
         <div class="min-w-0">
-          <div class="text-xs text-fg0 truncate">{{ t.question_type }} · {{ t.languages }}</div>
+          <div class="flex items-center gap-1.5 min-w-0">
+            <ModeBadge :task="t" small />
+            <div class="text-xs text-fg0 truncate">{{ t.question_type }} · {{ t.languages }}</div>
+          </div>
           <div class="text-[12px] truncate" :class="stage(t).cls">{{ stage(t).text }}</div>
         </div>
         <div class="mono text-[12px] text-fg1 nums">

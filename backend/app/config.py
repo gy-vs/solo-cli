@@ -80,6 +80,21 @@ CONTAINER_LABEL = "solo-cli.task"
 
 SIDES = ("A", "B")
 
+# 运行模式。single 是一直以来的跑法：A、B 用镜像里同一个模型各跑一次。
+# dual 是新旧模型对比：A 照旧用镜像自带的模型，B 只把模型名换成 cc.model_b，
+# key、网关、镜像、资源限额一概不变。
+RUN_MODE_SINGLE = "single"
+RUN_MODE_DUAL = "dual"
+# 镜像里声明作答模型的全部环境变量。只覆盖 ANTHROPIC_MODEL 不够：子代理和按档位
+# 选模型的调用走的是后面几个，漏一个就会有一部分步骤悄悄落回旧模型上。
+MODEL_ENV_VARS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+)
+
 
 class TaskPaths:
     """一道题某一侧（A 或 B）涉及的全部目录，同时给出宿主路径与挂载路径。

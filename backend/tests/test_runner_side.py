@@ -190,6 +190,56 @@ def test_run_side_holds_the_queue_when_the_image_is_missing(task_with_runs, monk
         assert run.container_exists is False
 
 
+def _spawned_cmd(ids, side, monkeypatch) -> list[str]:
+    """跑到 docker run 那一步为止，把拼出来的命令行拿回来。"""
+    got: list[tuple] = []
+
+    class Spawned(Exception):
+        pass
+
+    async def spawn(*a, **k):
+        got.append(a)
+        raise Spawned
+
+    async def ok(*a, **k):
+        return {"ok": True, "head": "", "dirty": 0, "message": ""}
+
+    async def present(image):
+        return True
+
+    monkeypatch.setattr(runner.dockerx, "image_present", present)
+    monkeypatch.setattr(runner.gsb_repo, "verify_head", ok)
+    monkeypatch.setattr(runner.settings_store, "get", lambda k: "img")
+    monkeypatch.setattr(runner.settings_store, "get_int", lambda k, d=0: d)
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(Spawned):
+        asyncio.run(runner.run_side(ids[side]))
+    return list(got[0])
+
+
+def test_run_without_model_leaves_the_image_model_alone(task_with_runs, monkeypatch):
+    """单模型模式的命令行必须和加双模型之前一模一样：一个模型变量都不带。"""
+    _, ids = task_with_runs
+    cmd = _spawned_cmd(ids, "A", monkeypatch)
+    assert not any(a.startswith(v + "=") for a in cmd for v in runner.config.MODEL_ENV_VARS)
+    assert cmd[-2:] == ["img", "print"]
+
+
+def test_run_with_model_overrides_every_model_var(task_with_runs, monkeypatch):
+    """只换模型名：每个模型变量都指向新模型，镜像和 key 照旧。"""
+    from app.db import session
+
+    _, ids = task_with_runs
+    with session() as db:
+        db.get(m.TaskRun, ids["B"]).model = "new/model"
+    cmd = _spawned_cmd(ids, "B", monkeypatch)
+    for var in runner.config.MODEL_ENV_VARS:
+        assert f"{var}=new/model" in cmd
+    assert "apikey=img" in cmd
+    # 覆盖参数要在镜像名前面，放到后面就成了传给容器入口的参数
+    assert cmd[-2:] == ["img", "print"]
+
+
 # ---------------- 收尾落库 ----------------
 
 @pytest.fixture()

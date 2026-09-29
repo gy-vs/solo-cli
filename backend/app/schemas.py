@@ -68,6 +68,12 @@ class IdList(BaseModel):
     ids: list[int]
 
 
+class ClaimBatch(IdList):
+    """批量领取：dual 为真时整批按双模型模式入队。"""
+
+    dual: bool = False
+
+
 class RerunBatch(IdList):
     """批量重跑：ids 是题，sides 留空表示每道题两侧都重跑。"""
 
@@ -106,6 +112,7 @@ def run_brief(r: TaskRun) -> dict:
         "container_name": r.container_name,
         "container_exists": r.container_exists,
         "image_tag": r.image_tag,
+        "model": r.model,
         "exit_code": r.exit_code,
         "session_id": r.session_id,
         "turn_id": r.turn_id,
@@ -142,6 +149,7 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "id": t.id,
         "task_no": t.task_no,
         "status": t.status,
+        "run_mode": t.run_mode or "single",
         "analysis_status": t.analysis_status,
         "question_type": t.question_type,
         "difficulty": t.difficulty,
