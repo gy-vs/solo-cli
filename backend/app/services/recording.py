@@ -413,6 +413,43 @@ async def _import(it: dict, sec: rec_report.DocSection) -> bool:
 
 # ---------------- 收回视频 ----------------
 
+def _collectable(task: Task, entry: rec_repo.Entry) -> bool:
+    """视频已回传、题还在待录屏、文档还是这一稿理由的，而且没在收、也不在失败冷却期里。"""
+    if entry.state != rec_repo.S_RECORDED or task.status != QC or task.id in _collect_jobs:
+        return False
+    if entry.digest != current_digest(task):
+        return False
+    rec = task.recording or {}
+    return not (rec.get("collect_error") and _age(rec.get("collect_failed_at") or "") < COLLECT_RETRY_GAP_S)
+
+
+def collect_ready() -> int:
+    """本地事件流里已经有回传、能收的题立刻收，不等下一轮巡检。
+
+    录屏仓库每拉一次（巡检、认领、写事件时推送被拒后的 rebase）都会走到这里：
+    别人回传的事件往往是顺着别的动作拉下来的，拉到了还干等巡检就白等一轮。
+    """
+    if not producer_active():
+        return 0
+    me = rec_repo.device()
+    ready = {e.task_no: e for e in rec_repo.entries().values()
+             if e.owner == me and e.state == rec_repo.S_RECORDED}
+    if not ready:
+        return 0
+    started = []
+    with session() as db:
+        for task in db.execute(select(Task).where(Task.task_no.in_(list(ready)))).scalars():
+            if _collectable(task, ready[task.task_no]):
+                _start_collect(task.id, ready[task.task_no])
+                started.append(task.task_no)
+    if started:
+        log.info("录屏仓库拉到回传，立即收回：%s", "、".join(started))
+    return len(started)
+
+
+rec_repo.on_change(collect_ready)
+
+
 def _start_collect(task_id: int, entry: rec_repo.Entry) -> None:
     if task_id in _collect_jobs:
         return
@@ -504,11 +541,7 @@ async def scan() -> dict:
                 why = "理由改过" if stale else f"题已离开待录屏（{task.status}）"
                 withdraw.append(rec_repo.event(rec_repo.WITHDRAWN, me, no, reason=why))
                 continue
-            if entry.state == rec_repo.S_RECORDED and task.status == QC and not stale:
-                if task.id in _collect_jobs:
-                    continue
-                if rec.get("collect_error") and _age(rec.get("collect_failed_at") or "") < COLLECT_RETRY_GAP_S:
-                    continue
+            if _collectable(task, entry):
                 _start_collect(task.id, entry)
                 stats["collected"] += 1
         # 人手动排的排前面，而且不看自动生成开关

@@ -532,7 +532,7 @@ const scanNote = computed(() => {
                 :class="t.recording.collect_error ? 'text-err' : 'text-info'" :title="t.recording.collect_error">
                 <template v-if="t.collecting"><span class="dot bg-run animate-breathe mr-1" />正在拉回视频并代传平台</template>
                 <template v-else-if="t.recording.collect_error">收回失败：{{ t.recording.collect_error }}，巡检稍后重试</template>
-                <template v-else>{{ fmtTime(t.entry?.recorded_at) }} 回传，等巡检收回</template>
+                <template v-else>{{ fmtTime(t.entry?.recorded_at) }} 回传，等待收回</template>
               </div>
               <div v-else class="text-[12px] truncate" :class="t.submit_block ? 'text-warn' : 'text-ok'" :title="t.submit_block">
                 {{ t.submit_block || `录屏已到位${t.recording.recorded_by ? `（${t.recording.recorded_by} 录制）` : ''}，可提交` }}

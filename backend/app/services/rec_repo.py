@@ -21,6 +21,7 @@ import logging
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -170,13 +171,33 @@ async def _init_local(slug: str) -> tuple[bool, str]:
     return (True, "") if r.ok else (False, f"推送录屏仓库失败：{_tail(r)}")
 
 
+_listeners: list[Callable[[], None]] = []
+
+
+def on_change(fn: Callable[[], None]) -> None:
+    """本地事件流可能变了（拉到了别人的事件、或刚写了自己的）就调 fn。fn 必须是不阻塞的同步函数。"""
+    if fn not in _listeners:
+        _listeners.append(fn)
+
+
+def _notify() -> None:
+    for fn in _listeners:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            log.exception("录屏仓库变更回调失败")
+
+
 async def sync() -> dict:
     """把 main 拉到本地。返回 {ok, message, stale?}。"""
     ok, why = available()
     if not ok:
         return {"ok": False, "message": why}
     async with _lock:
-        return await _sync_locked()
+        res = await _sync_locked()
+    if res["ok"]:
+        _notify()
+    return res
 
 
 async def _sync_locked() -> dict:
@@ -337,26 +358,34 @@ async def append(events: list[dict], *, subject: str, attempts: int = 3) -> dict
     if not ok:
         return {"ok": False, "message": why}
     async with _lock:
-        if not (repo_dir() / ".git").is_dir():
-            res = await _sync_locked()
-            if not res["ok"]:
-                return res
-        d = repo_dir()
-        with events_path().open("a", encoding="utf-8") as fp:
-            for ev in events:
-                fp.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        await _git(["add", "-A"], cwd=d)
-        r = await _git([*_GIT_ID, "commit", "-q", "-m", f"{device()}: {subject}"], cwd=d)
-        if not r.ok and "nothing to commit" not in (r.out + r.err):
-            return {"ok": False, "message": f"提交事件失败：{_tail(r)}"}
-        rr = r
-        for attempt in range(1, attempts + 1):
-            rr = await _git(["push", "-q", _url(), f"HEAD:{MAIN_BRANCH}"], cwd=d)
-            if rr.ok:
-                return {"ok": True, "message": "已同步到录屏仓库"}
-            if attempt < attempts:
-                await _git([*_GIT_ID, "pull", "--rebase", "-q", _url(), MAIN_BRANCH], cwd=d)
-        return {"ok": False, "message": f"推送录屏仓库失败：{_tail(rr)}"}
+        res = await _append_locked(events, subject=subject, attempts=attempts)
+    # 推送被拒时中间 rebase 过，别人的事件（比如另一台刚回传的视频）是顺着这里进来的
+    if res["ok"]:
+        _notify()
+    return res
+
+
+async def _append_locked(events: list[dict], *, subject: str, attempts: int) -> dict:
+    if not (repo_dir() / ".git").is_dir():
+        res = await _sync_locked()
+        if not res["ok"]:
+            return res
+    d = repo_dir()
+    with events_path().open("a", encoding="utf-8") as fp:
+        for ev in events:
+            fp.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    await _git(["add", "-A"], cwd=d)
+    r = await _git([*_GIT_ID, "commit", "-q", "-m", f"{device()}: {subject}"], cwd=d)
+    if not r.ok and "nothing to commit" not in (r.out + r.err):
+        return {"ok": False, "message": f"提交事件失败：{_tail(r)}"}
+    rr = r
+    for attempt in range(1, attempts + 1):
+        rr = await _git(["push", "-q", _url(), f"HEAD:{MAIN_BRANCH}"], cwd=d)
+        if rr.ok:
+            return {"ok": True, "message": "已同步到录屏仓库"}
+        if attempt < attempts:
+            await _git([*_GIT_ID, "pull", "--rebase", "-q", _url(), MAIN_BRANCH], cwd=d)
+    return {"ok": False, "message": f"推送录屏仓库失败：{_tail(rr)}"}
 
 
 # ---------------- 每题分支 ----------------

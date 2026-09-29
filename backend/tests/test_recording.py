@@ -272,6 +272,24 @@ def test_append_rebases_over_a_concurrent_push_from_another_device(local_remote,
     assert e.state == rec_repo.S_CLAIMED and e.claimed_by == "rec2"
 
 
+def test_append_that_pulls_in_another_devices_event_notifies_listeners(local_remote, tmp_path, monkeypatch):
+    """别人的回传是顺着自己写事件时的 rebase 进来的，这时就要通知，不能只在巡检同步时通知。"""
+    seen = []
+    monkeypatch.setattr(rec_repo, "_listeners", [])
+    rec_repo.on_change(lambda: seen.append(rec_repo.entries()["dev1/101"].state))
+
+    asyncio.run(rec_repo.append([_ev("published", "1", by="dev1", digest="d1")], subject="p"))
+    other = tmp_path / "other"
+    _git("clone", "-q", str(local_remote), str(other))
+    with (other / "events.jsonl").open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(_ev("recorded", "2", by="rec2", digest="d1")) + "\n")
+    _git("-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qam", "rec", cwd=other)
+    _git("push", "-q", "origin", "HEAD:main", cwd=other)
+
+    asyncio.run(rec_repo.append([_ev("published", "1", by="dev1", owner="dev1", no="102")], subject="p2"))
+    assert seen == [rec_repo.S_OPEN, rec_repo.S_RECORDED]
+
+
 # ---------------- 巡检编排 ----------------
 
 @pytest.fixture()
@@ -361,6 +379,26 @@ def test_scan_collects_recorded_videos(stub_repo):
     stub_repo["entries"] = {"dev1/101": _entry("101", rec_repo.S_RECORDED, recorded_by="rec1")}
     asyncio.run(recording.scan())
     assert stub_repo["collected"] == [tid] and stub_repo["appended"] == []
+
+
+def test_collect_ready_starts_right_away_without_a_scan(stub_repo):
+    ok = _add("101", m.QC)
+    _add("102", m.QC, gsb={"reason": "改过的理由"})                       # 文档是旧稿录的
+    _add("103", m.QC, recording={"collect_error": "HTTP 401",
+                                 "collect_failed_at": recording.utc_now().isoformat()})
+    _add("104", m.ANALYZED)
+    stub_repo["entries"] = {f"dev1/{n}": _entry(n, rec_repo.S_RECORDED) for n in ("101", "102", "103", "104")}
+    stub_repo["entries"]["dev2/105"] = rec_repo.Entry(owner="dev2", task_no="105",
+                                                      state=rec_repo.S_RECORDED, digest="x")
+    assert recording.collect_ready() == 1
+    assert stub_repo["collected"] == [ok]
+
+
+def test_collect_ready_is_idle_on_a_recorder_only_device(stub_repo, monkeypatch):
+    _add("101", m.QC)
+    stub_repo["entries"] = {"dev1/101": _entry("101", rec_repo.S_RECORDED)}
+    monkeypatch.setattr(rec_repo, "recorder_only", lambda: True)
+    assert recording.collect_ready() == 0 and stub_repo["collected"] == []
 
 
 def test_scan_deletes_branch_once_task_is_uploaded(stub_repo):
