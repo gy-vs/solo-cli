@@ -47,7 +47,7 @@ from app.services import breaker, difficulty, dockerx, gsb_repo, llm, settings_s
 
 log = logging.getLogger("watchdog")
 
-INTERVAL_DEFAULT = 300
+INTERVAL_DEFAULT = 150
 MAX_RETRIES_DEFAULT = 3
 MAX_TIMEOUTS_DEFAULT = 2
 # 同一侧因断网被退回、不计次数的上限。断网本不该算到题头上，但熔断探活只看得到

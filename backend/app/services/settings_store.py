@@ -115,7 +115,7 @@ SPECS: tuple[Spec, ...] = (
          default="80", kind="number"),
     Spec("difficulty.mid_peer_steps", "一侧在偏低线与废弃线之间时，另一侧至少要有的步数",
          "难度筛选", default="60", kind="number"),
-    Spec("watchdog.interval_seconds", "守护扫描间隔（秒）", "守护", default="300", kind="number",
+    Spec("watchdog.interval_seconds", "守护扫描间隔（秒）", "守护", default="150", kind="number",
          help="扫异常重跑与配对触发分析；run 一结束会立刻唤醒一次，这个间隔只是兜底"),
     Spec("watchdog.paused", "暂停自动重跑与废弃", "守护", default="0", kind="bool",
          help="打开后巡检不再自动重跑、也不再因次数用尽自动废弃，题目保持当前状态。"
