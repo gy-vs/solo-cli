@@ -14,8 +14,8 @@ from app.db import session
 from app.events import bus, sse_format
 from app.models import ALL_STATUSES, RUN_RUNNING, Task, TaskRun
 from app.services import (
-    designer, dockerx, gsb_precheck, gsb_uploader, llm, pool, qa_bridge, settings_store,
-    watchdog,
+    designer, dockerx, gsb_precheck, gsb_uploader, llm, pool, qa_bridge, run_mode,
+    settings_store, watchdog,
 )
 from app.services.scheduler import scheduler
 
@@ -53,6 +53,7 @@ async def system_status() -> dict:
         # 容器数才是真实负载：一道题占两个
         running_sides = db.execute(select(func.count()).select_from(TaskRun)
                                    .where(TaskRun.status == RUN_RUNNING)).scalar() or 0
+        dual_quota = run_mode.quota(db)
     containers = await dockerx.list_task_containers() if docker_ok else []
     dedup_ok, dedup_why = qa_bridge.available()
     return {
@@ -73,6 +74,7 @@ async def system_status() -> dict:
         "counts": counts,
         "running_sides": running_sides,
         "totals": {"finished": finished_today, "uploaded": uploaded_today, "date": today},
+        "dual_quota": dual_quota,
         "containers": containers,
         "configured": {
             "cc.api_key": settings_store.is_configured("cc.api_key"),

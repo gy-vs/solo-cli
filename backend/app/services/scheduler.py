@@ -24,7 +24,7 @@ from app.models import (
     RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING, RUN_WAITING, SCHEDULABLE, Task, TaskRun,
     as_utc, derive_task_status, utc_now,
 )
-from app.services import breaker, difficulty, dockerx, runner, settings_store
+from app.services import breaker, difficulty, dockerx, run_mode, runner, settings_store
 
 log = logging.getLogger("scheduler")
 
@@ -275,6 +275,8 @@ class Scheduler:
                     continue
                 run.status = RUN_RUNNING
                 task_ids.add(run.task_id)
+                # 模式要赶在 runner 起容器之前定死：runner 起容器时读的就是这一行上的模型名
+                run_mode.settle(db, run.task_id)
             for tid in task_ids:
                 sync_task_status(db, tid)
         for tid in task_ids:

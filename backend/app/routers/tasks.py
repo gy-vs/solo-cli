@@ -26,8 +26,8 @@ from app.schemas import (
 )
 from app.services import (
     difficulty, dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo,
-    gsb_rules, gsb_uploader, gsb_verifier, pool, pool_bank, prompt_bank, runner, scheduler,
-    scope, settings_store, trace, watchdog,
+    gsb_rules, gsb_uploader, gsb_verifier, pool, pool_bank, prompt_bank, run_mode, runner,
+    scheduler, scope, settings_store, trace, watchdog,
 )
 
 log = logging.getLogger("tasks")
@@ -301,13 +301,12 @@ async def batch_claim(body: ClaimBatch) -> dict:
     模型调用一个接一个，每次一两分钟，光这一项就能把整个请求拖到二十分钟以上。这一轮跑
     完之后下面每道题读的都是缓存。
     """
-    if body.dual:
-        _dual_model()
+    _check_mode(body.mode)
     await scope.warm(body.ids)
     results = []
     for tid in body.ids:
         try:
-            results.append({"id": tid, **(await _claim(tid, force=False, dual=body.dual))})
+            results.append({"id": tid, **(await _claim(tid, force=False, mode=body.mode))})
         except HTTPException as exc:
             # 被别的设备抢先时 detail 是结构化的，拆出错误码让界面能单独统计一句
             # 「N 道被其他设备领走」，混在门禁未过里报会让人以为是自己这边有问题。
@@ -385,22 +384,28 @@ async def gate_check(task_id: int) -> dict:
 
 @router.post("/{task_id}/claim")
 async def claim(task_id: int, force: bool = Query(default=False),
-                dual: bool = Query(default=False)) -> dict:
+                mode: str = Query(default=config.RUN_MODE_SINGLE)) -> dict:
     """领取：校验分支、clone 两侧、跑门禁，通过就建两个 run 进队列。
 
-    dual=true 按双模型模式入队：A 用镜像自带模型，B 用设置里的 cc.model_b。
+    mode 取值见 run_mode.MODES：dual 时 A 用镜像自带模型、B 用设置里的 cc.model_b；
+    auto 先标成待定，等第一个容器出闸时按当天的双/单循环定，见 run_mode 模块。
     """
-    return await _claim(task_id, force, dual)
+    return await _claim(task_id, force, mode)
 
 
-def _dual_model() -> str:
-    """双模型模式的 B 侧模型名。没配就拒绝，不能悄悄退回单模型去跑。
+def _check_mode(mode: str) -> str:
+    """校验领取模式，可能派双模型时顺带取出 B 侧模型名。没配就拒绝，不能悄悄退回单模型去跑。
 
-    要在去远端占题之前查：占下来再报错，题就挂在本机名下，还得人去放回。
+    要在去远端占题之前查：占下来再报错，题就挂在本机名下，还得人去放回。自动配比在这一刻
+    还不知道会派到哪种，只要比例不是 0 就可能派到双模型，所以一样要求先配好。
     """
+    if mode not in run_mode.MODES:
+        raise HTTPException(400, f"mode 必须是 {' / '.join(run_mode.MODES)}")
+    if mode == config.RUN_MODE_SINGLE or (mode == run_mode.MODE_AUTO and not run_mode.cycle()[0]):
+        return ""
     model = settings_store.get("cc.model_b").strip()
     if not model:
-        raise HTTPException(400, "双模型模式需要先在设置页填写「双模型模式 B 侧模型名」")
+        raise HTTPException(400, "双模型模式与自动配比都需要先在设置页填写「双模型模式 B 侧模型名」")
     return model
 
 
@@ -433,9 +438,9 @@ async def _take_remote(task_id: int) -> None:
                                      "task_no": task_no, "message": res["message"]})
 
 
-async def _claim(task_id: int, force: bool, dual: bool = False) -> dict:
+async def _claim(task_id: int, force: bool, mode: str = config.RUN_MODE_SINGLE) -> dict:
     """领取的实际动作。进程内的调用方一律走这里，见 batch_claim 的说明。"""
-    model_b = _dual_model() if dual else ""
+    model_b = _check_mode(mode)
     with session() as db:
         t = _get(db, task_id)
         if t.status not in (AVAILABLE, CLAIMED):
@@ -478,20 +483,22 @@ async def _claim(task_id: int, force: bool, dual: bool = False) -> dict:
     if queued:
         with session() as db:
             t = _get(db, task_id)
+            dual = mode == config.RUN_MODE_DUAL
             # 两侧的 run 一次建齐。缺一侧调度器会跳过整道题，宁可这里就建全
             have = {r.side: r for r in _runs(db, task_id)}
             for side in config.SIDES:
-                model = model_b if side == "B" else ""
+                model = model_b if dual and side == "B" else ""
                 if side in have:
                     have[side].model = model
                 else:
                     db.add(TaskRun(task_id=task_id, side=side, model=model,
                                    container_name=config.TaskPaths(t.task_no, side).container_name))
-            t.run_mode = config.RUN_MODE_DUAL if dual else config.RUN_MODE_SINGLE
+            t.run_mode = mode
+            t.mode_at = None
             t.status = QUEUED
             t.claimed_at = utc_now()
     bus.publish("tasks", {"type": "task", "id": task_id})
-    return {"queued": queued, "prepare": prep, "gate": report}
+    return {"queued": queued, "run_mode": mode if queued else "", "prepare": prep, "gate": report}
 
 
 @router.post("/{task_id}/release")
@@ -520,6 +527,7 @@ async def release(task_id: int) -> dict:
         t.claimed_at = None
         t.claimed_by = ""
         t.run_mode = config.RUN_MODE_SINGLE
+        t.mode_at = None
         for r in _runs(db, task_id):
             db.delete(r)
     bus.publish("tasks", {"type": "task", "id": task_id})

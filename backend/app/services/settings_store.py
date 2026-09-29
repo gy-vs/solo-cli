@@ -47,6 +47,11 @@ SPECS: tuple[Spec, ...] = (
          help="领取时勾选「双模型」的题，A 侧照旧用镜像自带的模型，B 侧换成这里填的模型名，"
               "key、网关、镜像都不变。只在领取入队那一刻抄进题里，之后改这里不影响已入队的题。"
               "留空时不能按双模型领取"),
+    Spec("run.cycle_dual", "自动配比：每轮先跑几道双模型", "Claude Code 容器", default="3", kind="number",
+         help="按「自动配比」领取的题，模式在第一个容器出闸时才定：每天开跑的题按「先这么多道双模型、"
+              "再下一项那么多道单模型」循环。手动强制单/双模型的题也计入当天的循环，已废弃的不计，"
+              "缺口由后面开跑的题补上。填 0 等于自动配比全走单模型"),
+    Spec("run.cycle_single", "自动配比：每轮再跑几道单模型", "Claude Code 容器", default="6", kind="number"),
     Spec("cursor.api_key", "Cursor API Key", "Cursor CLI 分析", secret=True, help="cursor.com/dashboard/api 创建的 User API Key"),
     Spec("cursor.model", "分析模型", "Cursor CLI 分析", default="claude-opus-5-thinking-high", kind="select"),
     Spec("cursor.timeout_minutes", "分析超时（分钟）", "Cursor CLI 分析", default="40", kind="number"),

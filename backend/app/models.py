@@ -189,9 +189,12 @@ class Task(Base, JsonMixin):
     # 远端分支校验结果。校验失败题会停在 CLAIMED，把原因存下来是为了题卡能直接
     # 显示缺哪个分支，而不是让人翻日志。
     branch_check_json: Mapped[str] = mapped_column(Text, default="{}")
-    # 运行模式，取值见 config.RUN_MODE_*。领取入队时定下，放回题库时回到 single。
-    # server_default 让老库补列后的历史题都读成 single，它们确实都是单模型跑的。
+    # 运行模式：single / dual，或 auto（按自动配比领取、还没开跑，出闸时才定，见 run_mode 模块）。
+    # 放回题库时回到 single。server_default 让老库补列后的历史题都读成 single，它们确实都是单模型跑的。
     run_mode: Mapped[str] = mapped_column(String(16), default="single", server_default="single")
+    # 第一个容器出闸、模式就此定死的时刻。每天的双/单循环按它数，而不是按领取时间：
+    # 领了但今天排不到的题不该占掉今天的名额。
+    mode_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 废弃前的状态，恢复时按它回退；不属于单跑字段，所以留在题级
     discarded_from: Mapped[str] = mapped_column(String(16), default="")
 

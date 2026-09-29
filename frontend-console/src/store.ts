@@ -1,6 +1,6 @@
 /** 轻量全局状态：系统状态 + 任务列表，供各页面共享并由 SSE 驱动刷新。 */
 import { computed, reactive, ref, watch } from 'vue'
-import { api, SIDES, type HostHealth, type SystemStatus, type TaskBrief } from './api'
+import { api, SIDES, type ClaimMode, type HostHealth, type SystemStatus, type TaskBrief } from './api'
 
 export const store = reactive({
   status: null as SystemStatus | null,
@@ -13,11 +13,14 @@ export const store = reactive({
 
 let pending: number | null = null
 
-/** 领取时是否按双模型模式入队。题库页、详情页、门禁弹窗共用一个开关，记在本机，
- *  否则在题库页打开了、门禁弹窗里重新检查通过后却按单模型入了队 */
-const DUAL_KEY = 'solo.claimDual'
-export const claimDual = ref(localStorage.getItem(DUAL_KEY) === '1')
-watch(claimDual, (v) => localStorage.setItem(DUAL_KEY, v ? '1' : '0'))
+/** 领取时按哪种模式入队，默认自动配比。题库页、详情页、门禁弹窗共用一份，记在本机，
+ *  否则在题库页选了双模型、门禁弹窗里重新检查通过后却按别的模式入了队 */
+const MODE_KEY = 'solo.claimMode'
+const savedMode = localStorage.getItem(MODE_KEY)
+export const claimMode = ref<ClaimMode>(
+  savedMode === 'single' || savedMode === 'dual' ? savedMode : 'auto')
+watch(claimMode, (v) => localStorage.setItem(MODE_KEY, v))
+export const MODE_TEXT: Record<string, string> = { auto: '自动配比', single: '单模型', dual: '双模型' }
 
 export async function refreshStatus() {
   try { store.status = await api.status() } catch { /* 顶栏会显示断连 */ }

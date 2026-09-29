@@ -2,7 +2,7 @@
 import { NButton, NModal, useDialog, useMessage } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { api, type GateReport, type TaskBrief } from '../api'
-import { claimDual } from '../store'
+import { claimMode, MODE_TEXT } from '../store'
 import GateChecks from './GateChecks.vue'
 
 const props = defineProps<{ show: boolean; task: TaskBrief | null; report: GateReport | null }>()
@@ -23,8 +23,8 @@ function forceStart() {
     onPositiveClick: async () => {
       busy.value = true
       try {
-        await api.claim(props.task!.id, true, claimDual.value)
-        msg.success('已强制加入队列')
+        const r = await api.claim(props.task!.id, true, claimMode.value)
+        msg.success(`已按${MODE_TEXT[r.run_mode]}模式强制加入队列`)
         emit('queued')
         emit('update:show', false)
       } catch (e: any) { msg.error(e.message) } finally { busy.value = false }

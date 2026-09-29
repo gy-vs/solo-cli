@@ -114,7 +114,7 @@ def test_dual_claim_puts_the_new_model_on_b_only(one_task, monkeypatch):
     settings_store.set_one("cc.model_b", "new/model")
     _stub_gate(monkeypatch, prepared=True, checks=[Check("workspace_A", "ok", "就绪")])
 
-    assert asyncio.run(tasks_router._claim(one_task, force=False, dual=True))["queued"] is True
+    assert asyncio.run(tasks_router._claim(one_task, force=False, mode="dual"))["queued"] is True
     with session() as db:
         assert db.get(m.Task, one_task).run_mode == "dual"
         models = {r.side: r.model for r in db.query(m.TaskRun).all()}
@@ -142,7 +142,7 @@ def test_dual_claim_without_a_model_is_refused_before_anything_happens(one_task,
 
     monkeypatch.setattr(tasks_router.gate, "prepare_workspaces", boom)
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(tasks_router._claim(one_task, force=False, dual=True))
+        asyncio.run(tasks_router._claim(one_task, force=False, mode="dual"))
     assert exc.value.status_code == 400
     with session() as db:
         assert db.get(m.Task, one_task).status == m.AVAILABLE
@@ -154,11 +154,31 @@ def test_release_returns_the_task_to_single_mode(one_task, monkeypatch):
 
     settings_store.set_one("cc.model_b", "new/model")
     _stub_gate(monkeypatch, prepared=True, checks=[Check("workspace_A", "ok", "就绪")])
-    asyncio.run(tasks_router._claim(one_task, force=False, dual=True))
+    asyncio.run(tasks_router._claim(one_task, force=False, mode="dual"))
     asyncio.run(tasks_router.release(one_task))
     with session() as db:
         assert db.get(m.Task, one_task).run_mode == "single"
         assert db.query(m.TaskRun).count() == 0
+
+
+def test_auto_claim_leaves_the_mode_open_until_dispatch(one_task, monkeypatch):
+    """自动配比领取时不定模式：今天领的题可能明天才跑，名额要留给真正开跑的那一刻。"""
+    from app.services import settings_store
+    from app.services.gate import Check
+
+    settings_store.set_one("cc.model_b", "new/model")
+    _stub_gate(monkeypatch, prepared=True, checks=[Check("workspace_A", "ok", "就绪")])
+    assert asyncio.run(tasks_router._claim(one_task, force=False, mode="auto"))["run_mode"] == "auto"
+    with session() as db:
+        t = db.get(m.Task, one_task)
+        assert (t.run_mode, t.mode_at) == ("auto", None)
+        assert {r.model for r in db.query(m.TaskRun).all()} == {""}
+
+
+def test_auto_without_model_is_refused(one_task, monkeypatch):
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(tasks_router._claim(one_task, force=False, mode="auto"))
+    assert exc.value.status_code == 400
 
 
 # ---------------- 跨设备抢占 ----------------

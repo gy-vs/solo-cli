@@ -69,9 +69,9 @@ class IdList(BaseModel):
 
 
 class ClaimBatch(IdList):
-    """批量领取：dual 为真时整批按双模型模式入队。"""
+    """批量领取：mode 取值见 run_mode.MODES，auto 时每道都等开跑那一刻按当天循环定。"""
 
-    dual: bool = False
+    mode: str = "single"
 
 
 class RerunBatch(IdList):
@@ -150,6 +150,7 @@ def task_brief(t: Task, runs: list[TaskRun] | None = None) -> dict:
         "task_no": t.task_no,
         "status": t.status,
         "run_mode": t.run_mode or "single",
+        "mode_at": _iso(t.mode_at),
         "analysis_status": t.analysis_status,
         "question_type": t.question_type,
         "difficulty": t.difficulty,

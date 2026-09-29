@@ -103,13 +103,17 @@ export interface DifficultyScreen {
 }
 
 export type RunMode = 'single' | 'dual'
+/** 领取时怎么定模式：auto 由后端按当天配比逐道决定 */
+export type ClaimMode = 'auto' | RunMode
 
 export interface TaskBrief {
   id: number
   task_no: string
   status: Status
-  /** single 是同一模型跑两侧，dual 是 A 旧模型、B 新模型 */
-  run_mode: RunMode
+  /** single 是同一模型跑两侧，dual 是 A 旧模型、B 新模型，auto 是自动配比、开跑时才定 */
+  run_mode: ClaimMode
+  /** 模式定死的时刻，即第一个容器出闸的时刻 */
+  mode_at: string | null
   analysis_status: 'IDLE' | 'RUNNING' | 'DONE' | 'FAILED'
   question_type: string
   difficulty: string
@@ -449,6 +453,8 @@ export interface SystemStatus {
   counts: Record<Status, number>
   running_sides: number
   totals: { finished: number; uploaded: number; date: string }
+  /** 当天已开跑、未废弃的题里双模型有几道。cycle 是「先几道双、再几道单」，next 是下一道自动配比题会派到的 */
+  dual_quota: { date: string; total: number; dual: number; cycle: [number, number]; next: RunMode }
   containers: { name: string; status: string; task_no: string }[]
   configured: Record<string, boolean>
   paths: { coder_root_host: string; coder_root_mount: string; prompt_file: string; prompt_exists: boolean }
@@ -561,9 +567,9 @@ export const api = {
 
   // ---- 领取与门禁 ----
   gate: (id: number) => post<GateReport>(`/api/tasks/${id}/gate`),
-  claim: (id: number, force = false, dual = false) =>
-    post<{ queued: boolean; prepare: PrepareResult; gate: GateReport | null }>(
-      `/api/tasks/${id}/claim?force=${force}&dual=${dual}`),
+  claim: (id: number, force = false, mode: ClaimMode = 'single') =>
+    post<{ queued: boolean; run_mode: ClaimMode | ''; prepare: PrepareResult; gate: GateReport | null }>(
+      `/api/tasks/${id}/claim?force=${force}&mode=${mode}`),
   release: (id: number) => post<{ ok: boolean }>(`/api/tasks/${id}/release`),
   discard: (id: number) => post<{ ok: boolean; message: string }>(`/api/tasks/${id}/discard`),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
@@ -662,7 +668,7 @@ export const api = {
   // ---- 上传与收尾 ----
   upload: (id: number) => post<{ ok: boolean; message: string; submission_id?: number }>(`/api/tasks/${id}/upload`),
   batchUpload: (ids: number[]) => post<{ results: BatchResult[] }>('/api/tasks/batch/upload', { ids }),
-  batchClaim: (ids: number[], dual = false) => post<{ results: any[] }>('/api/tasks/batch/claim', { ids, dual }),
+  batchClaim: (ids: number[], mode: ClaimMode = 'single') => post<{ results: any[] }>('/api/tasks/batch/claim', { ids, mode }),
   /** 批量重跑。sides 留空表示每道题两侧都重跑 */
   batchRerun: (ids: number[], sides: Side[] = []) =>
     post<{ results: BatchResult[] }>('/api/tasks/batch/rerun', { ids, sides }),
