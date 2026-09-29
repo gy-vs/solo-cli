@@ -7,7 +7,7 @@ type DialogApiInjection = ReturnType<typeof useDialog>
 /** 人对查重提示的回答。skip 带着要记进题里的理由 */
 export type DedupAnswer = { action: 'skip'; reason: string } | { action: 'discard' } | { action: 'cancel' }
 
-/** solo2 没起或查重没跑成：说一声，确认了就照常领，不拦 */
+/** 查重没跑成：说一声，确认了就照常领，不拦 */
 export function askUnavailable(dialog: DialogApiInjection, why: string, what: string): Promise<boolean> {
   return new Promise((resolve) => {
     let done = false

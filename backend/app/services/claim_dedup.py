@@ -7,8 +7,9 @@
 同批互查时两边都会被标成命中，这里只认「撞了排在前面的那道」：先领的留下，后领的
 才算重复，不然一对重复题会一起被拦下，一道也不剩。
 
-查重没跑成（solo2 没启动、桥接报错）不替人拿主意：告诉人一声，人确认了就照常领，
-不拦。命中了也不自动废弃，人可以略过——规则 A 按字面比，模板相近但做的事不同的题
+桥接是拿 solo2 的镜像和源码起一个一次性容器、直连远端库，不经过 solo2 的服务，所以
+solo2 起没起不影响查重。查重没跑成（远端库连不上、桥接报错）不替人拿主意：告诉人
+一声，人确认了就照常领，不拦。命中了也不自动废弃，人可以略过——规则 A 按字面比，模板相近但做的事不同的题
 它也会报。
 """
 
@@ -22,7 +23,7 @@ from app.models import (
     ANALYZED, ANALYZING, CLAIMED, NEEDS_ATTENTION, QC, QUEUED, READY, RUN_DONE, RUNNING,
     Task, as_utc, utc_now,
 )
-from app.services import dockerx, qa_bridge, settings_store
+from app.services import qa_bridge, settings_store
 
 log = logging.getLogger("claim_dedup")
 
@@ -56,17 +57,6 @@ def cached(task: Task) -> dict | None:
     return None
 
 
-async def probe() -> tuple[bool, str]:
-    """solo2 起没起。桥接直连远端库，不经过 solo2 的服务，但人要的是「solo2 开着才查」。"""
-    ok, why = qa_bridge.available()
-    if not ok:
-        return False, why
-    name = settings_store.get("claim.dedup_container").strip()
-    if name and (state := await dockerx.container_state(name)) != "running":
-        return False, f"solo2 没有启动（容器 {name} {state or '不存在'}）"
-    return True, ""
-
-
 def _peer_label(h: dict, local: dict[str, Task]) -> tuple[str, int | None]:
     """命中对象的说法，以及它若是本机题时的 id。"""
     seq = str((h.get("matched") or {}).get("seq") or "")
@@ -97,9 +87,6 @@ async def check(task_ids: list[int]) -> dict:
         hashes = {t.id: t.prompt_hash for t in todo}
         nos = {t.id: t.task_no for t in todo}
 
-    ok, why = await probe()
-    if not ok:
-        return {"ok": False, "error": why, "results": results}
     r = await qa_bridge.dedup(items, rules=("A",), timeout_s=300)
     if not r.get("ok"):
         return {"ok": False, "error": f"solo2 查重没跑成：{r.get('error') or '未知错误'}", "results": results}

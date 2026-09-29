@@ -359,7 +359,7 @@ export interface GateReport {
   checks: GateCheck[]
 }
 
-/** 领取前查重的结论。unavailable 是没查成（solo2 没启动之类），hit 是撞了；两种都要人看过再带 skip 重发 */
+/** 领取前查重的结论。unavailable 是没查成（远端库连不上、桥接报错），hit 是撞了；两种都要人看过再带 skip 重发 */
 export interface ClaimDedup {
   state: 'pass' | 'hit' | 'skipped' | 'unavailable'
   reason: string

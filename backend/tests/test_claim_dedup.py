@@ -34,10 +34,7 @@ def _hit(seq, sim=0.4, sid=19000):
 @pytest.fixture()
 def bridge(tmp_db, monkeypatch):
     """把 solo2 这头换成桩：hits 按题 id 给规则 A 的命中，calls 记下每次送了什么。"""
-    state = {"hits": {}, "calls": [], "up": True, "fail": ""}
-
-    async def probe():
-        return (True, "") if state["up"] else (False, "solo2 没有启动（容器 solo2-backend-1 exited）")
+    state = {"hits": {}, "calls": [], "fail": ""}
 
     async def dedup(items, *, rules, timeout_s):
         state["calls"].append([it["key"] for it in items])
@@ -48,7 +45,6 @@ def bridge(tmp_db, monkeypatch):
             for it in items]}
 
     monkeypatch.setattr(claim_dedup, "enabled", lambda: True)
-    monkeypatch.setattr(claim_dedup, "probe", probe)
     monkeypatch.setattr(claim_dedup.qa_bridge, "dedup", dedup)
     return state
 
@@ -148,25 +144,27 @@ def test_skip_after_a_hit_claims_and_remembers_the_decision(bridge, monkeypatch)
     assert bridge["calls"] == []
 
 
-def test_solo2_down_asks_first_and_then_does_not_block(bridge, monkeypatch):
-    """solo2 没起：先告诉人，不替人拒；人确认后照常领。"""
+def test_dedup_failure_asks_first_and_then_does_not_block(bridge, monkeypatch):
+    """查重没跑成：先告诉人，不替人拒；人确认后照常领。"""
     _stub_gate(monkeypatch)
     tid = _add("10")
-    bridge["up"] = False
+    bridge["fail"] = "规则 A 未完成（查重池不可用）"
     r = asyncio.run(tasks_router._claim(tid, force=False))
     assert r["queued"] is False and r["dedup"]["state"] == "unavailable"
-    assert "solo2 没有启动" in r["dedup"]["reason"]
+    assert "查重池不可用" in r["dedup"]["reason"]
     with session() as db:
         assert db.get(m.Task, tid).status == m.AVAILABLE
     assert asyncio.run(tasks_router._claim(tid, force=False, skip_dedup=True))["queued"] is True
 
 
-def test_bridge_error_is_treated_like_solo2_down(bridge, monkeypatch):
-    _stub_gate(monkeypatch)
+def test_dedup_does_not_care_whether_the_solo2_service_is_up(bridge, monkeypatch):
+    """桥接直连远端库，不经过 solo2 的服务：不该去看它的容器。"""
+    async def boom(name):
+        raise AssertionError("不该探测 solo2 容器")
+
+    monkeypatch.setattr(claim_dedup.qa_bridge.dockerx, "container_state", boom)
     tid = _add("10")
-    bridge["fail"] = "规则 A 未完成（查重池不可用）"
-    r = asyncio.run(tasks_router._claim(tid, force=False))
-    assert r["dedup"]["state"] == "unavailable" and "查重池不可用" in r["dedup"]["reason"]
+    assert asyncio.run(claim_dedup.check([tid]))["ok"] is True
 
 
 def test_force_from_the_gate_does_not_dedup_again(bridge, monkeypatch):
@@ -189,15 +187,15 @@ def test_batch_checks_once_and_leaves_hits_untouched(bridge, monkeypatch):
         assert db.get(m.Task, b).status == m.AVAILABLE
 
 
-def test_batch_with_solo2_down_touches_nothing_until_confirmed(bridge, monkeypatch):
+def test_batch_with_dedup_failing_touches_nothing_until_confirmed(bridge, monkeypatch):
     _stub_gate(monkeypatch)
     a = _add("10")
-    bridge["up"] = False
+    bridge["fail"] = "远端库连不上"
     r = asyncio.run(tasks_router.batch_claim(ClaimBatch(ids=[a])))
-    assert r["results"] == [] and "solo2 没有启动" in r["dedup_unavailable"]
+    assert r["results"] == [] and "远端库连不上" in r["dedup_unavailable"]
     with session() as db:
         assert db.get(m.Task, a).status == m.AVAILABLE
-    r = asyncio.run(tasks_router.batch_claim(ClaimBatch(ids=[a], skip_dedup=True, skip_reason="solo2 没起")))
+    r = asyncio.run(tasks_router.batch_claim(ClaimBatch(ids=[a], skip_dedup=True, skip_reason="查重没跑成")))
     assert r["results"][0]["queued"] is True
 
 
