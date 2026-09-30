@@ -203,7 +203,10 @@ async function setParallel(v: number | null) {
         <div class="text-[12px] text-fg2 mt-0.5">个容器 · 来自 {{ sch?.queued_tasks ?? 0 }} 道题</div></div>
       <div class="card p-4"><div class="text-fg1 text-xs">重跑过的侧</div>
         <div class="mono text-2xl nums mt-1" :class="retried.length ? 'text-warn' : 'text-fg0'">{{ retried.length }}</div>
-        <div class="text-[12px] text-fg2 mt-0.5">上限 {{ wd?.max_retries ?? '-' }} 次 / 超时 {{ wd?.max_timeouts ?? '-' }} 次</div></div>
+        <div class="text-[12px] text-fg2 mt-0.5">
+          <template v-if="wd?.unlimited">无限重跑，不限次数</template>
+          <template v-else>上限 {{ wd?.max_retries ?? '-' }} 次 / 超时 {{ wd?.max_timeouts ?? '-' }} 次</template>
+        </div></div>
       <div class="card p-4"><div class="text-fg1 text-xs">心跳</div>
         <div class="mono text-2xl nums mt-1" :class="stalled.length ? 'text-err' : 'text-fg0'">
           {{ beatAge(sch?.last_tick_at) ?? '-' }}<span class="text-fg2 text-base">s</span>
@@ -283,6 +286,9 @@ async function setParallel(v: number | null) {
         <span v-if="wd?.paused" class="text-[12px] text-warn ml-2">
           异常处理已暂停：下面这些只是记了一笔，没有重跑也没有废弃
         </span>
+        <span v-else-if="wd?.unlimited" class="text-[12px] text-fg2 ml-2">
+          网关重试用尽、容器消失、超时、没产出就结束，都会自动重跑；已开无限重跑，不会因次数用尽废弃
+        </span>
         <span v-else class="text-[12px] text-fg2 ml-2">
           网关重试用尽、容器消失、超时、没产出就结束，都会自动重跑；跑满 {{ wd?.max_retries ?? '-' }} 次或超时
           {{ wd?.max_timeouts ?? '-' }} 次就整题废弃，可在题库里恢复
@@ -296,7 +302,7 @@ async function setParallel(v: number | null) {
         <span class="mono text-[12px] font-semibold" :style="{ color: SIDE_HEX[x.r.side] }">{{ x.r.side }} 侧</span>
         <span class="mono text-[12px]" :class="x.r.abnormal?.gave_up ? 'text-err' : 'text-warn'">
           <template v-if="x.r.abnormal?.held">挂起 · 未重跑</template>
-          <template v-else>第 {{ x.r.attempt }} / {{ wd?.max_retries ?? '-' }} 次<span v-if="x.r.timeouts"> · 超时 {{ x.r.timeouts }}</span></template>
+          <template v-else>第 {{ x.r.attempt }}{{ wd?.unlimited ? '' : ` / ${wd?.max_retries ?? '-'}` }} 次<span v-if="x.r.timeouts"> · 超时 {{ x.r.timeouts }}</span></template>
         </span>
         <div class="min-w-0 text-[12px] truncate" :class="x.r.abnormal?.gave_up ? 'text-err' : 'text-fg1'"
           :title="x.r.abnormal?.reason">

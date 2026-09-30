@@ -523,6 +523,49 @@ def test_rerun_prep_failing_over_and_over_does_discard(task_with_runs, monkeypat
         assert db.get(m.Task, task_id).status == m.DISCARDED
 
 
+def _unlimited(monkeypatch) -> None:
+    monkeypatch.setattr(wd.settings_store, "get_bool",
+                        lambda k, d=False: True if k == "watchdog.unlimited_retries" else d)
+
+
+def test_unlimited_retries_rerun_past_both_limits(task_with_runs, stub_side_effects, monkeypatch):
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=3, timeouts=2)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    monkeypatch.setattr(wd.settings_store, "get_int",
+                        lambda k, d=0: {"watchdog.max_retries": 3, "watchdog.max_timeouts": 2}.get(k, d))
+    _unlimited(monkeypatch)
+
+    asyncio.run(wd._scan_abnormal())
+    with session() as db:
+        assert db.get(m.Task, task_id).status != m.DISCARDED
+        run = db.get(m.TaskRun, ids["A"])
+        assert run.status == m.RUN_QUEUED
+        assert run.attempt == 4
+
+
+def test_unlimited_retries_never_discard_on_failed_prep(task_with_runs, monkeypatch):
+    from app.db import session
+
+    task_id, ids = task_with_runs
+    _broken_run(ids, attempt=1)
+    monkeypatch.setattr(wd.dockerx, "container_state", _exited())
+    _unlimited(monkeypatch)
+
+    async def failing(run_id, *, reason, reset_attempt=False):
+        return {"ok": False, "message": "GitHub 连不上"}
+
+    monkeypatch.setattr(wd, "requeue_run", failing)
+    for _ in range(5):
+        asyncio.run(wd._scan_abnormal())
+
+    with session() as db:
+        assert db.get(m.Task, task_id).status != m.DISCARDED
+        assert db.get(m.TaskRun, ids["A"]).abnormal["prep_failures"] == 5
+
+
 def test_scan_leaves_runs_that_still_have_a_coroutine_watching(task_with_runs, monkeypatch):
     """有协程守着的 run 不判异常，哪怕这一刻容器已经不在 running 了。
 

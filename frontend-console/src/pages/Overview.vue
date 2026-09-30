@@ -94,6 +94,7 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
             <span class="ml-auto mono text-[12px] text-fg2">
               <template v-if="s?.watchdog.alive && s?.scheduler.alive">
                 <span v-if="s?.watchdog.paused" class="text-warn">每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 不自动重跑与废弃</span>
+                <template v-else-if="s?.watchdog.unlimited">每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 无限重跑</template>
                 <template v-else>每 {{ s?.watchdog.interval_seconds ?? '-' }}s 巡检 · 跑满 {{ s?.watchdog.max_retries ?? '-' }} 次即废弃</template>
               </template>
               <span v-else class="text-err">后台循环已停止，队列不再前进</span>

@@ -104,11 +104,17 @@ def paused() -> bool:
     return settings_store.get_bool("watchdog.paused", False)
 
 
+def unlimited() -> bool:
+    """无限重跑：异常照样重跑，但不再因任何次数用尽而自动废弃。"""
+    return settings_store.get_bool("watchdog.unlimited_retries", False)
+
+
 def status() -> dict:
     """巡检自己的近况，供界面确认它确实在按周期跑。"""
     return {
         "interval_seconds": max(30, settings_store.get_int("watchdog.interval_seconds", INTERVAL_DEFAULT)),
         "paused": paused(),
+        "unlimited": unlimited(),
         "breaker": breaker.state() if breaker.tripped() else None,
         "max_retries": settings_store.get_int("watchdog.max_retries", MAX_RETRIES_DEFAULT),
         "max_timeouts": settings_store.get_int("watchdog.max_timeouts", MAX_TIMEOUTS_DEFAULT),
@@ -804,6 +810,7 @@ async def _scan_abnormal() -> dict:
     # 于是整轮巡检当场中断——异常不处理、配对不推进，而日志里只有一条看不懂的磁盘报错。
     max_retries = settings_store.get_int("watchdog.max_retries", MAX_RETRIES_DEFAULT)
     max_timeouts = settings_store.get_int("watchdog.max_timeouts", MAX_TIMEOUTS_DEFAULT)
+    no_limit = unlimited()
     held_only = paused()
     stats = {"requeued": 0, "discarded": 0, "held": 0}
     with session() as db:
@@ -833,7 +840,7 @@ async def _scan_abnormal() -> dict:
             if run is None:
                 continue
             reason = abnormal_reason(run, alive)
-            over_budget = discard_reason(run, max_retries, max_timeouts)
+            over_budget = "" if no_limit else discard_reason(run, max_retries, max_timeouts)
             recorded = dict(run.abnormal or {})
             net_used = int(recorded.get("net_retries") or 0)
             # 断网跑挂的不算这道题的账，但只给 NET_RETRIES_MAX 次，理由见常量
@@ -898,7 +905,7 @@ async def _scan_abnormal() -> dict:
         # 就好了，所以不占重跑次数。但也不能无限试下去：连着失败到重跑上限那么多次，
         # 说明环境是真坏了，按废弃处理，别让它每五分钟空转一次。
         fails = int(recorded.get("prep_failures") or 0) + 1
-        if fails >= max(1, max_retries):
+        if not no_limit and fails >= max(1, max_retries):
             await give_up(run_id, f"{reason}；重跑准备连续 {fails} 次失败：{r['message']}")
             stats["discarded"] += 1
             continue

@@ -446,6 +446,8 @@ export interface SystemStatus {
     interval_seconds: number; max_retries: number; max_timeouts: number
     /** 开着就是只记异常不动手：不自动重跑、不自动废弃。模型停机时用 */
     paused: boolean
+    /** 无限重跑：照样自动重跑，但不因次数用尽自动废弃，两个上限失效 */
+    unlimited: boolean
     alive: boolean; last_tick_at: string | null; last_error: string
     last_stats: {
       adopted?: number; requeued?: number; discarded?: number; held?: number
