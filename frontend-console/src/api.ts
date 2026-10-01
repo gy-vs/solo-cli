@@ -562,6 +562,57 @@ export interface ContainerLive {
   last_log: string
 }
 
+/** 废弃原因的归类，口径见后端 attempt_log.discard_kind */
+export type DiscardKind = 'retries' | 'timeouts' | 'prep' | 'difficulty' | 'dedup' | 'manual' | 'other'
+
+/** 一侧跑完的一次 */
+export interface RunAttemptRow {
+  /** 这一侧的第几次，从 1 数，跨恢复连着数 */
+  seq: number
+  /** 当时的重跑计数。旧记录可能没有；人工重跑会把它清回 1，所以不拿它当序号 */
+  attempt: number | null
+  outcome: 'retry' | 'net_retry' | 'manual' | 'discard' | 'interrupted' | 'finished' | 'failed' | 'legacy'
+  outcome_label: string
+  run_status: RunStatus | ''
+  reason: string
+  started_at: string | null
+  finished_at: string | null
+  duration_s: number | null
+  /** 上一次结束到这一次开跑隔了多久：归档、重建工作区、排队等槽位 */
+  wait_s: number | null
+  /** 记录上线前的那几次，时间从轨迹归档推出来，原因没有留存 */
+  legacy: boolean
+}
+
+export interface DiscardedSide {
+  side: Side
+  status: RunStatus | ''
+  attempt: number
+  timeouts: number
+  retries: number
+  run_s: number
+  attempts: RunAttemptRow[]
+}
+
+export interface DiscardedTask {
+  id: number
+  task_no: string
+  question_type: string
+  languages: string
+  run_mode: string
+  discarded_at: string | null
+  discarded_from: string
+  reason: string
+  kind: DiscardKind
+  kind_label: string
+  discard_count: number
+  discards: { at: string | null; reason: string; kind: DiscardKind; kind_label: string; from: string; legacy?: boolean }[]
+  retries: number
+  run_s: number
+  legacy: boolean
+  sides: DiscardedSide[]
+}
+
 // ---------- 接口 ----------
 export const api = {
   health: () => get<{ ok: boolean }>('/api/health'),
@@ -593,6 +644,7 @@ export const api = {
   discard: (id: number, reason?: string) => post<{ ok: boolean; message: string }>(
     `/api/tasks/${id}/discard` + (reason ? `?reason=${encodeURIComponent(reason)}` : '')),
   restore: (id: number) => post<{ ok: boolean; status: Status; message: string }>(`/api/tasks/${id}/restore`),
+  recentDiscarded: (days = 7) => get<{ days: number; items: DiscardedTask[] }>(`/api/tasks/discarded/recent?days=${days}`),
   fix: (id: number, action: 'clone_sides' | 'reset_sides' | 'archive_traces' | 'remove_containers'
     | 'scope_check' | 'scope_override') =>
     post<{ ok: boolean; message: string }>(`/api/tasks/${id}/fix/${action}`),

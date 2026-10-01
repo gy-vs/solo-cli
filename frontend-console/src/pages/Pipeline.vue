@@ -12,19 +12,20 @@ import { NButton, NCheckbox, NPagination, useDialog, useMessage } from 'naive-ui
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, SIDES, type BatchResult, type Side, type Status, type TaskBrief } from '../api'
+import DiscardedList from '../components/DiscardedList.vue'
 import LaunchModal from '../components/LaunchModal.vue'
 import ModeBadge from '../components/ModeBadge.vue'
 import PrecheckPill from '../components/PrecheckPill.vue'
 import SideStats from '../components/SideStats.vue'
 import StatusPill from '../components/StatusPill.vue'
 import { fmtTime, RUN_END, VERDICT_LABEL } from '../status'
-import { liveTasks, refreshStatus, refreshTasks, store } from '../store'
+import { discardedTasks, liveTasks, refreshStatus, refreshTasks, store } from '../store'
 
 const router = useRouter()
 const msg = useMessage()
 const dialog = useDialog()
 
-type TabKey = 'running' | 'failed' | 'pending' | 'qc' | 'screencast' | 'ready' | 'submitted'
+type TabKey = 'running' | 'failed' | 'pending' | 'qc' | 'screencast' | 'ready' | 'submitted' | 'discarded'
 
 const TABS: {
   key: TabKey; label: string; statuses: Status[]; desc: string; empty: string
@@ -74,6 +75,12 @@ const TABS: {
     desc: '已交到 solo2 平台。这里留着备查，退回重做请先在平台上撤回',
     empty: '还没有提交过的题',
   },
+  {
+    key: 'discarded', label: '最近废弃', statuses: ['DISCARDED'],
+    desc: '重跑次数或超时次数用尽、难度不够、查重命中、人工废掉的题。每次废弃的原因、两侧每一次跑了多久'
+      + '都列在行里；要再跑就恢复到池子，跑完的一侧保留，其余侧重新排队',
+    empty: '最近没有废弃的题',
+  },
 ]
 
 const tab = ref<TabKey>('running')
@@ -91,8 +98,14 @@ function sorted(key: TabKey, list: TaskBrief[]): TaskBrief[] {
 
 const inTab = (key: TabKey) => liveTasks.value.filter(
   (t) => TABS.find((x) => x.key === key)!.statuses.includes(t.status))
+/** 最近废弃栏的时间窗。栏里的明细由 DiscardedList 自己去后端取，这里只用它数栏头那个数 */
+const discardDays = ref(7)
+const recentDiscarded = computed(() => {
+  const since = Date.now() - discardDays.value * 86400_000
+  return discardedTasks.value.filter((t) => t.discarded_at && new Date(t.discarded_at).getTime() >= since).length
+})
 const counts = computed(() => Object.fromEntries(
-  TABS.map((t) => [t.key, inTab(t.key).length])) as Record<TabKey, number>)
+  TABS.map((t) => [t.key, t.key === 'discarded' ? recentDiscarded.value : inTab(t.key).length])) as Record<TabKey, number>)
 
 /** 当前栏的全部题（跨页），批量操作的「一键全选」就是选它 */
 const all = computed(() => sorted(tab.value, inTab(tab.value)))
@@ -284,9 +297,9 @@ function discard(t: TaskBrief) {
     content: submitted
       // 平台那份不会跟着消失，这句必须说清楚：不然人以为点完就撤回了，回头发现平台上还在
       ? '本机不再跟踪这道题，两侧残留容器会一并销毁。已经交到平台的那份不受影响，'
-        + '要撤回请去 solo2 上操作。轨迹与工作目录仍留在磁盘上，之后可在题库的「已废弃」里恢复。'
+        + '要撤回请去 solo2 上操作。轨迹与工作目录仍留在磁盘上，之后可在「最近废弃」栏里恢复。'
       : '废弃后该题不再出现在这里，在跑的容器会被停掉并销毁。'
-        + '轨迹与工作目录仍留在磁盘上，之后可在题库的「已废弃」里恢复。',
+        + '轨迹与工作目录仍留在磁盘上，之后可在「最近废弃」栏里恢复。',
     positiveText: '确认废弃',
     negativeText: '取消',
     onPositiveClick: () => act(`${t.id}:discard`, async () =>
@@ -506,7 +519,9 @@ const cols = computed(() => (current.value.pick
       <NButton size="small" quaternary class="ml-auto" @click="clearPick">清空选择</NButton>
     </div>
 
-    <div class="card">
+    <DiscardedList v-if="tab === 'discarded'" v-model:days="discardDays" />
+
+    <div v-else class="card">
       <div class="px-4 h-10 grid items-center gap-3 border-b border-line text-[12px] text-fg2"
         :style="{ gridTemplateColumns: cols }">
         <NCheckbox v-if="current.pick" :checked="pageAllPicked" :disabled="!rows.length"

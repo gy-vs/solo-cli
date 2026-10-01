@@ -803,4 +803,7 @@ def _mark(task_id: int, result: dict, *, discard: bool) -> None:
             t.discarded_from = t.status if t.status != DISCARDED else AVAILABLE
             t.status = DISCARDED
             t.discarded_at = utc_now()
+            t.discard_log = [*t.discard_log, {
+                "at": t.discarded_at.isoformat(), "from": t.discarded_from,
+                "reason": f"设计查重命中：{result.get('reason') or ''}".rstrip("：")}]
     bus.publish("tasks", {"type": "task", "id": task_id})

@@ -25,7 +25,7 @@ from app.schemas import (
     ScreencastDeliver, ScreencastUpdate, task_brief, task_detail,
 )
 from app.services import (
-    claim_dedup, difficulty, dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo,
+    attempt_log, claim_dedup, difficulty, dockerx, gate, gsb_analyzer, gsb_factcheck, gsb_precheck, gsb_repo,
     gsb_rules, gsb_uploader, gsb_verifier, pool, pool_bank, prompt_bank, run_mode, runner,
     scheduler, scope, settings_store, trace, watchdog,
 )
@@ -107,6 +107,12 @@ async def list_tasks(status: str = Query(default=""), exclude_done: bool = Query
 # ---------------- 集合操作 ----------------
 # 这些路径必须注册在 /{task_id}/… 之前：FastAPI 按注册顺序匹配，
 # 先命中 /{task_id}/upload 的话 "batch" 会被当成 task_id 直接 422。
+
+@router.get("/discarded/recent")
+async def recent_discarded(days: int = Query(default=7, ge=1, le=90)) -> dict:
+    """最近 days 天内废弃的题，带每一次废弃的原因与两侧逐次运行的起止、耗时。"""
+    return await asyncio.to_thread(attempt_log.recent_discarded, days)
+
 
 @router.get("/queue/list")
 async def queue_list() -> dict:

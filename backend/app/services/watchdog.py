@@ -43,7 +43,7 @@ from app.models import (
     RUN_END_STATUSES, RUN_FAILED, RUN_FINISHED, RUN_INTERRUPTED, RUN_QUEUED, RUN_RUNNING,
     RUN_TIMEOUT, SCHEDULABLE, SETTLING, WATCHED, RunEvent, Task, TaskRun, as_utc, utc_now,
 )
-from app.services import breaker, difficulty, dockerx, gsb_repo, llm, settings_store
+from app.services import attempt_log, breaker, difficulty, dockerx, gsb_repo, llm, settings_store
 
 log = logging.getLogger("watchdog")
 
@@ -342,6 +342,9 @@ async def requeue_run(run_id: int, *, reason: str, reset_attempt: bool = False,
         task = db.get(Task, run.task_id) if run else None
         if run is None or task is None:
             return {"ok": False, "message": "运行记录已消失"}
+        # 下面要把这一行清空复用，这一次跑了多久、为什么重跑，先落到逐次记录里
+        attempt_log.record(db, run, "manual" if reset_attempt else "retry" if count else "net_retry",
+                           reason)
         # 上一次的事件全清掉。留着的话时间线上会出现两次「启动容器」，
         # 而界面按 seq 排序，读起来像模型自己重启了一遍
         db.query(RunEvent).filter(RunEvent.task_id == task_id, RunEvent.side == side).delete()
@@ -444,10 +447,13 @@ async def discard_task(task_id: int, reason: str) -> dict:
             if r.status not in RUN_END_STATUSES:
                 r.status = RUN_INTERRUPTED
                 r.finished_at = r.finished_at or utc_now()
+            attempt_log.record(db, r, *attempt_log.discard_outcome(r, r.id in alive))
         task.discarded_from = from_status
         task.status = DISCARDED
         task.discarded_at = utc_now()
         task.auto_error = f"自动废弃：{reason}"[:2000]
+        task.discard_log = [*task.discard_log, {"at": task.discarded_at.isoformat(),
+                                                "reason": reason, "from": from_status}]
     log.warning("题 %s 自动废弃：%s", task_no, reason)
     bus.publish("tasks", {"type": "task", "id": task_id})
     return {"ok": True, "discarded": True, "container_removed": removed, "message": reason}

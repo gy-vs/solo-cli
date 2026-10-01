@@ -197,6 +197,9 @@ class Task(Base, JsonMixin):
     mode_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 废弃前的状态，恢复时按它回退；不属于单跑字段，所以留在题级
     discarded_from: Mapped[str] = mapped_column(String(16), default="")
+    # 每一次废弃一条 {at, reason, from}。恢复之后还会再废，discarded_at 与 auto_error
+    # 只剩最后一次，「这道题被废过几回、每回为什么」只能从这里数。
+    discard_log_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
 
     # ---- GSB 分析 / 结论 ----
     # 容器、会话、result、verdict 这些「一次跑」的信息全在 TaskRun 上，
@@ -310,6 +313,14 @@ class Task(Base, JsonMixin):
     @screencast.setter
     def screencast(self, v: dict) -> None:
         self.screencast_json = self._dump(v)
+
+    @property
+    def discard_log(self) -> list:
+        return self._load(self.discard_log_json, [])
+
+    @discard_log.setter
+    def discard_log(self, v: list) -> None:
+        self.discard_log_json = self._dump(v)
 
     @property
     def precheck(self) -> dict:
@@ -475,6 +486,31 @@ class TaskRun(Base, JsonMixin):
     @abnormal.setter
     def abnormal(self, v: dict) -> None:
         self.abnormal_json = self._dump(v)
+
+
+class RunAttempt(Base):
+    """一侧跑完的一次。重跑会把 TaskRun 那一行整个清空复用，这一次跑了多久、
+    为什么没算数就只剩这里有记录。
+
+    在 TaskRun 被清空之前写（requeue_run），或者在整道题被废掉时写（discard_task）。
+    同一次只记一笔：按 (task_id, side, attempt, started_at) 认，恢复时的人工重跑会
+    再碰到废弃时已经记过的那一次。
+    """
+
+    __tablename__ = "run_attempt"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
+    side: Mapped[str] = mapped_column(String(1))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    # 这一次结束时 TaskRun 的状态：FINISHED / FAILED / TIMEOUT / INTERRUPTED
+    run_status: Mapped[str] = mapped_column(String(16), default="")
+    # 这一次之后发生了什么，取值见 attempt_log.OUTCOME_LABEL
+    outcome: Mapped[str] = mapped_column(String(16), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class RunEvent(Base, JsonMixin):
