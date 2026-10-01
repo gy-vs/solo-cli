@@ -111,6 +111,89 @@ TERMINAL_DUMP = re.compile(
     r"|\b\d+\s*/\s*\d+\s*(?:失败|通过|passing|failing)\b", re.I)
 
 
+# ---------------- 电报体：句号级的孤立短句串 ----------------
+# 照搬 solo-qa 的 readability.telegraphic_run_ids（平台电报体打分的确定性地板，命中即
+# 打回，不看模型分数），切句、视觉长度、衔接词表、阈值都必须和那边逐字一致，
+# 改了这边任何一处都会和平台的判定对不上。
+#
+# 判定单元是句号级句子：视觉长度不超过 18、又不含任何衔接词的算孤立短句，连续四句
+# 以上就是在逐条罗列。「详情页隐藏 Terminate，并给出警告文字。持久化恢复后会重建
+# 索引。扣分有两处。一是 X 依赖私有函数 Y。」每一句单看都通顺，措辞质检的模型
+# 一句也不会报，平台却照样打回。
+_TG_SENT_SPLIT = re.compile(r"[。；;！!？?\n]+")
+_TG_COMMA_SPLIT = re.compile(r"(?<!\d)[，,]|[，,](?!\d)")
+_TG_SUBSPLIT_MIN_PARTS = 3
+_TG_SUBSPLIT_MAX_CHARS = 18
+_TG_MIN_CLAUSE_CHARS = 2
+_TG_MAX_CLAUSES = 40
+TELEGRAPH_RUN_MIN = 4
+TELEGRAPH_MAX_VISUAL = 18
+_TG_CONNECTIVE = re.compile("|".join((
+    "然后", "随后", "接着", "之后", "之前", "先", "再", "最后", "最终",
+    "因为", "由于", "所以", "因此", "于是", "结果", "但", "不过", "然而",
+    "如果", "并且", "而且", "且", "同时", "进而", "从而", "导致", "使得",
+    "一旦", "直到", "其中", "而", "仍", "即", "才", "也", "又", "还是",
+    "这时", "此时", "这一点", "第[一二三四五六七八九十0-9]+[步轮次]",
+)))
+_TG_ASCII_TOKEN = re.compile(r"[A-Za-z0-9_./:-]+")
+
+
+def _tg_sentences(text: str) -> list[list[str]]:
+    """句号级句子，每句带它按逗号细切后的分句。分句总数封顶的口径和平台一致。"""
+    out: list[list[str]] = []
+    count = 0
+    for raw in _TG_SENT_SPLIT.split(text or ""):
+        sentence = raw.strip()
+        if len(sentence) < _TG_MIN_CLAUSE_CHARS:
+            continue
+        parts = [p.strip() for p in _TG_COMMA_SPLIT.split(sentence)]
+        parts = [p for p in parts if len(p) >= _TG_MIN_CLAUSE_CHARS]
+        if (len(parts) < _TG_SUBSPLIT_MIN_PARTS
+                or any(len(re.sub(r"\s+", "", p)) > _TG_SUBSPLIT_MAX_CHARS for p in parts)):
+            parts = [sentence]
+        parts = parts[:_TG_MAX_CLAUSES - count]
+        if not parts:
+            break
+        out.append(parts)
+        count += len(parts)
+        if count >= _TG_MAX_CLAUSES:
+            break
+    return out
+
+
+def visual_len(text: str) -> int:
+    """人眼宽度：一个汉字算 1，一段英文或数字串算 2。"""
+    compact = re.sub(r"\s+", "", text or "")
+    return len(_TG_ASCII_TOKEN.sub("", compact)) + 2 * len(_TG_ASCII_TOKEN.findall(compact))
+
+
+def telegraph_run(text: str) -> list[str]:
+    """落在孤立短句串里的那些句子（句号级）。没有串就是空表。"""
+    sentences = ["，".join(parts) for parts in _tg_sentences(text)]
+    flags = [visual_len(s) <= TELEGRAPH_MAX_VISUAL and not _TG_CONNECTIVE.search(s)
+             for s in sentences]
+    out: list[str] = []
+    start = 0
+    while start < len(flags):
+        if not flags[start]:
+            start += 1
+            continue
+        end = start
+        while end < len(flags) and flags[end]:
+            end += 1
+        if end - start >= TELEGRAPH_RUN_MIN:
+            out.extend(sentences[start:end])
+        start = end
+    return out
+
+
+def telegraph_message(who: str, run: list[str]) -> str:
+    shown = "」「".join(s[:24] for s in run[:4])
+    return (f"{who}有连续 {len(run)} 个孤立短句逐条罗列（「{shown}」），平台按电报体直接打回；"
+            f"把这几句并成主谓齐全、带「但」「所以」「而且」这类衔接的长句，"
+            f"写清它们之间的先后和因果")
+
+
 def symbol_run(text: str, limit: int = 5) -> str:
     """一口气列出 limit 个以上的符号名（测试名、函数名、文件名）就算搬运。
 
@@ -524,6 +607,8 @@ def reason_checks(text: str, *, verdict: str = "",
                     "理由里有 markdown 记号（标题、列表符号、加粗或反引号），平台的理由框不渲染"))
     if EMOJI.search(reason):
         out.append(("reason_emoji", "block", "理由里有表情符号"))
+    if run := telegraph_run(reason):
+        out.append(("reason_telegraph", "block", telegraph_message("理由里", run)))
 
     # ---- E1 硬指纹与空洞套话 ----
     hits = cliche_hits(reason)
@@ -692,6 +777,10 @@ DELIVERY_WRITING_RULES = f"""
    说 A 的事只能出自 A 的材料，说 B 的事只能出自 B 的材料。
 7. 措辞要求和理由一样：不用比喻、俚语、公文腔，不写步数、工具调用次数、耗时、行号，
    不用 markdown、表情符号和固定分栏，不要「表现一般」「基本可用」这种无法核验的话。
+8. 一两百字的描述最容易写成一句一个句号的短句清单，这会被判成电报体直接打回。
+   不要连着写「详情页隐藏 Terminate。持久化恢复后会重建索引。扣分有两处。」，
+   把做到的几项并成一句，扣分点用「扣分有两处，一是……；二是……」接在同一句里，
+   句与句之间用「但」「所以」「而且」交代关系。
 """.strip()
 
 # 满分才说得出口的话。前面带否定的（「谈不上完美」「并不完整」）不算；「基本完美」是评分表里
@@ -875,6 +964,8 @@ def delivery_checks(delivery: dict, *, side: str, reason: str = "",
         out.append(("delivery_markdown", "block", f"{who}描述里有 markdown 记号"))
     if EMOJI.search(desc):
         out.append(("delivery_emoji", "block", f"{who}描述里有表情符号"))
+    if run := telegraph_run(desc):
+        out.append(("delivery_telegraph", "block", telegraph_message(f"{who}描述里", run)))
     if hit := next((p for p in SELF_REFERENCE if p in desc), ""):
         out.append(("delivery_self_reference", "block", f"{who}描述里有 AI 自指（{hit}）"))
     if hit := next((p for p in CHAT_SCAFFOLD if p in desc), ""):
@@ -999,27 +1090,31 @@ WRITING_RULES = f"""
     平台的理由框是纯文本，这些记号会原样显示出来。
 36. 不写自己是什么：不要出现「作为 AI」「作为大语言模型」这类话，也不要
     「以下是我的分析」「希望对你有帮助」这种对话腔。
+37. 不要一句一个事实地用句号或分号罗列短句。「详情页隐藏 Terminate。持久化恢复后
+    会重建索引。扣分有两处。」这种连着四句十几个字、彼此没有衔接的写法会被判成
+    电报体直接打回。把相关的事实并进同一句，用「但」「所以」「而且」「同时」交代
+    它们之间的先后和因果，「扣分有两处」这类引子直接接在后文同一句里。
 
 八、容易写空的地方
-37. 少用「各有优劣」「难分高下」「看不出差别」「表现良好」「基本可用」「更好一些」
+38. 少用「各有优劣」「难分高下」「看不出差别」「表现良好」「基本可用」「更好一些」
     这类词。用了就必须紧跟具体的事实，否则整段会被判成没有实质内容。
-38. 过渡词不必刻意躲，但不要拿「综上所述」「总的来说」「值得注意的是」当段落骨架
+39. 过渡词不必刻意躲，但不要拿「综上所述」「总的来说」「值得注意的是」当段落骨架
     反复用，同一段里出现两个以上就会被判成套话。
 
 九、关于「正式」的分寸
-39. 不必为了像人而刻意堆口语、刻意每句都带「我」，写得专业不扣分。但也别端着写：
+40. 不必为了像人而刻意堆口语、刻意每句都带「我」，写得专业不扣分。但也别端着写：
     用日常会说的词，句子短一点，能说「运行结果不对」就不要说「运行时行为与
     预期存在偏差」。你是在给同事讲这两份产物差在哪，不是在交一份评估报告。
-40. 文件名、函数名、方法名、命令、报错原文都可以照写，这是定位问题的正常方式，
+41. 文件名、函数名、方法名、命令、报错原文都可以照写，这是定位问题的正常方式，
     只要不带行号。路径太长时可以只写文件名或者说清是哪个目录，不必背全路径。
 
 十、不作为判断依据的因素
-41. 只写模型自身能力造成的差异。推理快慢、网络波动、网关超时、请求失败、
+42. 只写模型自身能力造成的差异。推理快慢、网络波动、网关超时、请求失败、
     模型没报错但戛然而止，这几类都受部署和排队影响，不反映能力，不写进理由。
     如果某一侧确实出现了这类情况，只在 remark 里写一句说明。
-42. 提到文件只写仓库内的相对路径，例如 lib/rules_inline.mjs。不要出现任何绝对
+43. 提到文件只写仓库内的相对路径，例如 lib/rules_inline.mjs。不要出现任何绝对
     路径或本机目录名——这段理由会原样交给评审方，写进去等于把本地目录结构一起交出去。
-43. 不写你自己是怎么核验的：不写你有没有装依赖、能不能联网、在哪跑的，也不要出现
+44. 不写你自己是怎么核验的：不写你有没有装依赖、能不能联网、在哪跑的，也不要出现
     「产物副本」「沙箱」「我这边」「我的环境」。你手上只有代码改动和轨迹，
     结论就从这两样里出。
 """.strip()
