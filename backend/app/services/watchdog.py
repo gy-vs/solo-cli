@@ -87,6 +87,10 @@ _gate_wanted: list[int] = []
 _last_tick_at: datetime | None = None
 _last_error = ""
 _last_stats: dict = {}
+# 宿主机防熄屏的最近一次巡检结果，原样给界面看
+_awake: dict = {}
+# 已经喊过的那次睡眠，按代理报的发现时刻认，同一次只喊一回
+_awake_sleep_seen = ""
 
 
 def wake() -> None:
@@ -123,6 +127,7 @@ def status() -> dict:
         "last_tick_at": _last_tick_at.isoformat() if _last_tick_at else None,
         "last_error": _last_error,
         "last_stats": _last_stats,
+        "awake": _awake or None,
     }
 
 
@@ -1443,8 +1448,50 @@ async def _check_breaker() -> None:
         log.warning("网络熔断中，%s", msg)
 
 
+async def _check_awake() -> str:
+    """盯住宿主机的防熄屏。返回一个短词写进巡检日志。
+
+    代理自己每 20 秒巡检一次，这里是第二道：代理整个没了、它的巡检线程卡死、断言重建
+    失败，代理自己都喊不出来，只能靠这边每轮问一句。机器一睡，这个循环也跟着冻住，
+    所以睡没睡过要靠代理醒来后报的墙钟断档，这边负责把它喊进日志。
+    任何异常都在这里吞掉：防熄屏查不到不能连累后面的重跑和配对。
+    """
+    global _awake, _awake_sleep_seen
+    from app.services import host_agent
+
+    try:
+        res = await asyncio.wait_for(host_agent.awake(), timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        res = {"ok": False, "reachable": True, "message": f"查询防熄屏失败：{exc}"}
+    if not res.get("reachable"):
+        log.warning("防熄屏无人值守：%s", host_agent.NOT_RUNNING)
+    elif not res.get("ok"):
+        log.warning("防熄屏异常（%s），让宿主机代理就地重建", res.get("message"))
+        try:
+            fixed = await asyncio.wait_for(host_agent.ensure_awake(), timeout=100)
+        except Exception as exc:  # noqa: BLE001
+            fixed = {"ok": False, "reachable": True, "message": f"重建请求失败：{exc}"}
+        if fixed.get("ok"):
+            log.info("防熄屏已恢复（重建累计 %s 次）", fixed.get("restarts"))
+        else:
+            log.error("防熄屏重建失败：%s", fixed.get("message"))
+        res = {**res, **fixed}
+    slept = res.get("last_sleep") or {}
+    if slept.get("detected_at") and slept["detected_at"] != _awake_sleep_seen:
+        _awake_sleep_seen = slept["detected_at"]
+        log.error("宿主机刚睡过约 %ss（%s），这段时间容器和巡检都是冻住的",
+                  slept.get("gap_seconds"), slept.get("reason") or "原因未知")
+    res["checked_at"] = utc_now().isoformat()
+    _awake = res
+    if res.get("ok"):
+        return "正常"
+    return "代理未运行" if not res.get("reachable") else "异常"
+
+
 async def tick() -> dict:
     """跑一轮定时任务。三步的先后都不能换，理由见上面那段注释。"""
+    # 防熄屏排第一：它不依赖任何题的状态，又最怕被后面哪一步的异常跳过
+    awake = await _check_awake()
     await _check_breaker()
     adopted = await _scan_orphans()
     stats = await _scan_abnormal()
@@ -1471,7 +1518,8 @@ async def tick() -> dict:
     recording.kick()
     # 台账校正放最后：上面几步可能刚销毁过容器，这时对齐一次正好
     fixed = await _reconcile_containers()
-    return {"adopted": adopted, **stats, "advanced": advanced, "container_fixed": fixed}
+    return {"adopted": adopted, **stats, "advanced": advanced, "container_fixed": fixed,
+            "awake": awake}
 
 
 def alive() -> bool:
@@ -1505,11 +1553,11 @@ async def _loop() -> None:
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
             log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 转待分析 %s · 转人工 %s"
                      " · 探路废弃 %s · 恢复放回 %s · 自愈 %s · 起推进 %s · 补质检 %s（在跑 %s）"
-                     " · 耗时 %.1fs",
+                     " · 防熄屏 %s · 耗时 %.1fs",
                      stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
                      stats["run_done"], stats["settled"], stats["probed"], stats["freed"],
                      stats["healed"], stats["advanced"], stats["gated"], len(_advance_tasks),
-                     (utc_now() - began).total_seconds())
+                     stats["awake"], (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001

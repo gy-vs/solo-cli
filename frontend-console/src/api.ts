@@ -453,6 +453,13 @@ export interface SystemStatus {
       adopted?: number; requeued?: number; discarded?: number; held?: number
       run_done?: number; settled?: number; advanced?: number
     }
+    /** 宿主机防熄屏的最近一次巡检结果；巡检还没跑过一轮时为 null */
+    awake: {
+      ok: boolean; reachable: boolean; message: string
+      power_source?: string; risks?: string[]; restarts?: number
+      last_sleep?: { detected_at?: string; gap_seconds?: number; reason?: string }
+      checked_at?: string
+    } | null
   }
   dedup: { ok: boolean; message: string; image: string }
   /** 远端题库。enabled 为假就是单设备模式，题目来自本机题面文件 */

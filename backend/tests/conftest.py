@@ -47,6 +47,21 @@ def breaker_closed(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def host_agent_absent(monkeypatch):
+    """巡检每轮都会问宿主机代理防熄屏的状况。测试里一律当它不在，免得真去连本机的代理，
+    更不能让它在本机上重建断言。测防熄屏巡检的用例自己换桩。"""
+    from app.services import host_agent, watchdog
+
+    async def absent(*_a, **_kw):
+        return {"ok": False, "reachable": False, "message": host_agent.NOT_RUNNING}
+
+    monkeypatch.setattr(host_agent, "awake", absent)
+    monkeypatch.setattr(host_agent, "ensure_awake", absent)
+    monkeypatch.setattr(watchdog, "_awake", {})
+    monkeypatch.setattr(watchdog, "_awake_sleep_seen", "")
+
+
+@pytest.fixture(autouse=True)
 def tmp_coder_root(tmp_path, monkeypatch):
     """把工作区根目录指到临时目录，和 no_container_side_effects 是同一类保护。
 

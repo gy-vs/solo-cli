@@ -57,6 +57,16 @@ async def health() -> dict:
     return res
 
 
+async def awake() -> dict:
+    """防熄屏的现状。巡检每轮都要问，所以不走 /health（那边要现列一遍屏幕，慢）。"""
+    return await _call("GET", "/awake", timeout=10)
+
+
+async def ensure_awake() -> dict:
+    """让代理立刻重建防熄屏并巡检一轮。代理那边一轮最多要扫一次电源日志，给足时间。"""
+    return await _call("POST", "/awake/ensure", timeout=90)
+
+
 async def start_project(task_no: str, side: str, commands: list[str]) -> dict:
     paths = config.TaskPaths(task_no, side)
     return await _call("POST", "/project/start", json={

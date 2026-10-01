@@ -34,6 +34,26 @@ async function doSync() {
 }
 const pipeline: Status[] = ['AVAILABLE', 'QUEUED', 'RUNNING', 'RUN_DONE', 'ANALYZED', 'QC', 'READY', 'UPLOADED', 'DONE']
 const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => !t.screencast?.[x])
+
+// 防熄屏：断言在、但有挡不住的睡法（电池、合盖）时给黄灯，不能当成万事大吉
+const awake = computed(() => s.value?.watchdog.awake)
+const awakeRisky = computed(() => !!awake.value?.ok && !!awake.value?.risks?.length)
+const awakeDot = computed(() => !awake.value ? 'bg-fg2' : !awake.value.ok ? 'bg-err' : awakeRisky.value ? 'bg-warn' : 'bg-ok')
+const awakeTone = computed(() => !awake.value?.ok ? 'text-err' : awakeRisky.value ? 'text-warn' : 'text-fg2')
+const awakeText = computed(() => {
+  const a = awake.value
+  if (!a) return '等第一轮巡检'
+  if (!a.reachable) return '宿主机代理未运行'
+  if (!a.ok) return a.message
+  const slept = a.last_sleep?.gap_seconds ? ` · 上次睡了 ${Math.round(a.last_sleep.gap_seconds / 60)} 分钟` : ''
+  return `生效中 · ${a.power_source || '-'}${awakeRisky.value ? ' · 有风险' : ''}${slept}`
+})
+const awakeTitle = computed(() => {
+  const a = awake.value
+  if (!a) return ''
+  return [a.message, ...(a.risks || []), a.last_sleep?.reason ? `最近一次睡眠：${a.last_sleep.reason}` : '']
+    .filter(Boolean).join('\n')
+})
 </script>
 
 <template>
@@ -99,6 +119,11 @@ const missingSides = (t: typeof liveTasks.value[number]) => SIDES.filter((x) => 
               </template>
               <span v-else class="text-err">后台循环已停止，队列不再前进</span>
             </span>
+          </div>
+          <div class="flex items-center gap-2 text-xs">
+            <span class="dot" :class="awakeDot" />
+            <span class="text-fg1">防熄屏</span>
+            <span class="ml-auto mono text-[12px] truncate max-w-[220px]" :class="awakeTone" :title="awakeTitle">{{ awakeText }}</span>
           </div>
           <div class="flex items-center gap-2 text-xs">
             <span class="dot" :class="s?.dedup.ok ? 'bg-ok' : 'bg-err'" />

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""宿主机执行代理：替容器里的后端在这台 Mac 上干两件事——把项目跑起来、把屏幕录下来。
+"""宿主机执行代理：替容器里的后端在这台 Mac 上干三件事——把项目跑起来、把屏幕录下来、
+不让这台机器熄屏睡眠。
 
 为什么非要有这么个东西：后端跑在 Linux 容器里，工作目录虽然挂进去了，但在那儿执行
 命令用的是容器的 Node/Python/系统依赖，屏幕上也不会有终端窗口；屏幕录制更是 macOS
 按「发起进程所属 App」授权的系统权限，容器根本拿不到。所以录屏交付这一段必须由一个
-你亲手启动过、授过权的宿主机进程来接活。
+你亲手启动过、授过权的宿主机进程来接活。防熄屏同理：电源断言只能由宿主机进程持有，
+机器一睡，Docker 连同里面的调度和巡检全部冻住，题一道都不会往前走。
 
 只用标准库，不装任何依赖。启动：
 
@@ -31,7 +33,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_PORT = 8790
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOKEN_FILE = REPO_ROOT / "data" / "host-agent" / "token"
@@ -241,6 +243,188 @@ def stop_record(task_no: str = "", side: str = "", rec_id: str = "") -> dict:
     return res
 
 
+# ---------------- 防熄屏 ----------------
+
+AWAKE_CHECK_SECONDS = 20
+# 墙钟走得比巡检周期多出这么多，就当这段时间机器睡过去了（睡眠期间线程不会被调度）
+SLEEP_GAP_SECONDS = 60
+# 少了任何一条都会出事：前者管显示器，后者管空闲睡眠。PreventSystemSleep 只在插电时生效，
+# 不算必需，缺了作为风险报出来
+REQUIRED_ASSERTIONS = ("PreventUserIdleDisplaySleep", "PreventUserIdleSystemSleep")
+
+
+def _pmset(*args: str, timeout: float = 15) -> str:
+    try:
+        r = subprocess.run(["pmset", *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout
+
+
+def held_assertions(pid: int) -> set[str]:
+    """这个 pid 实际被系统登记了哪些电源断言。进程活着不等于断言还在，以系统账本为准。"""
+    out = _pmset("-g", "assertions")
+    return set(re.findall(rf"pid {pid}\(caffeinate\): \[\w+\] [\d:]+ (\w+) named", out))
+
+
+def power_risks() -> tuple[str, list[str]]:
+    """断言挡不住的那几种睡法，提前说出来。返回（电源，风险列表）。"""
+    batt = _pmset("-g", "batt")
+    source = "AC" if "AC Power" in batt else ("电池" if "Battery Power" in batt else "未知")
+    risks = []
+    if source == "电池":
+        risks.append("正在用电池：PreventSystemSleep 不生效，合盖一定会睡，插上电源")
+    settings = _pmset("-g")
+    m = re.search(r"^\s*sleep\s+(\d+)", settings, re.M)
+    if m and 0 < int(m.group(1)) <= 10:
+        risks.append(f"系统空闲 {m.group(1)} 分钟即睡眠，断言一旦掉线马上就睡；"
+                     "可执行 sudo pmset -c sleep 0 兜底")
+    return source, risks
+
+
+def last_sleep_reason() -> str:
+    """最近一次进入睡眠的原因。pmset -g log 要扫好几秒，只在确认睡过之后才查。"""
+    try:
+        r = subprocess.run(["pmset", "-g", "log"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    hits = re.findall(r"^(\S+ \S+) \S+ Sleep\s+Entering Sleep state due to '([^']+)'", r.stdout, re.M)
+    return f"{hits[-1][0]} {hits[-1][1]}" if hits else ""
+
+
+class KeepAwake:
+    """持有防熄屏断言，并自己每 20 秒巡检一次。
+
+    只起一次 caffeinate 是不够的：它会被误杀、断言会被系统回收、巡检线程自己也可能挂，
+    哪一样出了事都不会有任何提示，屏幕照样黑。所以每轮都对着系统账本核一遍，缺了就重建，
+    并且每轮补一次「用户在操作」的信号——这条能把已经关掉的显示器重新点亮，也能顶住
+    屏保和锁屏的空闲计时，两件事 -d 都管不到。
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.proc: subprocess.Popen | None = None
+        self.thread: threading.Thread | None = None
+        self.restarts = 0
+        self.checks = 0
+        self.held: set[str] = set()
+        self.problem = ""
+        self.power_source = "未知"
+        self.risks: list[str] = []
+        self.last_check_wall = 0.0
+        self.last_sleep: dict = {}
+
+    def start(self) -> None:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._loop, name="keep-awake", daemon=True)
+            self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+
+    def _spawn(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        # -w 绑在代理自己身上：代理怎么死的都好，断言跟着释放，不会留下一个没人管的 caffeinate
+        self.proc = subprocess.Popen(
+            ["caffeinate", "-d", "-i", "-m", "-s", "-w", str(os.getpid())],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def check(self) -> None:
+        with self.lock:
+            now = time.time()
+            if self.last_check_wall and now - self.last_check_wall > AWAKE_CHECK_SECONDS + SLEEP_GAP_SECONDS:
+                gap = round(now - self.last_check_wall)
+                reason = last_sleep_reason()
+                self.last_sleep = {"detected_at": datetime.now().isoformat(timespec="seconds"),
+                                   "gap_seconds": gap, "reason": reason}
+                log(f"⚠ 防熄屏：机器刚睡过约 {gap} 秒（{reason or '原因未知'}）")
+            self.last_check_wall = now
+            problems = []
+            if self.proc is None or self.proc.poll() is not None:
+                if self.proc is not None:
+                    problems.append(f"caffeinate 已退出（{self.proc.returncode}），已重拉")
+                    self.restarts += 1
+                self._spawn()
+                time.sleep(0.5)
+            held = held_assertions(self.proc.pid)
+            missing = [a for a in REQUIRED_ASSERTIONS if a not in held]
+            if missing:
+                problems.append(f"系统账本里缺 {'、'.join(missing)}，已重建")
+                self.restarts += 1
+                self._spawn()
+                time.sleep(0.5)
+                held = held_assertions(self.proc.pid)
+            self.held = held
+            still = [a for a in REQUIRED_ASSERTIONS if a not in held]
+            self.problem = f"重建后仍缺 {'、'.join(still)}" if still else ""
+            for p in problems:
+                log(f"⚠ 防熄屏：{p}")
+            # 不等它结束：两秒的断言自己会到期退出
+            subprocess.Popen(["caffeinate", "-u", "-t", "2"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.power_source, self.risks = power_risks()
+            self.checks += 1
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.check()
+            except Exception as e:  # noqa: BLE001
+                # 巡检线程一死防熄屏就悄悄没了，任何异常都只记下、下一轮接着来
+                self.problem = f"巡检出错：{e}"
+                log(f"⚠ 防熄屏巡检出错：{e}")
+            self.stop_event.wait(AWAKE_CHECK_SECONDS)
+
+    def status(self) -> dict:
+        thread_alive = bool(self.thread and self.thread.is_alive())
+        proc_alive = bool(self.proc and self.proc.poll() is None)
+        since = round(time.time() - self.last_check_wall, 1) if self.last_check_wall else None
+        fresh = since is not None and since < AWAKE_CHECK_SECONDS * 3
+        held_all = all(a in self.held for a in REQUIRED_ASSERTIONS)
+        ok = thread_alive and proc_alive and fresh and held_all and not self.problem
+        if ok:
+            message = "防熄屏生效中"
+        elif not thread_alive:
+            message = "防熄屏巡检线程已停止"
+        elif not proc_alive:
+            message = "caffeinate 不在了，等下一轮重拉"
+        elif not fresh:
+            message = f"防熄屏巡检 {since}s 没动静"
+        else:
+            message = self.problem or "系统账本里缺断言"
+        return {
+            "ok": ok, "message": message, "pid": self.proc.pid if proc_alive else None,
+            "held": sorted(self.held), "restarts": self.restarts, "checks": self.checks,
+            "thread_alive": thread_alive, "seconds_since_check": since,
+            "interval_seconds": AWAKE_CHECK_SECONDS,
+            "power_source": self.power_source, "risks": self.risks, "last_sleep": self.last_sleep,
+        }
+
+    def ensure(self) -> dict:
+        """外部（后端看门狗）发现不对时调：线程没了就拉起来，并立刻巡检一轮。"""
+        self.start()
+        try:
+            self.check()
+        except Exception as e:  # noqa: BLE001
+            self.problem = f"巡检出错：{e}"
+        return self.status()
+
+
+AWAKE = KeepAwake()
+
+
 # ---------------- 启动项目 ----------------
 
 def osascript(script: str, timeout: float = 30) -> subprocess.CompletedProcess:
@@ -374,8 +558,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "ok": True, "version": VERSION, "coder_root": self.server.coder_root,
                 "ffmpeg": bool(ff), "screens": list_screens(ff) if ff else [],
-                "height": RECORD_HEIGHT, "recordings": recs,
+                "height": RECORD_HEIGHT, "recordings": recs, "awake": AWAKE.status(),
             })
+        if self.path.startswith("/awake"):
+            # 只读状态、不含敏感信息，和 /health 一样免口令；巡检要的是又快又稳
+            return self._send(200, AWAKE.status())
         if not self._authed():
             return self._send(401, {"ok": False, "message": "口令不对"})
         if self.path.startswith("/project/status"):
@@ -396,6 +583,8 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return self._send(400, {"ok": False, "message": "请求体不是合法 JSON"})
         try:
+            if self.path.startswith("/awake/ensure"):
+                return self._send(200, AWAKE.ensure())
             if self.path.startswith("/project/start"):
                 cwd = self._safe_dir(body.get("cwd", ""))
                 if not cwd:
@@ -419,13 +608,19 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "message": "没有这个接口"})
 
 
-def main() -> None:
+def main() -> int:
     port = int(os.environ.get("HOST_AGENT_PORT", DEFAULT_PORT))
     token = ensure_token()
     root = coder_root()
-    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as e:
+        # 多半是已经有一个代理在跑。退出码 2 告诉启动脚本别反复拉起
+        print(f"端口 {port} 起不来（{e}），多半已有一个代理在跑，本窗口退出", flush=True)
+        return 2
     srv.token = token
     srv.coder_root = root
+    AWAKE.start()
 
     ff = ffmpeg_bin()
     screens = list_screens(ff) if ff else []
@@ -436,6 +631,10 @@ def main() -> None:
     print(f"  口令    : {TOKEN_FILE}")
     print(f"  ffmpeg  : {ff or '未安装，录屏不可用（brew install ffmpeg）'}")
     print(f"  可录屏幕: {', '.join(s['label'] for s in screens) or '无'}")
+    print(f"  防熄屏  : 已开启，每 {AWAKE_CHECK_SECONDS}s 巡检一次（代理退出即释放）")
+    _, risks = power_risks()
+    for r in risks:
+        print(f"  ⚠ {r}")
     print("=" * 64)
     print("  这个窗口留着别关。首次录屏若失败，去「系统设置 → 隐私与安全性 → 屏幕录制」")
     print("  勾上「终端」，然后回到这里 Ctrl+C 再重跑一次。")
@@ -446,7 +645,9 @@ def main() -> None:
         log("收到退出信号，正在停掉未结束的录制")
         for rec in list(RECORDINGS.values()):
             rec.stop()
+        AWAKE.stop()
         srv.shutdown()
+    return 0
 
 
 if __name__ == "__main__":
