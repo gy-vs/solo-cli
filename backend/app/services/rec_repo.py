@@ -135,6 +135,45 @@ def _tail(r) -> str:  # noqa: ANN001
     return (r.err or r.out).strip()[:200]
 
 
+async def _clear_rebase(d: Path) -> None:
+    """进程在 rebase 半途被杀（重启、超时）会留下 rebase-merge 目录，之后每次 pull --rebase
+    都直接报错。--quit 只清状态、不动 HEAD：残留之后本地照常提交过，回退到 orig-head 会丢事件。"""
+    if (d / ".git" / "rebase-merge").exists() or (d / ".git" / "rebase-apply").exists():
+        log.warning("录屏仓库有中断残留的 rebase，清掉再拉")
+        await _git(["rebase", "--quit"], cwd=d)
+        for name in ("rebase-merge", "rebase-apply"):
+            shutil.rmtree(d / ".git" / name, ignore_errors=True)
+
+
+async def _pull(d: Path):  # noqa: ANN202
+    """把远端 main 并进本地。rebase 走不通就取远端为底，把本地独有的事件行补在后面再提交：
+    events.jsonl 只追加、状态按时间重放，行序无所谓，这样合并不会丢任何一端的事件。"""
+    await _clear_rebase(d)
+    r = await _git([*_GIT_ID, "pull", "--rebase", "-q", _url(), MAIN_BRANCH], cwd=d)
+    if r.ok or "find remote ref" in _tail(r):
+        return r
+    await _git(["rebase", "--abort"], cwd=d)
+    await _clear_rebase(d)
+    rf = await _git(["fetch", "-q", _url(), MAIN_BRANCH], cwd=d)
+    if not rf.ok:
+        return r
+    path = events_path()
+    mine = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    rr = await _git(["reset", "-q", "--hard", "FETCH_HEAD"], cwd=d)
+    if not rr.ok:
+        return rr
+    theirs = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    seen = set(theirs)
+    extra = [ln for ln in mine if ln.strip() and ln not in seen]
+    if extra:
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write("".join(ln + "\n" for ln in extra))
+        await _git(["add", "-A"], cwd=d)
+        await _git([*_GIT_ID, "commit", "-q", "-m", f"{device()}: merge {len(extra)} local events"], cwd=d)
+    log.warning("录屏仓库 rebase 失败（%s），已改为以远端为底合并，补回本地事件 %d 条", _tail(r), len(extra))
+    return rr
+
+
 async def _ensure_remote_repo(slug: str) -> tuple[bool, str]:
     r = await pool._sh(["gh", "repo", "view", slug, "--json", "visibility", "-q", ".visibility"], timeout=60)
     if r.ok:
@@ -219,7 +258,7 @@ async def _sync_locked() -> dict:
             if not created:
                 return {"ok": False, "message": why}
     else:
-        r = await _git([*_GIT_ID, "pull", "--rebase", "-q", _url(), MAIN_BRANCH], cwd=d)
+        r = await _pull(d)
         if not r.ok:
             tail = _tail(r)
             if "find remote ref" not in tail:
@@ -384,7 +423,7 @@ async def _append_locked(events: list[dict], *, subject: str, attempts: int) -> 
         if rr.ok:
             return {"ok": True, "message": "已同步到录屏仓库"}
         if attempt < attempts:
-            await _git([*_GIT_ID, "pull", "--rebase", "-q", _url(), MAIN_BRANCH], cwd=d)
+            await _pull(d)
     return {"ok": False, "message": f"推送录屏仓库失败：{_tail(rr)}"}
 
 

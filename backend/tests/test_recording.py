@@ -272,6 +272,61 @@ def test_append_rebases_over_a_concurrent_push_from_another_device(local_remote,
     assert e.state == rec_repo.S_CLAIMED and e.claimed_by == "rec2"
 
 
+def _push_from_other(remote, tmp_path, ev):
+    other = tmp_path / "other"
+    if not other.exists():
+        _git("clone", "-q", str(remote), str(other))
+    _git("pull", "-q", cwd=other)
+    with (other / "events.jsonl").open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(ev) + "\n")
+    _git("-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qam", "other", cwd=other)
+    _git("push", "-q", "origin", "HEAD:main", cwd=other)
+
+
+def test_leftover_rebase_state_does_not_freeze_the_repo(local_remote, tmp_path):
+    """上次 rebase 半途被杀留下 rebase-merge 目录：只要本地一领先，pull --rebase 就一直报错，
+    别人的回传再也拉不进来。要能自己清掉，而且本地还没推上去的事件不能丢。"""
+    asyncio.run(rec_repo.append([_ev("published", "1", by="dev1", digest="d1")], subject="p"))
+    d = rec_repo.repo_dir()
+    (d / ".git" / "rebase-merge").mkdir()
+    (d / ".git" / "rebase-merge" / "head-name").write_text("refs/heads/main\n")
+    # 本地多一条没推上去的事件，同时另一台推了回传：两边分叉，必须真 rebase
+    with rec_repo.events_path().open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(_ev("published", "1", by="dev1", no="102", digest="d2")) + "\n")
+    _git(*rec_repo._GIT_ID, "commit", "-qam", "local", cwd=d)
+    _push_from_other(local_remote, tmp_path, _ev("recorded", "2", by="rec2", digest="d1"))
+
+    res = asyncio.run(rec_repo.sync())
+    assert res["ok"] and not res.get("stale"), res
+    assert not (d / ".git" / "rebase-merge").exists()
+    ents = rec_repo.entries()
+    assert ents["dev1/101"].state == rec_repo.S_RECORDED
+    assert ents["dev1/102"].state == rec_repo.S_OPEN
+
+
+def test_pull_falls_back_to_union_merge_when_rebase_conflicts(local_remote, tmp_path, monkeypatch):
+    """rebase 冲突（比如 .gitattributes 没生效）也不能卡住：以远端为底，把本地独有的行补回去。"""
+    asyncio.run(rec_repo.append([_ev("published", "1", by="dev1", digest="d1")], subject="p"))
+    d = rec_repo.repo_dir()
+    (d / ".gitattributes").write_text("")
+    _git(*rec_repo._GIT_ID, "commit", "-qam", "drop union", cwd=d)
+    _git("push", "-q", str(local_remote), "HEAD:main", cwd=d)
+    monkeypatch.setattr(rec_repo, "_write_scaffold", lambda: None)
+    with rec_repo.events_path().open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(_ev("published", "1", by="dev1", no="102", digest="d2")) + "\n")
+    _git(*rec_repo._GIT_ID, "commit", "-qam", "local", cwd=d)
+    _push_from_other(local_remote, tmp_path, _ev("recorded", "2", by="rec2", digest="d1"))
+
+    res = asyncio.run(rec_repo.append([_ev("published", "1", by="dev1", no="103", digest="d3")], subject="p3"))
+    assert res["ok"], res
+    _git("pull", "-q", cwd=tmp_path / "other")
+    remote_events = (tmp_path / "other" / "events.jsonl").read_text(encoding="utf-8")
+    assert all(f'"task_no": "{n}"' in remote_events for n in ("101", "102", "103"))
+    ents = rec_repo.entries()
+    assert ents["dev1/101"].state == rec_repo.S_RECORDED
+    assert {"dev1/102", "dev1/103"} <= set(ents)
+
+
 def test_append_that_pulls_in_another_devices_event_notifies_listeners(local_remote, tmp_path, monkeypatch):
     """别人的回传是顺着自己写事件时的 rebase 进来的，这时就要通知，不能只在巡检同步时通知。"""
     seen = []

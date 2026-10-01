@@ -516,6 +516,9 @@ async def scan() -> dict:
         _last_scan.clear()
         _last_scan.update(stats)
         return stats
+    if res.get("stale"):
+        # 本地副本还能用，照常往下走；但别人的回传一条都拉不进来，得让页面看得见
+        stats["error"] = res["message"]
     me = rec_repo.device()
     mine = {e.task_no: e for e in rec_repo.entries().values() if e.owner == me}
 
