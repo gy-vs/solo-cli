@@ -3,7 +3,7 @@
 任一 block 级检查不通过就拒绝启动。双跑的检查项按 side 成对出现（workspace_A 与
 workspace_B 这样），因为 A 和 B 是两次完全独立的运行，一侧就绪不代表另一侧也就绪。
 
-题面口径（难度、任务类型）在这里就挡住，是因为跑完了才发现不符合平台收题范围，
+题面口径（难度、任务类型、环境可复现等级）在这里就挡住，是因为跑完了才发现不符合平台收题范围，
 两个容器的算力就白花了。题面的改动面够不够宽（scope 检查）挡在这里是同一个道理：
 只动一个模块的题两边都能很快做完，比不出高下，那两个多小时同样是白花。
 """
@@ -27,8 +27,9 @@ _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "b
 # 而题块里习惯写成有空格的，所以比对前要先归一化
 QUESTION_TYPES = ("0-1代码生成", "feature迭代", "Bug修复", "代码理解",
                   "代码重构", "工程化", "代码测试")
-# 本期只收这两档，简单与中等一律打回（平台规则 G1）
-DIFFICULTIES = ("困难", "地狱")
+# 平台只禁简单（规则 G1）。中等只开放给 feature迭代 与 Bug修复，0-1 代码生成仍只收困难与地狱
+DIFFICULTIES = ("中等", "困难", "地狱")
+MEDIUM_QUESTION_TYPES = ("feature迭代", "Bug修复")
 REPRO_LEVELS = ("无外部依赖", "有外部依赖，未容器化", "已容器化，可一键起环境")
 
 _WS = re.compile(r"\s+")
@@ -63,6 +64,42 @@ def normalize_choice(value: str, options: tuple[str, ...]) -> str:
         if _WS.sub("", o).casefold() == want:
             return o
     return ""
+
+
+def difficulty_problem(difficulty: str, question_type: str) -> str:
+    """难度与任务类型的组合是否在收题范围内。返回空串表示通过。"""
+    level = normalize_choice(difficulty, DIFFICULTIES)
+    if not level:
+        return f"难度「{difficulty or '空'}」不收，只收中等、困难与地狱（规则 G1）"
+    if level == "中等" and normalize_choice(question_type, QUESTION_TYPES) not in MEDIUM_QUESTION_TYPES:
+        return f"「{question_type or '空'}」不收中等，中等只开放给 Feature 迭代与 Bug 修复"
+    return ""
+
+
+def repro_problem(repro_level: str) -> str:
+    """环境可复现等级是否是平台三档之一。返回空串表示通过。
+
+    这是单选字段，题块里只能原样写三档的字面值，判定依据不能塞进来。写成
+    「Python only; no PostgreSQL server required」这种描述，门禁看着像填了，
+    上传时却归一化成空值，平台按缺字段打回，两个容器已经白跑完了。
+    """
+    if normalize_choice(repro_level, REPRO_LEVELS):
+        return ""
+    options = "、".join(f"「{o}」" for o in REPRO_LEVELS)
+    return f"环境可复现等级「{repro_level or '空'}」不在平台选项里，只能原样填 {options} 之一"
+
+
+def field_problems(fields: dict) -> list[str]:
+    """题块里三个单选提交参数对不上平台口径的地方。空列表表示都合规。"""
+    qt = str(fields.get("question_type") or "")
+    out: list[str] = []
+    if not normalize_choice(qt, QUESTION_TYPES):
+        out.append(f"任务类型「{qt or '空'}」不在平台选项里（{'、'.join(QUESTION_TYPES)}）")
+    if problem := difficulty_problem(str(fields.get("difficulty") or ""), qt):
+        out.append(problem)
+    if problem := repro_problem(str(fields.get("repro_level") or "")):
+        out.append(problem)
+    return out
 
 
 def _scan_blacklist(root: str, patterns: list[str], limit: int = 20) -> list[str]:
@@ -152,11 +189,10 @@ async def run_checks(task: Task) -> list[Check]:
                             hard=True))
 
     # 2. 题面必须符合平台口径，不然两个容器跑完也交不上去
-    if normalize_choice(task.difficulty, DIFFICULTIES):
-        checks.append(Check("difficulty", "ok", f"难度 {task.difficulty}"))
+    if problem := difficulty_problem(task.difficulty, task.question_type):
+        checks.append(Check("difficulty", "block", problem))
     else:
-        checks.append(Check("difficulty", "block",
-                            f"难度「{task.difficulty or '空'}」不收，本期只收困难与地狱（规则 G1）"))
+        checks.append(Check("difficulty", "ok", f"难度 {task.difficulty}"))
     qt = normalize_choice(task.question_type, QUESTION_TYPES)
     if qt:
         checks.append(Check("question_type", "ok", f"任务类型 {qt}"))
@@ -164,11 +200,10 @@ async def run_checks(task: Task) -> list[Check]:
         checks.append(Check("question_type", "block",
                             f"任务类型「{task.question_type or '空'}」不在平台选项里，"
                             f"可选：{'、'.join(QUESTION_TYPES)}"))
-    if normalize_choice(task.repro_level, REPRO_LEVELS):
-        checks.append(Check("repro_level", "ok", f"可复现等级 {task.repro_level}"))
+    if problem := repro_problem(task.repro_level):
+        checks.append(Check("repro_level", "block", problem))
     else:
-        checks.append(Check("repro_level", "warn",
-                            f"可复现等级「{task.repro_level or '空'}」不在平台选项里，上传前需要改题块"))
+        checks.append(Check("repro_level", "ok", f"可复现等级 {task.repro_level}"))
     checks.append(_scope_check(task))
     checks.append(_dedup_check(task))
 

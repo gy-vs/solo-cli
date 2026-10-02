@@ -241,3 +241,57 @@ def test_available_reports_each_missing_piece(pooled):
         ok, why = pool.available()
         assert not ok and hint in why
         settings_store.set_many({key: "1" if key == "pool.enabled" else "x"})
+
+
+# ---------------- 入池校验 ----------------
+
+def _draft(no: str, repro: str) -> str:
+    return (f"题号：{no}\n\n提交参数\n\n任务类型：Feature 迭代\n任务难度：困难\n"
+            f"环境可复现等级：{repro}\n\n以下为发送给模型的 prompt 正文，A 侧与 B 侧发送同一份，"
+            f"整段复制。\n\n做第 {no} 道题\n")
+
+
+@pytest.fixture()
+def bootstrapping(pooled, monkeypatch):
+    async def synced():
+        return {"ok": True, "message": "ok"}
+
+    async def pushed(n):
+        return {"ok": True, "message": f"已推 {n} 道"}
+
+    monkeypatch.setattr(pool, "sync", synced)
+    monkeypatch.setattr(pool, "push", pushed)
+
+    def use(entries):
+        monkeypatch.setattr(pool, "bootstrap_entries", lambda: entries)
+    return use
+
+
+def test_bootstrap_rejects_free_text_choice_fields(bootstrapping):
+    """单选字段写成描述的题不进池，否则它会一路跑到上传才被平台按缺字段打回。"""
+    import asyncio
+
+    good = _entry(task_no="01", user_prompt="做第 01 道题", draft=_draft("01", "无外部依赖"))
+    bad = _entry(task_no="02", user_prompt="做第 02 道题",
+                 draft=_draft("02", "Python only; no PostgreSQL server required"))
+    bootstrapping([good, bad])
+
+    res = asyncio.run(pool.bootstrap())
+
+    assert res["added"] == 1
+    assert list(res["rejected"]) == ["02"]
+    assert "可复现等级" in res["rejected"]["02"][0] and "02" in res["message"]
+    assert [e.task_no for e in pool.load()] == ["01"]
+
+
+def test_bootstrap_leaves_entries_already_in_the_pool_alone(bootstrapping):
+    """已经入池的老题不再拿来报不合规：它在不在池里不由这次调用决定，报了也改不了。"""
+    import asyncio
+
+    old = _entry(task_no="03", user_prompt="做第 03 道题", draft=_draft("03", "随便写的"))
+    pool.append([old])
+    bootstrapping([old])
+
+    res = asyncio.run(pool.bootstrap())
+
+    assert res["rejected"] == {} and res["added"] == 0

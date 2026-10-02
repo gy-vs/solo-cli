@@ -17,10 +17,10 @@ def _candidate(**over) -> dict:
         "source": "A",
         "upstream": "https://github.com/csstree/csstree",
         "repo_name": "css-syntax-core",
-        "question_type": "功能开发",
+        "question_type": "Feature 迭代",
         "difficulty": "困难",
         "languages": "JavaScript, Node.js",
-        "repro_level": "完全可复现",
+        "repro_level": "无外部依赖",
         "summary": "补齐选择器解析",
         "origin_reason": "该版本已有解析框架但尚未支持嵌套",
         "prompt_body": "需求正文。" * 40,
@@ -46,9 +46,28 @@ def test_malformed_repo_name_is_rejected(name):
     assert "不合法" in designer.validate_candidate(_candidate(repo_name=name))
 
 
-@pytest.mark.parametrize("level", ["简单", "中等", "", "hard"])
-def test_only_hard_and_hell_difficulty_are_accepted(level):
+@pytest.mark.parametrize("level", ["简单", "", "hard"])
+def test_difficulty_outside_platform_options_is_rejected(level):
     assert "难度" in designer.validate_candidate(_candidate(difficulty=level))
+
+
+@pytest.mark.parametrize("qtype", ["Feature 迭代", "Bug 修复"])
+def test_medium_is_accepted_for_feature_and_bugfix(qtype):
+    assert designer.validate_candidate(_candidate(difficulty="中等", question_type=qtype)) == ""
+
+
+@pytest.mark.parametrize("level", ["完全可复现", "Python only; no PostgreSQL server required", ""])
+def test_repro_level_outside_platform_options_is_rejected(level):
+    assert "可复现等级" in designer.validate_candidate(_candidate(repro_level=level))
+
+
+def test_question_type_outside_platform_options_is_rejected():
+    assert "任务类型" in designer.validate_candidate(_candidate(question_type="功能开发"))
+
+
+def test_medium_is_rejected_for_zero_to_one():
+    got = designer.validate_candidate(_candidate(difficulty="中等", question_type="0-1 代码生成"))
+    assert "中等" in got
 
 
 def test_short_prompt_body_is_rejected():
@@ -183,7 +202,7 @@ def test_rendered_draft_is_parsable_by_prompt_bank():
     t = parsed[0]
     assert t.task_no == "07"
     assert t.fields["difficulty"] == "困难"
-    assert t.fields["question_type"] == "功能开发"
+    assert t.fields["question_type"] == "Feature 迭代"
     assert t.fields["harness_version"] == "1.2.3"
     assert t.meta["仓库"].startswith("https://github.com/me/css-syntax-core")
     assert SHA in t.fields["env_snapshot"]

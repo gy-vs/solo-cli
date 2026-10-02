@@ -39,7 +39,7 @@ from app.models import (
     DISCARDED, ORIGIN_DESIGNED, DesignRun, Task, utc_now,
 )
 from app.services import (
-    dockerx, gsb_repo, llm, pool, pool_bank, prompt_bank, qa_bridge, settings_store,
+    dockerx, gate, gsb_repo, llm, pool, pool_bank, prompt_bank, qa_bridge, settings_store,
 )
 
 log = logging.getLogger("designer")
@@ -258,7 +258,8 @@ def _skill_prompt(count: int, note: str, env_facts: str) -> str:
 - question_type：按 skill 的任务类型取值单选
 - difficulty：按 skill 的难度档位与配比单选
 - languages：本题实际涉及的主要语言与框架，逗号分隔
-- repro_level：按 skill 的环境可复现等级三档单选
+- repro_level：只能原样取「无外部依赖」「有外部依赖，未容器化」「已容器化，可一键起环境」
+  三者之一，一字不差；判定依据不要写进这个字段
 - summary：一句话功能点摘要，用于题库索引
 - origin_reason：选这个项目与这个切入点的理由，一到三句
 - difficulty_basis：这道题归到该难度档的核验依据，写明命中了定义里的哪几条
@@ -313,10 +314,10 @@ def validate_candidate(c: dict) -> str:
         return f"仓库名 {name!r} 暴露了出题语义"
     if _is_own_repo(name):
         return f"仓库名 {name!r} 与自有工具仓库同名"
-    if str(c.get("difficulty") or "").strip() not in ("困难", "地狱"):
-        return f"难度 {c.get('difficulty')!r} 不收，只要困难或地狱"
+    if problems := gate.field_problems(c):
+        return problems[0]
     if len(str(c.get("prompt_body") or "").strip()) < 200:
-        return "prompt 正文太短，撑不起困难档"
+        return "prompt 正文太短，撑不起中等以上的难度"
     upstream = str(c.get("upstream") or "").strip()
     if str(c.get("source") or "").upper() == "A" and not upstream.startswith("https://github.com/"):
         return f"上游地址 {c.get('upstream')!r} 不是 GitHub https 地址"

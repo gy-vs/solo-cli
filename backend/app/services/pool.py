@@ -830,15 +830,42 @@ def _sha_of(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def draft_problems(entry: Entry) -> list[str]:
+    """题面里单选提交参数对不上平台选项的地方。"""
+    from app.services import gate, prompt_bank
+
+    parsed = next((p for p in prompt_bank.parse_text(entry.draft or "") if p.user_prompt), None)
+    return gate.field_problems(parsed.fields) if parsed else []
+
+
 async def bootstrap() -> dict:
-    """把本机既有题一次性导入池。已在池里的会被 append 自己跳过。"""
+    """把本机既有题一次性导入池。已在池里的会被 append 自己跳过。
+
+    新题入池前先核一遍单选提交参数。池是所有设备的可领题库，字段写错的题一旦进去，
+    领题、跑两个容器、分析、质检一路都不会拦它，直到上传才被平台按缺字段打回。
+    挡在这里，出题的一方当场就能看到哪道题哪个字段要改。
+    """
     ok, why = available()
     if not ok:
-        return {"ok": False, "message": why, "added": 0}
+        return {"ok": False, "message": why, "added": 0, "rejected": {}}
     synced = await sync()
     if not synced["ok"]:
-        return {"ok": False, "message": synced["message"], "added": 0}
-    return await add(bootstrap_entries())
+        return {"ok": False, "message": synced["message"], "added": 0, "rejected": {}}
+    known = {e.id for e in load()}
+    accepted: list[Entry] = []
+    rejected: dict[str, list[str]] = {}
+    for e in bootstrap_entries():
+        if e.id not in known and (problems := draft_problems(e)):
+            rejected[e.task_no] = problems
+        else:
+            accepted.append(e)
+    res = await add(accepted)
+    if rejected:
+        log.warning("入池拦下 %s 道提交参数不合规的题：%s", len(rejected),
+                    "；".join(f"{no} {'，'.join(p)}" for no, p in rejected.items()))
+        detail = "；".join(f"{no}：{'，'.join(p)}" for no, p in rejected.items())
+        res["message"] = f"{res['message']}。另有 {len(rejected)} 道题提交参数不合规未入池，改好题面后重调：{detail}"
+    return {**res, "rejected": rejected}
 
 
 def snapshot() -> dict:

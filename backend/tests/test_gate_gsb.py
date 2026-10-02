@@ -27,13 +27,26 @@ def test_normalize_choice_ignores_case():
     assert gate.normalize_choice("bug 修复", gate.QUESTION_TYPES) == "Bug修复"
 
 
-def test_difficulty_options_are_exactly_two():
-    assert gate.DIFFICULTIES == ("困难", "地狱")
+def test_difficulty_options_exclude_easy():
+    assert gate.DIFFICULTIES == ("中等", "困难", "地狱")
+
+
+@pytest.mark.parametrize("qtype, level, ok", [
+    ("0-1 代码生成", "困难", True),
+    ("0-1 代码生成", "地狱", True),
+    ("0-1 代码生成", "中等", False),
+    ("Feature 迭代", "中等", True),
+    ("Bug 修复", "中等", True),
+    ("Bug 修复", "简单", False),
+])
+def test_difficulty_range_depends_on_question_type(qtype, level, ok):
+    assert (gate.difficulty_problem(level, qtype) == "") is ok
 
 
 def _task(**kw):
     base = dict(task_no="07", prompt_hash="h", difficulty="困难",
-                question_type="0-1 代码生成", repo_url="https://github.com/acme/widget",
+                question_type="0-1 代码生成", repro_level="无外部依赖",
+                repo_url="https://github.com/acme/widget",
                 env_snapshot="https://github.com/acme/widget/commit/" + "a" * 40)
     base.update(kw)
     return m.Task(**base)
@@ -90,13 +103,39 @@ def test_all_green_passes(stub):
 
 
 def test_easy_difficulty_is_blocked(stub):
+    checks = asyncio.run(gate.run_checks(_task(difficulty="简单")))
+    assert _levels(checks)["difficulty"] == "block"
+
+
+def test_medium_zero_to_one_is_blocked(stub):
     checks = asyncio.run(gate.run_checks(_task(difficulty="中等")))
     assert _levels(checks)["difficulty"] == "block"
+
+
+def test_medium_bugfix_passes_difficulty(stub):
+    checks = asyncio.run(gate.run_checks(_task(difficulty="中等", question_type="Bug 修复")))
+    assert _levels(checks)["difficulty"] == "ok"
 
 
 def test_unknown_question_type_is_blocked(stub):
     checks = asyncio.run(gate.run_checks(_task(question_type="瞎写的类型")))
     assert _levels(checks)["question_type"] == "block"
+
+
+@pytest.mark.parametrize("level", ["", "Python only; no PostgreSQL server required",
+                                   "无外部服务；Node.js 测试与独立依赖环境"])
+def test_free_text_repro_level_is_blocked(stub, level):
+    """单选字段写成描述，上传时归一化为空、平台按缺字段打回，要在跑之前拦住。"""
+    checks = asyncio.run(gate.run_checks(_task(repro_level=level)))
+    assert _levels(checks)["repro_level"] == "block"
+
+
+def test_field_problems_lists_every_bad_choice():
+    got = gate.field_problems({"question_type": "功能开发", "difficulty": "简单",
+                               "repro_level": "Python only"})
+    assert len(got) == 3
+    assert gate.field_problems({"question_type": "Feature 迭代", "difficulty": "中等",
+                                "repro_level": "有外部依赖，未容器化"}) == []
 
 
 def test_missing_repo_url_is_blocked(stub):
