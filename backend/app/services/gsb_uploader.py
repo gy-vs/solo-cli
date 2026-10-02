@@ -436,7 +436,22 @@ def _fail(task_id: int, record: dict, message: str, *,
     return {"ok": False, "message": message, "fields": fields or {}, "auth_error": auth}
 
 
+# 同一道题同一时刻只许一次提交在路上。界面上点提交和巡检自动提交是两条独立入口，
+# 撞在一起就是同一份结论在平台上落两单，而平台那边不会替我们去重。
+_uploading: set[int] = set()
+
+
 async def upload_task(task_id: int) -> dict:
+    if task_id in _uploading:
+        return {"ok": False, "message": "这道题正在提交中，等它跑完再说"}
+    _uploading.add(task_id)
+    try:
+        return await _upload_task(task_id)
+    finally:
+        _uploading.discard(task_id)
+
+
+async def _upload_task(task_id: int) -> dict:
     with session() as db:
         task = db.get(Task, task_id)
         if task is None:

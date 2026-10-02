@@ -577,3 +577,136 @@ def test_deliver_does_not_submit_when_one_side_fails_to_upload(ready_task, monke
     r = asyncio.run(up.deliver_screencasts(
         task_id, {"A": str(tmp_path / "a.mp4"), "B": str(tmp_path / "missing.mp4")}))
     assert r["ok"] is False and "文件不存在" in r["message"] and submitted == []
+
+
+# ---------------- 巡检自动提交 ----------------
+
+@pytest.fixture()
+def clean_submit():
+    """自动提交的台账是模块级的，用例之间必须擦干净。"""
+    from app.services import watchdog as wd
+
+    def reset():
+        wd._submit_job = None
+        wd._submit_failed.clear()
+        wd._submit_auth_until = 0.0
+        wd._submit_auth_cookie = ""
+
+    reset()
+    yield wd
+    reset()
+
+
+def _scan_and_wait(wd):
+    async def main():
+        n = wd._scan_submit()
+        if wd._submit_job is not None:
+            await wd._submit_job
+        return n
+
+    return asyncio.run(main())
+
+
+def test_watchdog_submits_tasks_that_are_ready(ready_task, monkeypatch, clean_submit):
+    """质检放行、录屏齐了的题，巡检扫到就交，口径和界面上那个提交按钮是同一个。"""
+    wd = clean_submit
+    task_id, _ = ready_task
+    _ready_to_submit(task_id)
+    submitted = []
+
+    async def fake_submit(tid):
+        submitted.append(tid)
+        return {"ok": True, "message": "提交成功"}
+
+    monkeypatch.setattr(up, "upload_task", fake_submit)
+    assert _scan_and_wait(wd) == 1
+    assert submitted == [task_id]
+
+
+def test_watchdog_leaves_tasks_the_gate_still_blocks(ready_task, monkeypatch, clean_submit):
+    """录屏还缺着的题提交按钮是灰的，巡检也不能交。"""
+    wd = clean_submit
+    task_id, _ = ready_task
+    _ready_to_submit(task_id, urls=("https://v.example/a", ""))
+    submitted = []
+    monkeypatch.setattr(up, "upload_task", lambda tid: submitted.append(tid))
+    assert _scan_and_wait(wd) == 0 and submitted == []
+
+
+def test_watchdog_auto_submit_can_be_switched_off(ready_task, monkeypatch, clean_submit):
+    wd = clean_submit
+    task_id, _ = ready_task
+    _ready_to_submit(task_id)
+    monkeypatch.setattr(wd, "auto_submit", lambda: False)
+    submitted = []
+    monkeypatch.setattr(up, "upload_task", lambda tid: submitted.append(tid))
+    assert _scan_and_wait(wd) == 0 and submitted == []
+
+
+def test_watchdog_does_not_resubmit_a_rejected_task_every_round(ready_task, monkeypatch,
+                                                                clean_submit):
+    """平台回绝的原因不会自己消失，下一轮照样交只会刷出同一句回绝。"""
+    wd = clean_submit
+    task_id, _ = ready_task
+    _ready_to_submit(task_id)
+    calls = []
+
+    async def rejected(tid):
+        calls.append(tid)
+        return {"ok": False, "message": "字段超长"}
+
+    monkeypatch.setattr(up, "upload_task", rejected)
+    _scan_and_wait(wd)
+    _scan_and_wait(wd)
+    assert calls == [task_id]
+
+    wd._submit_failed[task_id] -= wd.SUBMIT_RETRY_GAP_S   # 冷却期过了再试
+    _scan_and_wait(wd)
+    assert calls == [task_id, task_id]
+
+
+def test_watchdog_pauses_auto_submit_until_cookie_changes(ready_task, monkeypatch, clean_submit):
+    """身份失效时后面每一道都会被同样拒掉；人一换 Cookie 就该接着交，不必干等。"""
+    wd = clean_submit
+    task_id, _ = ready_task
+    _ready_to_submit(task_id)
+    cookie = {"v": "old"}
+    monkeypatch.setattr(wd.settings_store, "get",
+                        lambda k: cookie["v"] if k == "gsb.session_cookie" else "")
+    calls = []
+
+    async def auth_failed(tid):
+        calls.append(tid)
+        return {"ok": False, "message": "身份失效", "auth_error": True}
+
+    monkeypatch.setattr(up, "upload_task", auth_failed)
+    _scan_and_wait(wd)
+    _scan_and_wait(wd)
+    assert calls == [task_id]
+
+    cookie["v"] = "new"
+    _scan_and_wait(wd)
+    assert calls == [task_id, task_id]
+
+
+def test_upload_task_refuses_a_second_concurrent_submit(ready_task, monkeypatch):
+    """手点提交和巡检自动提交撞在同一道题上，后到的那次必须挡回去，不然平台上落两单。"""
+    task_id, _ = ready_task
+
+    async def main():
+        gate = asyncio.Event()
+
+        async def slow(tid):
+            await gate.wait()
+            return {"ok": True, "message": "提交成功"}
+
+        monkeypatch.setattr(up, "_upload_task", slow)
+        first = asyncio.create_task(up.upload_task(task_id))
+        await asyncio.sleep(0)
+        second = await up.upload_task(task_id)
+        gate.set()
+        return await first, second
+
+    first, second = asyncio.run(main())
+    assert first["ok"] is True
+    assert second["ok"] is False and "正在提交中" in second["message"]

@@ -17,7 +17,8 @@
    并推到各自分支、开 GSB 分析。
 3. 生成描述并质检。分析产出结论与理由，先过本地核验（长度、AI 痕迹、证据可定位），
    再送 solo-qa 的 GSB 质检链路拿平台口径的结论。
-4. 整合结果。把上面每一步的结论落到题上，异常的转人工，正常的留着等录屏与上传。
+4. 整合结果。把上面每一步的结论落到题上，异常的转人工，正常的留着等录屏；
+   质检放行、录屏也齐了的题由巡检自动提交到平台（设置项 auto.submit）。
 
 周期扫描是兜底。正常情况下 runner 结束会 wake 一次，立刻扫，不必等满一轮。
 """
@@ -124,6 +125,8 @@ def status() -> dict:
         "max_timeouts": settings_store.get_int("watchdog.max_timeouts", MAX_TIMEOUTS_DEFAULT),
         "alive": alive(),
         "advancing": len(_advance_tasks),
+        "auto_submit": auto_submit(),
+        "submitting": _submit_job is not None and not _submit_job.done(),
         "last_tick_at": _last_tick_at.isoformat() if _last_tick_at else None,
         "last_error": _last_error,
         "last_stats": _last_stats,
@@ -1436,6 +1439,95 @@ async def _scan_pairs() -> int:
     return started
 
 
+# ---------------- 自动提交 ----------------
+# 两道质检都放行、两侧录屏也齐了的题，剩下的只有「点一下提交」这一个机械动作。
+# 挑题口径直接用 gsb_precheck.submittable_ids：界面上提交按钮亮不亮照的是同一个
+# submit_block，巡检这边另判一套的话，迟早会提交一道按钮还灰着的题。
+#
+# 提交要上传两份轨迹再等平台落库，一道题十几秒到一两分钟，所以和推进一样放到后台，
+# 一批串行跑完，不在巡检这一轮里等它。
+
+SUBMIT_RETRY_GAP_S = 1800
+_submit_job: asyncio.Task | None = None
+# 提交没成的题 {task_id: 时刻}。被拒的原因（字段缺失、超长、轨迹对不上）不会自己消失，
+# 每轮都重交一遍只会在平台日志里刷一串同样的回绝，所以隔一段再试。放在内存里就够：
+# 重启之后多试一次没有坏处。
+_submit_failed: dict[int, float] = {}
+# 身份失效时整批暂停到这个时刻，同时记下当时的 Cookie：人更新了 Cookie 就立刻恢复，
+# 不必干等到点。
+_submit_auth_until = 0.0
+_submit_auth_cookie = ""
+
+
+def auto_submit() -> bool:
+    return settings_store.get_bool("auto.submit", True)
+
+
+def _submit_paused_for_auth() -> bool:
+    global _submit_auth_until
+    if time.time() >= _submit_auth_until:
+        return False
+    if settings_store.get("gsb.session_cookie") != _submit_auth_cookie:
+        _submit_auth_until = 0.0
+        return False
+    return True
+
+
+def _submit_candidates() -> list[int]:
+    from app.services import gsb_precheck
+
+    now = time.time()
+    return [tid for tid in gsb_precheck.submittable_ids()
+            if now - _submit_failed.get(tid, 0.0) >= SUBMIT_RETRY_GAP_S]
+
+
+async def _submit_batch(ids: list[int]) -> int:
+    """逐道提交，返回成功了几道。身份失效就停下，剩下的那几道交上去也是同一个回绝。"""
+    global _submit_auth_until, _submit_auth_cookie
+    from app.services import gsb_uploader
+
+    done = 0
+    for i, task_id in enumerate(ids):
+        try:
+            r = await gsb_uploader.upload_task(task_id)
+        except Exception as exc:  # noqa: BLE001
+            r = {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
+        if r.get("ok"):
+            _submit_failed.pop(task_id, None)
+            done += 1
+            continue
+        if r.get("auth_error"):
+            _submit_auth_until = time.time() + SUBMIT_RETRY_GAP_S
+            _submit_auth_cookie = settings_store.get("gsb.session_cookie")
+            log.warning("自动提交：平台身份不可用（%s），剩下 %s 道暂停，更新 Cookie 后恢复",
+                        r.get("message", ""), len(ids) - i)
+            break
+        _submit_failed[task_id] = time.time()
+        log.warning("题 %s 自动提交没成：%s", task_id, r.get("message", ""))
+    if done:
+        log.info("自动提交：本批 %s 道，成功 %s 道", len(ids), done)
+    return done
+
+
+def _scan_submit() -> int:
+    """把可提交的题交给后台提交。返回这一轮排进去了几道。
+
+    上一批还没交完就不再起新的一批：两批撞在同一道题上，upload_task 自己会挡，
+    但没必要让它去挡。熔断拉着时网络本来就不通，交出去也是白交。
+    """
+    global _submit_job
+    if not auto_submit() or breaker.tripped() or _submit_paused_for_auth():
+        return 0
+    if _submit_job is not None and not _submit_job.done():
+        return 0
+    ids = _submit_candidates()
+    if not ids:
+        return 0
+    log.info("自动提交：%s 道题已可提交，交给后台逐道提交", len(ids))
+    _submit_job = asyncio.create_task(_submit_batch(ids), name="auto-submit")
+    return len(ids)
+
+
 async def _check_breaker() -> None:
     """熔断拉着就探一次，通了就放开。排在异常扫描前面，放开的当轮就能把挂起的侧重跑掉。"""
     if not breaker.tripped():
@@ -1516,6 +1608,8 @@ async def tick() -> dict:
     from app.services import recording
 
     recording.kick()
+    # 自动提交排在质检与录屏之后：前面几步刚把题推到可提交，当轮就能交出去
+    stats["submitted"] = _scan_submit()
     # 台账校正放最后：上面几步可能刚销毁过容器，这时对齐一次正好
     fixed = await _reconcile_containers()
     return {"adopted": adopted, **stats, "advanced": advanced, "container_fixed": fixed,
@@ -1553,11 +1647,11 @@ async def _loop() -> None:
             # 按周期跑」就完全无从判断 —— 出了问题只能靠猜。
             log.info("巡检 · 补记账 %s · 重跑 %s · 废弃 %s · 挂起 %s · 转待分析 %s · 转人工 %s"
                      " · 探路废弃 %s · 恢复放回 %s · 自愈 %s · 起推进 %s · 补质检 %s（在跑 %s）"
-                     " · 防熄屏 %s · 耗时 %.1fs",
+                     " · 起提交 %s · 防熄屏 %s · 耗时 %.1fs",
                      stats["adopted"], stats["requeued"], stats["discarded"], stats["held"],
                      stats["run_done"], stats["settled"], stats["probed"], stats["freed"],
                      stats["healed"], stats["advanced"], stats["gated"], len(_advance_tasks),
-                     stats["awake"], (utc_now() - began).total_seconds())
+                     stats["submitted"], stats["awake"], (utc_now() - began).total_seconds())
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001
@@ -1615,6 +1709,8 @@ async def stop() -> None:
     _advance_tasks.clear()
     _advance_wanted.clear()
     _gate_wanted.clear()
+    if _submit_job is not None:
+        _submit_job.cancel()
     if _task:
         _task.cancel()
 
