@@ -1,0 +1,1003 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solo 录屏端</title>
+<!--
+  免部署录屏端：双击用浏览器打开即可，不装 Docker / Python / Git，不引用任何 CDN。
+  只和 GitHub 私有「录屏仓库」打交道，协议与 backend/app/services/rec_repo.py 完全一致：
+    - main 分支的 events.jsonl：一个动作一行、只追加，按 (at, by) 重放折叠出每道题的状态
+    - 每题一个分支 rec/<设备>/<题号>：report.md 由出题端发布，A/B 视频由这里回传
+  改协议时两边要一起改。
+-->
+<style>
+:root{
+  --bg:#f4f5f9; --panel:#fff; --ink:#0f172a; --ink2:#475569; --ink3:#94a3b8; --line:#e6e8ef;
+  --brand:#4f46e5; --brand2:#6366f1; --brand-soft:#eef2ff;
+  --ok:#059669; --ok-soft:#ecfdf5; --warn:#b45309; --warn-soft:#fffbeb; --bad:#dc2626; --bad-soft:#fef2f2;
+  --r:14px; --shadow:0 1px 2px rgba(15,23,42,.04),0 6px 20px rgba(15,23,42,.06);
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{font-family:"Inter","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  background:var(--bg);color:var(--ink);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+button{font:inherit;cursor:pointer}
+input{font:inherit}
+a{color:var(--brand);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* 顶栏 */
+.top{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.86);backdrop-filter:saturate(1.6) blur(12px);
+  border-bottom:1px solid var(--line)}
+.top-in{max-width:1180px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:16px}
+.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),#8b5cf6);
+  display:grid;place-items:center;color:#fff;box-shadow:0 4px 12px rgba(79,70,229,.35)}
+.brand h1{margin:0;font-size:16px;font-weight:700;letter-spacing:.2px}
+.brand p{margin:0;font-size:12px;color:var(--ink3)}
+.top .grow{flex:1}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;background:#f1f5f9;
+  color:var(--ink2);font-size:12px;white-space:nowrap}
+.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.chip.bad .dot{background:var(--bad)}
+
+/* 按钮 */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:10px;
+  border:1px solid var(--line);background:#fff;color:var(--ink);font-weight:500;transition:all .15s;white-space:nowrap}
+.btn:hover{border-color:#cbd5e1;background:#f8fafc}
+.btn:active{transform:translateY(1px)}
+.btn[disabled]{opacity:.5;cursor:not-allowed;transform:none}
+.btn.primary{background:var(--brand);border-color:var(--brand);color:#fff;box-shadow:0 2px 8px rgba(79,70,229,.25)}
+.btn.primary:hover{background:#4338ca;border-color:#4338ca}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--ink2)}
+.btn.ghost:hover{background:#f1f5f9}
+.btn.danger{color:var(--bad)}
+.btn.sm{height:30px;padding:0 10px;font-size:13px;border-radius:8px}
+.btn svg{width:16px;height:16px}
+
+/* 主体 */
+.wrap{max-width:1180px;margin:0 auto;padding:24px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;box-shadow:var(--shadow)}
+.stat b{display:block;font-size:24px;line-height:1.2;font-weight:700}
+.stat span{font-size:12px;color:var(--ink3)}
+.stat.hl b{color:var(--brand)}
+.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:18px}
+.search{flex:1;position:relative}
+.search input{width:100%;height:38px;border:1px solid var(--line);border-radius:10px;padding:0 12px 0 36px;background:#fff;outline:none;transition:.15s}
+.search input:focus{border-color:var(--brand2);box-shadow:0 0 0 3px rgba(99,102,241,.15)}
+.search svg{position:absolute;left:11px;top:11px;width:16px;height:16px;color:var(--ink3)}
+.sync{font-size:12px;color:var(--ink3);white-space:nowrap}
+.banner{border-radius:12px;padding:12px 14px;margin-bottom:18px;font-size:13px;display:flex;gap:10px;align-items:flex-start}
+.banner.bad{background:var(--bad-soft);color:#991b1b;border:1px solid #fecaca}
+.sec{margin-bottom:28px}
+.sec-h{display:flex;align-items:center;gap:8px;margin:0 0 12px}
+.sec-h h2{margin:0;font-size:15px;font-weight:650}
+.sec-h .count{font-size:12px;color:var(--ink3);background:#e9ecf3;border-radius:999px;padding:1px 8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px;box-shadow:var(--shadow);
+  display:flex;flex-direction:column;gap:10px;transition:.15s}
+.card:hover{border-color:#d4d8e3;transform:translateY(-1px)}
+.card.mine{border-color:#c7d2fe;background:linear-gradient(180deg,#fafaff,#fff)}
+.card-h{display:flex;align-items:baseline;gap:10px}
+.no{font-size:20px;font-weight:750;letter-spacing:-.3px}
+.card-h .title{color:var(--ink2);font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.meta{display:flex;flex-wrap:wrap;gap:6px}
+.badge{display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:6px;font-size:12px;background:#f1f5f9;color:var(--ink2)}
+.badge.brand{background:var(--brand-soft);color:var(--brand)}
+.badge.ok{background:var(--ok-soft);color:var(--ok)}
+.badge.warn{background:var(--warn-soft);color:var(--warn)}
+.card .sub{font-size:12px;color:var(--ink3);display:flex;justify-content:space-between;gap:8px}
+.card .sub a{color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card .acts{display:flex;gap:8px;margin-top:2px}
+.card .acts .btn{flex:1}
+.empty{background:var(--panel);border:1px dashed #d5d9e4;border-radius:var(--r);padding:28px;text-align:center;color:var(--ink3);font-size:13px}
+.mini{display:flex;flex-wrap:wrap;gap:8px}
+.mini .chip{background:#fff;border:1px solid var(--line)}
+
+/* 弹窗 / 抽屉 */
+.mask{position:fixed;inset:0;background:rgba(15,23,42,.38);backdrop-filter:blur(2px);z-index:40;animation:fade .15s}
+.modal{position:fixed;z-index:41;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100vw - 32px));
+  background:#fff;border-radius:18px;box-shadow:0 24px 64px rgba(15,23,42,.25);padding:24px;animation:pop .18s}
+.modal h3{margin:0 0 4px;font-size:18px}
+.modal .desc{margin:0 0 18px;color:var(--ink2);font-size:13px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+.field input{width:100%;height:40px;border:1px solid var(--line);border-radius:10px;padding:0 12px;outline:none;transition:.15s}
+.field input:focus{border-color:var(--brand2);box-shadow:0 0 0 3px rgba(99,102,241,.15)}
+.field .hint{font-size:12px;color:var(--ink3);margin-top:5px}
+.modal .foot{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
+.err{color:var(--bad);font-size:13px;min-height:20px}
+.drawer{position:fixed;z-index:41;top:0;right:0;bottom:0;width:min(920px,100vw);background:#fff;display:flex;flex-direction:column;
+  box-shadow:-20px 0 60px rgba(15,23,42,.2);animation:slide .22s ease-out}
+.dr-h{padding:16px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
+.dr-h .no{font-size:22px}
+.dr-h .grow{flex:1;min-width:0}
+.dr-h .title{font-size:13px;color:var(--ink2)}
+.dr-b{flex:1;overflow:auto;padding:8px 28px 28px}
+.dr-f{border-top:1px solid var(--line);padding:14px 22px;background:#fafbfd}
+.drops{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.drop{border:1.5px dashed #cfd5e2;border-radius:12px;padding:12px 14px;background:#fff;display:flex;align-items:center;gap:12px;cursor:pointer;transition:.15s;min-width:0}
+.drop:hover,.drop.over{border-color:var(--brand2);background:var(--brand-soft)}
+.drop.has{border-style:solid;border-color:#a7f3d0;background:var(--ok-soft)}
+.drop.too{border-color:#fecaca;background:var(--bad-soft)}
+.drop .side{width:34px;height:34px;flex:none;border-radius:9px;background:var(--brand);color:#fff;font-weight:700;display:grid;place-items:center}
+.drop .txt{min-width:0}
+.drop .txt b{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.drop .txt span{font-size:12px;color:var(--ink3)}
+.drop input{display:none}
+.dr-acts{display:flex;align-items:center;gap:10px}
+.dr-acts .grow{flex:1;min-width:0}
+.prog{height:6px;background:#e6e8ef;border-radius:99px;overflow:hidden;margin-top:6px}
+.prog i{display:block;height:100%;background:linear-gradient(90deg,var(--brand),#8b5cf6);border-radius:99px;transition:width .2s}
+.step{font-size:12px;color:var(--ink2)}
+.state-box{border-radius:12px;padding:12px 14px;font-size:13px}
+.state-box.ok{background:var(--ok-soft);color:#065f46}
+.state-box.warn{background:var(--warn-soft);color:#92400e}
+
+/* Markdown */
+.md{font-size:14.5px;line-height:1.75;color:#1e293b}
+.md h1,.md h2,.md h3,.md h4{line-height:1.35;margin:1.4em 0 .6em;font-weight:700}
+.md h2{font-size:19px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+.md h3{font-size:16px}
+.md p{margin:.6em 0}
+.md code{font-family:"JetBrains Mono","Cascadia Code",Consolas,"SF Mono",monospace;font-size:.88em;background:#f1f5f9;border-radius:5px;padding:.1em .4em}
+.md .code{margin:14px 0;border-radius:12px;overflow:hidden;background:#0f172a;box-shadow:0 4px 14px rgba(15,23,42,.12)}
+.md .code-h{display:flex;align-items:center;justify-content:space-between;padding:6px 8px 6px 14px;background:#1e293b;color:#94a3b8;font-size:12px}
+.md .code-h button{border:0;background:#334155;color:#e2e8f0;border-radius:6px;padding:3px 10px;font-size:12px}
+.md .code-h button:hover{background:#475569}
+.md pre{margin:0;padding:14px 16px;overflow:auto;color:#e2e8f0;font-size:13px;line-height:1.6}
+.md pre code{background:none;padding:0;font-size:inherit;color:inherit}
+.md ul,.md ol{padding-left:1.4em;margin:.6em 0}
+.md li{margin:.25em 0}
+.md blockquote{margin:.8em 0;padding:.4em 1em;border-left:3px solid #c7d2fe;background:#f8faff;color:var(--ink2);border-radius:0 8px 8px 0}
+.md table{border-collapse:collapse;margin:.8em 0;font-size:13.5px;width:100%}
+.md th,.md td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+.md th{background:#f8fafc;font-weight:600}
+.md hr{border:0;border-top:1px solid var(--line);margin:1.4em 0}
+.md a{word-break:break-all}
+
+/* 其他 */
+.toasts{position:fixed;z-index:60;top:18px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;align-items:center}
+.toast{background:#0f172a;color:#fff;padding:10px 16px;border-radius:10px;font-size:13px;box-shadow:0 10px 30px rgba(15,23,42,.3);animation:pop .18s;max-width:min(560px,calc(100vw - 32px))}
+.toast.bad{background:var(--bad)}
+.toast.ok{background:var(--ok)}
+.spin{width:16px;height:16px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:rot .7s linear infinite;display:inline-block}
+.skel{height:14px;border-radius:6px;background:linear-gradient(90deg,#eef0f5,#f6f7fa,#eef0f5);background-size:200% 100%;animation:sh 1.2s infinite;margin:12px 0}
+@keyframes rot{to{transform:rotate(360deg)}}
+@keyframes fade{from{opacity:0}}
+@keyframes pop{from{opacity:0;transform:translate(-50%,-48%) scale(.98)}}
+.toast{animation:none}
+@keyframes slide{from{transform:translateX(40px);opacity:0}}
+@keyframes sh{to{background-position:-200% 0}}
+@media (max-width:760px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .drops{grid-template-columns:1fr}
+  .top-in{padding:10px 14px}.wrap{padding:16px}
+  .top .chip.repo{display:none}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="top-in">
+    <div class="logo">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="m22 8-6 4 6 4V8z"/></svg>
+    </div>
+    <div class="brand"><h1>Solo 录屏端</h1><p>认领文档 · 照着录 · 回传视频</p></div>
+    <div class="grow"></div>
+    <span id="chipRepo" class="chip repo"></span>
+    <span id="chipDevice" class="chip"></span>
+    <button class="btn ghost sm" data-act="settings" title="设置">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      设置
+    </button>
+  </div>
+</header>
+
+<main class="wrap" id="main"></main>
+<div id="layer"></div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+(() => {
+'use strict';
+
+// ---------------- 常量（与后端保持一致） ----------------
+const API = 'https://api.github.com';
+const MAIN_BRANCH = 'main';
+const EVENTS_FILE = 'events.jsonl';
+const REPORT_FILE = 'report.md';
+const SIDES = ['A', 'B'];
+const VIDEO_SUFFIXES = ['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi'];
+// GitHub 单文件硬上限 100 MB，与 rec_repo.MAX_VIDEO_BYTES 一致
+const MAX_VIDEO_BYTES = 95 * 1024 * 1024;
+const EVENT_TYPES = ['published', 'claimed', 'released', 'recorded', 'collected', 'withdrawn'];
+const S = { OPEN: 'open', CLAIMED: 'claimed', RECORDED: 'recorded', COLLECTED: 'collected', WITHDRAWN: 'withdrawn' };
+const STATE_LABEL = { open: '待认领', claimed: '录制中', recorded: '已回传，等出题端收回', collected: '出题端已收回', withdrawn: '已撤回' };
+const CFG_KEY = 'solo-recorder.cfg';
+const REPORT_KEY = 'solo-recorder.report.';
+const AUTO_REFRESH_MS = 60_000;
+
+// ---------------- 工具 ----------------
+const $ = (s, root = document) => root.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function slug(name) {
+  return (name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown';
+}
+function normRepo(raw) {
+  raw = (raw || '').trim().replace(/^https?:\/\/(?:[^@]+@)?github\.com\//, '').replace(/\.git$/, '');
+  const parts = raw.split('/').filter(Boolean);
+  return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : '';
+}
+const branchOf = (owner, no) => `rec/${slug(owner)}/${no}`;
+const keyOf = (owner, no) => `${owner}/${no}`;
+const encBranch = b => b.split('/').map(encodeURIComponent).join('/');
+
+// 时间戳必须与 Python isoformat(timespec="microseconds") 同格式：状态靠字符串排序重放
+function nowIso() {
+  const micro = String(Math.floor((performance.now() % 1) * 1000)).padStart(3, '0');
+  return new Date().toISOString().slice(0, 23) + micro + '+00:00';
+}
+function ago(stamp) {
+  if (!stamp) return '';
+  const t = Date.parse(stamp);
+  if (Number.isNaN(t)) return '';
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return '刚刚';
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  return `${Math.floor(s / 86400)} 天前`;
+}
+function fmtSize(n) {
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+function ext(name) {
+  const i = name.lastIndexOf('.');
+  return i < 0 ? '' : name.slice(i).toLowerCase();
+}
+function b64ToUtf8(b64) {
+  const bin = atob((b64 || '').replace(/\s/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+function utf8ToB64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function fileToB64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',', 2)[1] || '');
+    r.onerror = () => reject(new Error(`读不了 ${file.name}：${r.error && r.error.message}`));
+    r.readAsDataURL(file);
+  });
+}
+function stable(v) {
+  if (Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stable(v[k])).join(',') + '}';
+  return JSON.stringify(v);
+}
+
+// ---------------- 配置 ----------------
+function loadCfg() {
+  try { return JSON.parse(localStorage.getItem(CFG_KEY) || '{}') || {}; } catch { return {}; }
+}
+let cfg = loadCfg();
+const configured = () => Boolean(cfg.repo && cfg.token && cfg.device);
+
+// ---------------- GitHub API ----------------
+class GhError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+function explain(status, data, headers) {
+  const msg = (data && data.message) || '';
+  if (status === 401) return 'Token 无效或已过期，请到「设置」里换一个';
+  if (status === 403 && headers && headers.get && headers.get('x-ratelimit-remaining') === '0') return 'GitHub 接口调用次数用完了，过一会儿再试';
+  if (status === 403) return `Token 权限不够（需要这个仓库的 Contents 读写）：${msg}`;
+  if (status === 404) return '找不到（仓库名不对，或 Token 没勾选这个仓库）';
+  if (status === 409) return '仓库刚被别人改过，请重试';
+  return `GitHub 返回 ${status}${msg ? '：' + msg : ''}`;
+}
+async function gh(path, { method = 'GET', body } = {}) {
+  let r;
+  try {
+    r = await fetch(API + path, {
+      method, cache: 'no-store',
+      headers: {
+        Authorization: `Bearer ${cfg.token}`,
+        Accept: 'application/vnd.github+json',
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    throw new GhError(0, `连不上 GitHub（检查网络或代理）：${e.message}`);
+  }
+  if (r.status === 204) return null;
+  const txt = await r.text();
+  let data = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch { /* 非 JSON */ }
+  if (!r.ok) throw new GhError(r.status, explain(r.status, data, r.headers));
+  return data;
+}
+// 大文件走 XHR：fetch 拿不到上传进度
+function ghUpload(path, body, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('POST', API + path);
+    x.setRequestHeader('Authorization', `Bearer ${cfg.token}`);
+    x.setRequestHeader('Accept', 'application/vnd.github+json');
+    x.setRequestHeader('Content-Type', 'application/json');
+    x.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    x.onload = () => {
+      let d = null;
+      try { d = JSON.parse(x.responseText); } catch { /* 非 JSON */ }
+      if (x.status >= 200 && x.status < 300) resolve(d);
+      else reject(new GhError(x.status, explain(x.status, d)));
+    };
+    x.onerror = () => reject(new GhError(0, '上传中断（网络问题），再点一次「回传」即可'));
+    x.send(JSON.stringify(body));
+  });
+}
+const repoPath = p => `/repos/${cfg.repo}${p}`;
+
+// ---------------- 事件（对应 rec_repo.load_events / fold / append） ----------------
+async function readEvents() {
+  let meta;
+  try {
+    meta = await gh(repoPath(`/contents/${EVENTS_FILE}?ref=${MAIN_BRANCH}`));
+  } catch (e) {
+    if (e.status === 404) throw new GhError(404, `录屏仓库 ${cfg.repo} 里没有 ${EVENTS_FILE}：仓库名填错了、Token 没勾这个仓库，或出题端还没启用录屏协作`);
+    throw e;
+  }
+  // 按 sha 取 blob：内容与后面写回时用的 sha 必然是同一版
+  const blob = await gh(repoPath(`/git/blobs/${meta.sha}`));
+  return { sha: meta.sha, text: b64ToUtf8(blob.content) };
+}
+function parseEvents(text) {
+  const rows = [];
+  for (let line of text.split('\n')) {
+    line = line.trim();
+    if (!line) continue;
+    let raw;
+    try { raw = JSON.parse(line); } catch { continue; }
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) && EVENT_TYPES.includes(raw.type) && raw.owner && raw.task_no) rows.push(raw);
+  }
+  return rows;
+}
+function fold(events) {
+  const out = {};
+  const uniq = new Map();
+  for (const e of events) uniq.set(stable(e), e);
+  const sorted = [...uniq.values()].sort((a, b) => {
+    const ka = String(a.at || ''), kb = String(b.at || '');
+    if (ka !== kb) return ka < kb ? -1 : 1;
+    const ba = String(a.by || ''), bb = String(b.by || '');
+    return ba === bb ? 0 : (ba < bb ? -1 : 1);
+  });
+  for (const ev of sorted) {
+    const key = keyOf(ev.owner, ev.task_no);
+    let cur = out[key];
+    const kind = ev.type;
+    if (kind === 'published') {
+      cur = out[key] = {
+        key, owner: ev.owner, task_no: String(ev.task_no), state: S.OPEN,
+        digest: String(ev.digest || ''), title: String(ev.title || ''), kind_label: String(ev.kind_label || ''),
+        verdict: String(ev.verdict || ''), repo_url: String(ev.repo_url || ''), published_at: String(ev.at || ''),
+        claimed_by: '', claimed_at: '', recorded_by: '', recorded_at: '', collected_at: '',
+        history: cur ? cur.history.slice() : [],
+      };
+      cur.history.push(ev);
+      continue;
+    }
+    if (!cur) continue;
+    cur.history.push(ev);
+    const sameRound = !ev.digest || ev.digest === cur.digest;
+    const by = String(ev.by || '');
+    if (kind === 'withdrawn') cur.state = S.WITHDRAWN;
+    else if (!sameRound) continue;
+    else if (kind === 'claimed') {
+      if (cur.state === S.OPEN) Object.assign(cur, { state: S.CLAIMED, claimed_by: by, claimed_at: String(ev.at || '') });
+    } else if (kind === 'released') {
+      if (cur.state === S.CLAIMED && cur.claimed_by === by) Object.assign(cur, { state: S.OPEN, claimed_by: '', claimed_at: '' });
+    } else if (kind === 'recorded') {
+      if (cur.state === S.OPEN || (cur.state === S.CLAIMED && cur.claimed_by === by)) {
+        Object.assign(cur, { state: S.RECORDED, recorded_by: by, recorded_at: String(ev.at || '') });
+        cur.claimed_by = cur.claimed_by || by;
+      }
+    } else if (kind === 'collected') {
+      if (cur.state === S.RECORDED) Object.assign(cur, { state: S.COLLECTED, collected_at: String(ev.at || '') });
+    }
+  }
+  return out;
+}
+// 本机时钟比出题端慢时，新动作可能排到这道题的 published 前面而被重放忽略，所以至少晚于最后一条
+function mkEvent(type, entry, extra = {}) {
+  let at = nowIso();
+  const last = entry.history.reduce((m, ev) => (String(ev.at || '') > m ? String(ev.at) : m), '');
+  if (at <= last) at = new Date(Date.parse(last.slice(0, 23) + 'Z') + 1).toISOString().slice(0, 23) + '000+00:00';
+  return { type, owner: entry.owner, task_no: String(entry.task_no), by: cfg.device, at, ...extra };
+}
+// 写入带 sha：文件被别人改过就会被拒（409），重新读一遍再写
+async function appendEvents(events, subject, attempts = 3) {
+  let last;
+  for (let i = 1; i <= attempts; i++) {
+    const { sha, text } = await readEvents();
+    let body = text;
+    if (body && !body.endsWith('\n')) body += '\n';
+    body += events.map(e => JSON.stringify(e)).join('\n') + '\n';
+    try {
+      await gh(repoPath(`/contents/${EVENTS_FILE}`), {
+        method: 'PUT',
+        body: { message: `${cfg.device}: ${subject}`, content: utf8ToB64(body), sha, branch: MAIN_BRANCH },
+      });
+      return;
+    } catch (e) {
+      last = e;
+      if (e.status !== 409 && e.status !== 422) throw e;
+      await sleep(600 * i);
+    }
+  }
+  throw new Error(`写入录屏仓库失败：${last && last.message}`);
+}
+
+// ---------------- 录屏端动作（对应 recording.claim / report / release / submit_videos） ----------------
+const state = { entries: {}, loading: false, error: '', syncedAt: null, filter: '', busy: new Set(), drawer: null };
+const entry = key => state.entries[key];
+
+async function refresh({ quiet = false } = {}) {
+  if (!configured()) return;
+  state.loading = true;
+  renderMain();
+  try {
+    const { text } = await readEvents();
+    state.entries = fold(parseEvents(text));
+    state.syncedAt = new Date();
+    state.error = '';
+  } catch (e) {
+    state.error = e.message;
+    if (!quiet) toast(e.message, 'bad');
+    throw e;
+  } finally {
+    state.loading = false;
+    renderMain();
+    if (state.drawer) renderDrawer();
+  }
+}
+
+async function claim(key) {
+  await refresh({ quiet: true });
+  let e = entry(key);
+  if (!e) throw new Error('录屏仓库里没有这道题');
+  if (e.state === S.CLAIMED && e.claimed_by === cfg.device) return openDrawer(key);
+  if (e.state !== S.OPEN) {
+    throw new Error(`这道题现在不能认领：${STATE_LABEL[e.state] || e.state}${e.claimed_by ? `（${e.claimed_by} 在录）` : ''}`);
+  }
+  await appendEvents([mkEvent('claimed', e, { digest: e.digest })], `claim ${e.task_no}`);
+  // 写完再读一遍：两端同时认领时，以重放结果为准
+  await refresh({ quiet: true });
+  e = entry(key);
+  if (!e || e.claimed_by !== cfg.device) throw new Error(`晚了一步，${e && e.claimed_by ? e.claimed_by : '别人'} 先认领了这道题`);
+  toast(`已认领第 ${e.task_no} 题`, 'ok');
+  openDrawer(key);
+}
+
+async function release(key) {
+  const e = entry(key);
+  if (!e || e.state !== S.CLAIMED || e.claimed_by !== cfg.device) throw new Error('这道题不在你名下');
+  await appendEvents([mkEvent('released', e, { digest: e.digest })], `release ${e.task_no}`);
+  await refresh({ quiet: true });
+  toast('已放回队列', 'ok');
+}
+
+async function loadReport(e) {
+  try {
+    const c = JSON.parse(localStorage.getItem(REPORT_KEY + e.key) || 'null');
+    if (c && c.digest === e.digest && c.md) return c.md;
+  } catch { /* 缓存坏了就重拉 */ }
+  const branch = branchOf(e.owner, e.task_no);
+  let meta;
+  try {
+    meta = await gh(repoPath(`/contents/${REPORT_FILE}?ref=${encodeURIComponent(branch)}`));
+  } catch (err) {
+    if (err.status === 404) throw new Error(`录屏仓库里没有分支 ${branch}，文档可能已被撤回`);
+    throw err;
+  }
+  const b64 = meta.content && meta.encoding === 'base64' ? meta.content : (await gh(repoPath(`/git/blobs/${meta.sha}`))).content;
+  const md = b64ToUtf8(b64);
+  try { localStorage.setItem(REPORT_KEY + e.key, JSON.stringify({ digest: e.digest, md })); } catch { /* 存不下就不缓存 */ }
+  return md;
+}
+
+function checkFiles(files) {
+  const missing = SIDES.filter(s => !files[s]);
+  if (missing.length) return `还缺 ${missing.join('、')} 侧的视频`;
+  for (const s of SIDES) {
+    const f = files[s];
+    if (!VIDEO_SUFFIXES.includes(ext(f.name))) return `${s} 侧 ${f.name} 不像视频文件（支持 ${VIDEO_SUFFIXES.join(' ')}）`;
+    if (!f.size) return `${s} 侧 ${f.name} 是空文件`;
+    if (f.size > MAX_VIDEO_BYTES) return `${s} 侧 ${f.name} 有 ${fmtSize(f.size)}，超过 GitHub 单文件上限，请按 720p 重新导出（一般几 MB）`;
+  }
+  return '';
+}
+
+async function submitVideos(key, files, onStep) {
+  const bad = checkFiles(files);
+  if (bad) throw new Error(bad);
+  onStep('核对题目状态…', 0);
+  await refresh({ quiet: true });
+  const e = entry(key);
+  if (!e) throw new Error('录屏仓库里没有这道题');
+  if (e.state === S.WITHDRAWN) throw new Error('这份文档已被出题端撤回（理由改过或题已提交），视频不用传了');
+  if (e.state === S.CLAIMED && e.claimed_by !== cfg.device) throw new Error(`这道题由 ${e.claimed_by} 在录`);
+  if (e.state !== S.OPEN && e.state !== S.CLAIMED) throw new Error(`这道题已经回传过了（${STATE_LABEL[e.state] || e.state}）`);
+
+  const names = {};
+  for (const s of SIDES) names[s] = `${s}${ext(files[s].name)}`;
+  const shas = {};
+  for (const [i, s] of SIDES.entries()) {
+    onStep(`读取 ${s} 侧视频…`, i / SIDES.length);
+    const content = await fileToB64(files[s]);
+    const blob = await ghUpload(repoPath('/git/blobs'), { content, encoding: 'base64' },
+      p => onStep(`上传 ${s} 侧视频 ${Math.round(p * 100)}%`, (i + p) / SIDES.length));
+    shas[s] = blob.sha;
+  }
+
+  onStep('提交到文档分支…', 1);
+  const branch = branchOf(e.owner, e.task_no);
+  for (let attempt = 1; ; attempt++) {
+    let ref;
+    try {
+      ref = await gh(repoPath(`/git/ref/heads/${encBranch(branch)}`));
+    } catch (err) {
+      if (err.status === 404) throw new Error('文档分支已被删除（出题端撤回或题已提交），视频不用传了');
+      throw err;
+    }
+    const head = ref.object.sha;
+    const commit = await gh(repoPath(`/git/commits/${head}`));
+    const tree = await gh(repoPath('/git/trees'), {
+      method: 'POST',
+      body: { base_tree: commit.tree.sha, tree: SIDES.map(s => ({ path: names[s], mode: '100644', type: 'blob', sha: shas[s] })) },
+    });
+    const next = await gh(repoPath('/git/commits'), {
+      method: 'POST', body: { message: `${cfg.device}: record ${e.task_no}`, tree: tree.sha, parents: [head] },
+    });
+    try {
+      await gh(repoPath(`/git/refs/heads/${encBranch(branch)}`), { method: 'PATCH', body: { sha: next.sha, force: false } });
+      break;
+    } catch (err) {
+      if (err.status !== 422 || attempt >= 3) throw err;
+      await sleep(800);
+    }
+  }
+
+  onStep('写入回传记录…', 1);
+  await appendEvents([mkEvent('recorded', e, { digest: e.digest, files: names })], `recorded ${e.task_no}`);
+  await refresh({ quiet: true });
+}
+
+// ---------------- Markdown（只覆盖录屏文档用得到的语法） ----------------
+const codeStore = [];
+function inline(s) {
+  const holes = [];
+  const hold = html => `\u0000${holes.push(html) - 1}\u0000`;
+  s = esc(s);
+  s = s.replace(/`([^`]+)`/g, (_, c) => hold(`<code>${c}</code>`));
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, t, u) => hold(`<a href="${u}" target="_blank" rel="noopener">${t}</a>`));
+  s = s.replace(/https?:\/\/[^\s<>"'，。；、）)\u3000]+/g, u => {
+    const m = u.match(/[.,;:!?]+$/);
+    const tail = m ? m[0] : '';
+    const url = tail ? u.slice(0, -tail.length) : u;
+    return hold(`<a href="${url}" target="_blank" rel="noopener">${url}</a>`) + tail;
+  });
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => holes[+i]);
+}
+function codeBlock(code, lang) {
+  const id = codeStore.push(code) - 1;
+  return `<div class="code"><div class="code-h"><span>${esc(lang || 'text')}</span><button data-act="copy" data-id="${id}">复制</button></div><pre><code>${esc(code)}</code></pre></div>`;
+}
+const isBlockStart = l => /^\s*(`{3,}|~{3,})/.test(l) || /^#{1,6}\s/.test(l) || /^\s*>/.test(l) || /^\s*([-*+]|\d+[.)])\s+/.test(l) || /^\s*\|/.test(l);
+function md(src) {
+  src = String(src).replace(/\r\n?/g, '\n').replace(/<!--[\s\S]*?-->/g, '');
+  const lines = src.split('\n');
+  const out = [];
+  let i = 0;
+  const splitRow = l => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  while (i < lines.length) {
+    const l = lines[i];
+    const fence = l.match(/^\s*(`{3,}|~{3,})\s*([\w+#.-]*)/);
+    if (fence) {
+      const buf = [];
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith(fence[1])) buf.push(lines[i++]);
+      i++;
+      out.push(codeBlock(buf.join('\n'), fence[2]));
+      continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    const h = l.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); i++; continue; }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)) { out.push('<hr>'); i++; continue; }
+    if (/^\s*>/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ''));
+      out.push(`<blockquote>${md(buf.join('\n'))}</blockquote>`);
+      continue;
+    }
+    if (/^\s*\|/.test(l) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      const head = splitRow(l);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(splitRow(lines[i++]));
+      out.push(`<table><thead><tr>${head.map(c => `<th>${inline(c)}</th>`).join('')}</tr></thead><tbody>${
+        rows.map(r => `<tr>${r.map(c => `<td>${inline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`);
+      continue;
+    }
+    const li = l.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);
+    if (li) {
+      const ordered = /\d/.test(li[1]);
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);
+        if (m) { items.push(m[2]); i++; continue; }
+        if (lines[i].trim() && /^\s{2,}/.test(lines[i]) && items.length) { items[items.length - 1] += ' ' + lines[i].trim(); i++; continue; }
+        break;
+      }
+      const tag = ordered ? 'ol' : 'ul';
+      out.push(`<${tag}>${items.map(t => `<li>${inline(t)}</li>`).join('')}</${tag}>`);
+      continue;
+    }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !(buf.length && isBlockStart(lines[i]))) buf.push(lines[i++]);
+    out.push(`<p>${buf.map(inline).join('<br>')}</p>`);
+  }
+  return out.join('\n');
+}
+
+// ---------------- 渲染 ----------------
+const ICON = {
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/></svg>',
+  up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9m0 0-4 4m4-4 4 4M4 3h16"/></svg>',
+};
+
+function renderChips() {
+  $('#chipRepo').innerHTML = cfg.repo ? `<span class="dot"></span>${esc(cfg.repo)}` : '';
+  $('#chipRepo').style.display = cfg.repo ? '' : 'none';
+  $('#chipDevice').innerHTML = cfg.device ? `本机：${esc(cfg.device)}` : '未设置';
+}
+
+function matches(e) {
+  const q = state.filter.trim().toLowerCase();
+  return !q || [e.task_no, e.title, e.kind_label, e.owner].some(v => String(v).toLowerCase().includes(q));
+}
+
+function card(e, kind) {
+  const busy = state.busy.has(e.key);
+  const badges = [
+    e.kind_label && `<span class="badge brand">${esc(e.kind_label)}</span>`,
+    e.verdict && `<span class="badge">结论 ${esc(e.verdict)}</span>`,
+    kind === 'recorded' && `<span class="badge ${e.state === S.COLLECTED ? 'ok' : 'warn'}">${esc(STATE_LABEL[e.state])}</span>`,
+  ].filter(Boolean).join('');
+  const when = kind === 'mine' ? `认领于 ${ago(e.claimed_at)}` : kind === 'recorded' ? `回传于 ${ago(e.recorded_at)}` : `发布于 ${ago(e.published_at)}`;
+  const spin = '<span class="spin"></span>';
+  let acts = '';
+  if (kind === 'open') acts = `<button class="btn primary" data-act="claim" data-key="${esc(e.key)}" ${busy ? 'disabled' : ''}>${busy ? spin : ''}认领并打开文档</button>`;
+  if (kind === 'mine') acts = `<button class="btn primary" data-act="open" data-key="${esc(e.key)}">打开文档 · 回传视频</button>
+    <button class="btn danger" style="flex:0 0 auto" data-act="release" data-key="${esc(e.key)}" ${busy ? 'disabled' : ''}>${busy ? spin : ''}放回</button>`;
+  if (kind === 'recorded') acts = `<button class="btn" data-act="open" data-key="${esc(e.key)}">查看文档</button>`;
+  return `<div class="card ${kind === 'mine' ? 'mine' : ''}">
+    <div class="card-h"><span class="no">#${esc(e.task_no)}</span><span class="title" title="${esc(e.title)}">${esc(e.title || '（无标题）')}</span></div>
+    <div class="meta">${badges}</div>
+    <div class="sub"><span>${esc(e.owner)} · ${esc(when)}</span>${e.repo_url ? `<a href="${esc(e.repo_url)}" target="_blank" rel="noopener">${esc(e.repo_url.replace(/^https?:\/\/github\.com\//, ''))}</a>` : ''}</div>
+    <div class="acts">${acts}</div>
+  </div>`;
+}
+
+function section(title, list, kind, emptyText) {
+  return `<section class="sec"><div class="sec-h"><h2>${title}</h2><span class="count">${list.length}</span></div>
+    ${list.length ? `<div class="grid">${list.map(e => card(e, kind)).join('')}</div>` : `<div class="empty">${emptyText}</div>`}</section>`;
+}
+
+function renderMain() {
+  renderChips();
+  const main = $('#main');
+  if (!configured()) {
+    main.innerHTML = `<div class="empty" style="padding:56px">第一次使用，先点右上角「设置」填好录屏仓库、Token 和本机标识。</div>`;
+    return;
+  }
+  const all = Object.values(state.entries);
+  const me = cfg.device;
+  const byTime = f => (a, b) => String(a[f]).localeCompare(String(b[f]));
+  const mine = all.filter(e => e.state === S.CLAIMED && e.claimed_by === me).sort(byTime('claimed_at'));
+  const open = all.filter(e => e.state === S.OPEN).sort(byTime('published_at'));
+  const others = all.filter(e => e.state === S.CLAIMED && e.claimed_by !== me);
+  const done = all.filter(e => (e.state === S.RECORDED || e.state === S.COLLECTED) && e.recorded_by === me)
+    .sort(byTime('recorded_at')).reverse().slice(0, 30);
+  const waiting = done.filter(e => e.state === S.RECORDED).length;
+  const old = $('#q');
+  const caret = old && document.activeElement === old ? old.selectionStart : null;
+  const synced = state.loading ? '<span class="spin" style="width:12px;height:12px"></span> 同步中' :
+    state.syncedAt ? `上次同步 ${state.syncedAt.toLocaleTimeString()}` : '';
+  main.innerHTML = `
+    ${state.error ? `<div class="banner bad"><b>同步失败</b><span>${esc(state.error)}</span></div>` : ''}
+    <div class="stats">
+      <div class="stat hl"><b>${mine.length}</b><span>我在录</span></div>
+      <div class="stat"><b>${open.length}</b><span>待认领</span></div>
+      <div class="stat"><b>${others.length}</b><span>别人在录</span></div>
+      <div class="stat"><b>${waiting}</b><span>已回传待收回</span></div>
+    </div>
+    <div class="toolbar">
+      <div class="search">${ICON.search}<input id="q" placeholder="按题号、题型、出题设备筛选" value="${esc(state.filter)}"></div>
+      <span class="sync">${synced}</span>
+      <button class="btn" data-act="refresh" ${state.loading ? 'disabled' : ''}>${ICON.refresh}刷新</button>
+    </div>
+    ${section('我在录', mine.filter(matches), 'mine', '手上没有题。从下面「待认领」里挑一道。')}
+    ${section('待认领', open.filter(matches), 'open', '队列是空的，出题端有新题会自动出现在这里（每分钟刷新一次）。')}
+    ${others.length ? `<section class="sec"><div class="sec-h"><h2>别人在录</h2><span class="count">${others.length}</span></div>
+      <div class="mini">${others.map(e => `<span class="chip">#${esc(e.task_no)} · ${esc(e.claimed_by)}</span>`).join('')}</div></section>` : ''}
+    ${section('我已回传', done.filter(matches), 'recorded', '还没有回传记录。')}
+  `;
+  const q = $('#q');
+  if (caret != null) { q.focus(); q.setSelectionRange(caret, caret); }
+  q.addEventListener('input', () => {
+    state.filter = q.value;
+    renderMain();
+  });
+}
+
+// ---------------- 设置弹窗 ----------------
+function openSettings() {
+  $('#layer').innerHTML = `<div class="mask" data-act="close-modal"></div>
+  <div class="modal" role="dialog">
+    <h3>录屏端设置</h3>
+    <p class="desc">三项都保存在这台电脑的浏览器里，不会上传到别处。</p>
+    <div class="field"><label>录屏仓库</label><input id="fRepo" placeholder="owner/repo，例如 gy-vs/solo-video" value="${esc(cfg.repo || '')}">
+      <div class="hint">出题端「设置 → 录屏协作 → 录屏仓库」里的同一个值</div></div>
+    <div class="field"><label>GitHub Token</label><input id="fToken" type="password" placeholder="github_pat_…" value="${esc(cfg.token || '')}">
+      <div class="hint">出题端给你的细粒度 Token，只需要录屏仓库的 Contents 读写权限</div></div>
+    <div class="field"><label>本机标识</label><input id="fDevice" placeholder="例如 luping-win" value="${esc(cfg.device || '')}">
+      <div class="hint">英文字母和数字，不能和出题端的设备名相同；认领、回传记录都署这个名字</div></div>
+    <div class="err" id="fErr"></div>
+    <div class="foot">
+      ${configured() ? '<button class="btn" data-act="close-modal">取消</button>' : ''}
+      <button class="btn primary" data-act="save-settings">测试连接并保存</button>
+    </div>
+  </div>`;
+  $('#fRepo').focus();
+}
+
+async function saveSettings(btn) {
+  const repo = normRepo($('#fRepo').value);
+  const token = $('#fToken').value.trim();
+  const device = $('#fDevice').value.trim();
+  const err = $('#fErr');
+  if (!repo) return (err.textContent = '录屏仓库要写成 owner/repo');
+  if (!token) return (err.textContent = '请填 GitHub Token');
+  if (slug(device) === 'unknown') return (err.textContent = '本机标识至少要有一个英文字母或数字');
+  err.textContent = '';
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>测试中';
+  const prev = cfg;
+  cfg = { repo, token, device };
+  try {
+    const info = await gh(`/repos/${repo}`);
+    if (!info.private) throw new Error(`${repo} 是公开仓库，录屏文档里有作答仓库和评审结论，必须用私有仓库`);
+    const { text } = await readEvents();
+    const owners = new Set(parseEvents(text).map(e => slug(e.owner)));
+    if (owners.has(slug(device))) throw new Error(`本机标识「${device}」和出题端设备名重复了，换一个`);
+    localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
+    closeLayer();
+    toast('连接成功，已保存', 'ok');
+    refresh({ quiet: true }).catch(() => {});
+  } catch (e) {
+    cfg = prev;
+    err.textContent = e.message;
+    btn.disabled = false;
+    btn.textContent = '测试连接并保存';
+  }
+}
+
+// ---------------- 抽屉：文档 + 回传 ----------------
+function openDrawer(key) {
+  state.drawer = { key, md: null, error: '', files: {}, step: '', progress: 0, uploading: false };
+  renderDrawer();
+  const e = entry(key);
+  loadReport(e).then(text => {
+    if (state.drawer && state.drawer.key === key) { state.drawer.md = text; renderDrawer(); }
+  }).catch(err => {
+    if (state.drawer && state.drawer.key === key) { state.drawer.error = err.message; renderDrawer(); }
+  });
+}
+
+function renderDrawer() {
+  const d = state.drawer;
+  if (!d) return;
+  const e = entry(d.key);
+  if (!e) { closeLayer(); return; }
+  const mineNow = e.state === S.CLAIMED && e.claimed_by === cfg.device;
+  const scroll = $('.dr-b') ? $('.dr-b').scrollTop : 0;
+  const body = d.error ? `<div class="banner bad" style="margin-top:20px">${esc(d.error)}</div>` :
+    d.md == null ? '<div style="padding-top:12px">' + '<div class="skel"></div>'.repeat(10) + '</div>' : `<div class="md">${md(d.md)}</div>`;
+  let foot;
+  if (mineNow || d.uploading) {
+    foot = `<div class="drops">${SIDES.map(s => {
+      const f = d.files[s];
+      const too = f && (f.size > MAX_VIDEO_BYTES || !VIDEO_SUFFIXES.includes(ext(f.name)));
+      return `<label class="drop ${f ? (too ? 'too' : 'has') : ''}" data-side="${s}">
+        <input type="file" accept="${VIDEO_SUFFIXES.join(',')},video/*" data-side="${s}" ${d.uploading ? 'disabled' : ''}>
+        <span class="side">${s}</span>
+        <span class="txt"><b>${f ? esc(f.name) : `选择 ${s} 侧视频`}</b><span>${f ? `${fmtSize(f.size)}${too ? ' · 格式或大小不符' : ''}` : '点击选择或拖进来 · 单个 ≤ 95 MB'}</span></span>
+      </label>`;
+    }).join('')}</div>
+    <div class="dr-acts">
+      <div class="grow">${d.uploading || d.step ? `<div class="step">${esc(d.step)}</div><div class="prog"><i style="width:${Math.round(d.progress * 100)}%"></i></div>` :
+        '<div class="step">两侧都选好后点「回传」，出题端下一轮巡检会自动收回</div>'}</div>
+      <button class="btn danger" data-act="release" data-key="${esc(e.key)}" ${d.uploading ? 'disabled' : ''}>放回</button>
+      <button class="btn primary" data-act="upload" ${d.uploading || checkFiles(d.files) ? 'disabled' : ''}>${d.uploading ? '<span class="spin"></span>' : ICON.up}回传</button>
+    </div>`;
+  } else {
+    const tone = e.state === S.COLLECTED || e.state === S.RECORDED ? 'ok' : 'warn';
+    const extra = e.state === S.RECORDED ? '，出题端下一轮巡检会自动收回' : e.state === S.CLAIMED ? `（${esc(e.claimed_by)} 在录）` : '';
+    foot = `<div class="state-box ${tone}">当前状态：${esc(STATE_LABEL[e.state] || e.state)}${extra}</div>`;
+  }
+  $('#layer').innerHTML = `<div class="mask" data-act="close-drawer"></div>
+  <aside class="drawer">
+    <div class="dr-h">
+      <span class="no">#${esc(e.task_no)}</span>
+      <div class="grow"><div class="meta">${e.kind_label ? `<span class="badge brand">${esc(e.kind_label)}</span>` : ''}${e.verdict ? `<span class="badge">结论 ${esc(e.verdict)}</span>` : ''}</div>
+        <div class="title">${esc(e.title)}${e.repo_url ? ` · <a href="${esc(e.repo_url)}" target="_blank" rel="noopener">作答仓库</a>` : ''}</div></div>
+      <button class="btn sm" data-act="download" ${d.md == null ? 'disabled' : ''}>${ICON.down}下载文档</button>
+      <button class="btn ghost sm" data-act="close-drawer" title="关闭" ${d.uploading ? 'disabled' : ''}>${ICON.close}</button>
+    </div>
+    <div class="dr-b">${body}</div>
+    <div class="dr-f">${foot}</div>
+  </aside>`;
+  $('.dr-b').scrollTop = scroll;
+}
+
+function setFile(side, file) {
+  if (!state.drawer || state.drawer.uploading || !file) return;
+  state.drawer.files[side] = file;
+  if (!VIDEO_SUFFIXES.includes(ext(file.name))) toast(`${file.name} 不像视频文件（支持 ${VIDEO_SUFFIXES.join(' ')}）`, 'bad');
+  else if (file.size > MAX_VIDEO_BYTES) toast(`${file.name} 有 ${fmtSize(file.size)}，超过 95 MB，请按 720p 重新导出`, 'bad');
+  renderDrawer();
+}
+
+async function doUpload() {
+  const d = state.drawer;
+  if (!d || d.uploading) return;
+  d.uploading = true;
+  d.step = '准备中…';
+  d.progress = 0;
+  renderDrawer();
+  try {
+    await submitVideos(d.key, d.files, (step, p) => {
+      if (state.drawer !== d) return;
+      d.step = step;
+      d.progress = p;
+      const stepEl = $('.dr-f .step'), bar = $('.dr-f .prog i');
+      if (stepEl && bar) { stepEl.textContent = step; bar.style.width = `${Math.round(p * 100)}%`; }
+      else renderDrawer();
+    });
+    d.uploading = false;
+    d.step = '';
+    toast(`第 ${entry(d.key).task_no} 题已回传，出题端下一轮巡检会自动收回`, 'ok');
+    renderDrawer();
+  } catch (e) {
+    d.uploading = false;
+    d.step = `回传失败：${e.message}`;
+    toast(e.message, 'bad');
+    renderDrawer();
+  }
+}
+
+function downloadReport() {
+  const d = state.drawer;
+  if (!d || d.md == null) return;
+  const e = entry(d.key);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([d.md], { type: 'text/markdown;charset=utf-8' }));
+  a.download = `第${e.task_no}题-录屏文档.md`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+}
+
+function closeLayer() {
+  if (state.drawer && state.drawer.uploading) return;
+  state.drawer = null;
+  $('#layer').innerHTML = '';
+}
+
+function toast(msg, tone = '') {
+  const el = document.createElement('div');
+  el.className = `toast ${tone}`;
+  el.textContent = msg;
+  $('#toasts').appendChild(el);
+  setTimeout(() => el.remove(), tone === 'bad' ? 6000 : 3200);
+}
+
+// ---------------- 事件绑定 ----------------
+async function withBusy(key, fn) {
+  state.busy.add(key);
+  renderMain();
+  try { await fn(); } catch (e) { toast(e.message, 'bad'); } finally { state.busy.delete(key); renderMain(); if (state.drawer) renderDrawer(); }
+}
+
+document.addEventListener('click', ev => {
+  const t = ev.target.closest('[data-act]');
+  if (!t || t.disabled) return;
+  const act = t.dataset.act, key = t.dataset.key;
+  if (act === 'settings') openSettings();
+  else if (act === 'close-modal' && configured()) closeLayer();
+  else if (act === 'close-drawer') closeLayer();
+  else if (act === 'save-settings') saveSettings(t);
+  else if (act === 'refresh') refresh().catch(() => {});
+  else if (act === 'claim') withBusy(key, () => claim(key));
+  else if (act === 'open') openDrawer(key);
+  else if (act === 'release') {
+    if (!confirm('确定放回？放回后别人可以认领这道题。')) return;
+    withBusy(key, async () => { await release(key); closeLayer(); });
+  }
+  else if (act === 'upload') doUpload();
+  else if (act === 'download') downloadReport();
+  else if (act === 'copy') {
+    copyText(codeStore[+t.dataset.id] || '').then(() => { t.textContent = '已复制'; setTimeout(() => (t.textContent = '复制'), 1500); });
+  }
+});
+document.addEventListener('change', ev => {
+  const t = ev.target;
+  if (t.matches('input[type=file][data-side]') && t.files[0]) setFile(t.dataset.side, t.files[0]);
+});
+for (const type of ['dragover', 'dragleave', 'drop']) {
+  document.addEventListener(type, ev => {
+    const zone = ev.target.closest && ev.target.closest('.drop');
+    if (type !== 'dragleave') ev.preventDefault();
+    if (!zone) return;
+    zone.classList.toggle('over', type === 'dragover');
+    if (type === 'drop' && ev.dataTransfer.files[0]) setFile(zone.dataset.side, ev.dataTransfer.files[0]);
+  });
+}
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && (state.drawer || configured())) closeLayer();
+});
+window.addEventListener('beforeunload', ev => {
+  if (state.drawer && state.drawer.uploading) { ev.preventDefault(); ev.returnValue = ''; }
+});
+
+// ---------------- 启动 ----------------
+renderMain();
+if (configured()) refresh({ quiet: true }).catch(() => {});
+else openSettings();
+setInterval(() => {
+  if (configured() && !state.loading && !(state.drawer && state.drawer.uploading) && !document.hidden) refresh({ quiet: true }).catch(() => {});
+}, AUTO_REFRESH_MS);
+})();
+</script>
+</body>
+</html>

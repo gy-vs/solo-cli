@@ -219,6 +219,18 @@ prompts/<设备>/NN.md 题面的可读副本，纯粹为了能在 GitHub 上直�
 
 **最后一步留给人**：「可上传」栏勾选后批量提交，或逐条提交。题目列表页也新增了同名一栏。
 
+### 录屏端免部署
+
+只做录屏的人不用部署控制台，也不用装 Docker：把 [`recorder/录屏端.html`](recorder/录屏端.html) 这一个文件发给他，双击用 Edge / Chrome 打开就是完整的录屏端（认领 → 看文档、复制 PowerShell 命令 → 选 A/B 视频回传 → 放回）。它直接调 GitHub API 读写同一个录屏仓库，协议与 `rec_repo.py` 一致，出题端什么都不用改，照常巡检收视频。
+
+首次打开要填三项，存在他本机浏览器里：
+
+- **录屏仓库**：和出题端同一个 `owner/repo`。
+- **GitHub Token**：出题端账号生成一个细粒度 Token，[预填链接](https://github.com/settings/personal-access-tokens/new?name=solo-recorder&target_name=gy-vs&expires_in=90&contents=write)打开后在 Repository access 里只勾录屏仓库。别选 All repositories——那样这个 Token 能改所有作答仓库。
+- **本机标识**：英文字母数字，不能和出题端设备名重名，认领和回传记录都署这个名字。
+
+写 `events.jsonl` 走带版本号的更新，和出题端的 git 推送同时发生时会被拒，重读再写，最多三次。本机时钟比出题端慢时，新动作的时间戳会自动顶到这道题最后一条记录之后，否则重放时认领会排到发布前面而失效。视频单个上限 95 MB，720p 导出一般几 MB。
+
 ## 换一台设备部署
 
 仓库里只有代码。`data/`（库、`secret.key`、导出轨迹、题库的本地副本）和 `.env` 都不进版本库，两台设备各自持有一份，互不覆盖；跨设备共享的只有题库那一个仓库。
