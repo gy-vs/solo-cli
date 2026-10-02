@@ -30,6 +30,10 @@ docs/SoloReport.md
 docs/GsbReasons.md
 docs/ScreencastPending.md
 
+# 本地临时数据：重写用的库备份与脚本、录屏视频
+.rewrite/
+sp/
+
 # 系统与编辑器
 .DS_Store
 .idea/
