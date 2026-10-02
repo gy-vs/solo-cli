@@ -507,6 +507,28 @@ def test_result_is_returned_even_if_the_cli_never_lets_go_of_its_pipes(monkeypat
     assert killed.get("pg") == 4242424
 
 
+def test_writing_to_a_closed_stdin_is_a_retryable_llm_error():
+    """CLI 起来就退出时，asyncio 写已关闭的管道抛的是 RuntimeError。漏成裸异常的话
+    调用方只接 LlmError，失败落库被跳过，质检会一直挂在进行中。"""
+    class ClosedStdin:
+        def write(self, data):
+            raise RuntimeError("unable to perform operation on <WriteUnixTransport closed=True>; "
+                               "the handler is closed")
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Proc:
+        stdin = ClosedStdin()
+
+    with pytest.raises(llm.LlmError) as err:
+        asyncio.run(llm._feed_stdin(Proc(), "x"))
+    assert err.value.retryable is True
+
+
 # ---------------- 工作目录与 skill ----------------
 
 def test_ask_defaults_to_the_empty_dir_but_honours_cwd(monkeypatch):

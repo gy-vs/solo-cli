@@ -290,7 +290,9 @@ async def _feed_stdin(proc: asyncio.subprocess.Process, prompt: str) -> None:
         proc.stdin.write(data)
         await proc.stdin.drain()
         proc.stdin.close()
-    except (BrokenPipeError, ConnectionResetError) as exc:
+    # 进程起来就退出时，asyncio 往已关闭的管道写抛的是 RuntimeError 而不是 BrokenPipeError，
+    # 不在这里转成 LlmError 的话调用方的失败落库会被整段跳过，质检状态停在 RUNNING
+    except (BrokenPipeError, ConnectionResetError, RuntimeError) as exc:
         raise LlmError("Cursor CLI 在读完 prompt 之前退出", retryable=True) from exc
 
 
