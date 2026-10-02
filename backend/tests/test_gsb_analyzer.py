@@ -846,3 +846,88 @@ def test_peer_openings_excludes_self_and_unanalyzed(tmp_db):
         got = ga.peer_openings(db, me.id)
     assert set(got) == {"08"}
     assert got["08"] == ga.gsb_rules.opening_signature("两侧对根因的判断一致。")
+
+
+# ---------------- 分析期间题被改动，结果不能写回 ----------------
+
+def _analysis_ready_task():
+    from app.db import session
+    from app.models import QC, RUN_FINISHED, TaskRun
+
+    with session() as db:
+        t = _task(db, status=QC)
+        for side in ("A", "B"):
+            db.add(TaskRun(task_id=t.id, side=side, status=RUN_FINISHED))
+        db.flush()
+        return t.id
+
+
+def _fail_after(monkeypatch, meddle):
+    """分析停在采集那一步：先让 meddle 改一下库里的题，再抛错。"""
+    import time
+
+    async def boom(*a, **kw):
+        meddle()
+        raise RuntimeError("模型输出里没有可解析的 JSON")
+
+    monkeypatch.setattr(ga, "collect_side", boom)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+
+
+def _status(task_id):
+    from app.db import session
+    from app.models import Task
+
+    with session() as db:
+        t = db.get(Task, task_id)
+        return t.status, t.auto_error
+
+
+def test_failure_after_rerun_keeps_the_task_queued(tmp_db, monkeypatch):
+    """440 的现场：分析在跑，人点了重跑，分析随后失败，把题改成需关注，调度器再也不取它。"""
+    from app.db import session
+    from app.models import QUEUED, Task
+    from app.services import watchdog
+
+    tid = _analysis_ready_task()
+
+    def rerun():
+        with session() as db:
+            t = db.get(Task, tid)
+            t.status = QUEUED
+            watchdog.clear_analysis(t)
+
+    _fail_after(monkeypatch, rerun)
+    res = asyncio.run(ga.analyze_task(tid))
+    assert res["ok"] is False and res.get("stale") is True
+    assert _status(tid) == (QUEUED, "")
+
+
+def test_failure_after_discard_keeps_the_task_discarded(tmp_db, monkeypatch):
+    from app.db import session
+    from app.models import DISCARDED, Task
+
+    tid = _analysis_ready_task()
+
+    def discard():
+        with session() as db:
+            db.get(Task, tid).status = DISCARDED
+
+    _fail_after(monkeypatch, discard)
+    asyncio.run(ga.analyze_task(tid))
+    assert _status(tid)[0] == DISCARDED
+
+
+def test_undisturbed_failure_still_needs_attention(tmp_db, monkeypatch):
+    from app.db import session
+    from app.models import NEEDS_ATTENTION, Task
+
+    tid = _analysis_ready_task()
+    _fail_after(monkeypatch, lambda: None)
+    res = asyncio.run(ga.analyze_task(tid))
+    status, err = _status(tid)
+    assert res["ok"] is False and not res.get("stale")
+    assert status == NEEDS_ATTENTION and "没有可解析的 JSON" in err
+    with session() as db:
+        analysis = db.get(Task, tid).analysis
+    assert "run_token" not in analysis and analysis["failure"]["count"] == 1

@@ -31,6 +31,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1254,6 +1255,18 @@ def peer_openings(db, task_id: int) -> dict[str, str]:
 
 # ---------------- 主流程 ----------------
 
+def _still_mine(t: Task | None, token: str) -> bool:
+    """这次分析的结果还该不该落库。
+
+    一次分析要十几分钟，这期间题可能已经被重跑（clear_analysis 清空 analysis，令牌随之
+    消失、状态回到排队）、被废弃，或者又起了一次新的分析（令牌被换掉）。这时候不论成败
+    都不能写回：失败会把刚排上队的题改成「需关注」，调度器从此不再取它；成功则是拿上一跑
+    的轨迹比出来的结论盖到新一跑头上。
+    """
+    return (t is not None and t.status == ANALYZING
+            and (t.analysis or {}).get("run_token") == token)
+
+
 async def analyze_task(task_id: int) -> dict:
     with session() as db:
         t = db.get(Task, task_id)
@@ -1272,6 +1285,8 @@ async def analyze_task(task_id: int) -> dict:
         t.factcheck = {}
         t.precheck_status = PRECHECK_IDLE
         t.precheck = {}
+        token = uuid.uuid4().hex
+        t.analysis = {**(t.analysis or {}), "run_token": token}
         db.flush()
         task_no = t.task_no
         snapshot = gsb_repo.snapshot_sha(t.env_snapshot)
@@ -1330,7 +1345,9 @@ async def analyze_task(task_id: int) -> dict:
 
         with session() as db:
             t = db.get(Task, task_id)
-            assert t is not None
+            if not _still_mine(t, token):
+                log.warning("题 %s 分析期间已被重跑/废弃/重新分析，这次结论作废不写回", task_no)
+                return {"ok": False, "error": "分析期间题目状态已变，结论作废", "stale": True}
             t.analysis = {
                 "model": result.model,
                 "agent_session": result.session_id,
@@ -1368,15 +1385,17 @@ async def analyze_task(task_id: int) -> dict:
         log.exception("GSB 分析失败 %s", task_no)
         with session() as db:
             t = db.get(Task, task_id)
-            if t is not None:
-                t.analysis_status = ANALYSIS_FAILED
-                t.status = NEEDS_ATTENTION
-                t.auto_error = f"GSB 分析失败：{exc}"[:2000]
-                # 看门狗按这笔账决定要不要、什么时候再自动试一次，见 watchdog._scan_failed_analyses
-                prev = dict(t.analysis or {})
-                count = int((prev.get("failure") or {}).get("count") or 0) + 1
-                t.analysis = {**prev, "failure": {"count": count, "at": utc_now().isoformat(),
-                                                  "error": str(exc)[:300]}}
+            if not _still_mine(t, token):
+                log.warning("题 %s 分析期间已被重跑/废弃/重新分析，失败不再改它的状态", task_no)
+                return {"ok": False, "error": str(exc), "stale": True}
+            t.analysis_status = ANALYSIS_FAILED
+            t.status = NEEDS_ATTENTION
+            t.auto_error = f"GSB 分析失败：{exc}"[:2000]
+            # 看门狗按这笔账决定要不要、什么时候再自动试一次，见 watchdog._scan_failed_analyses
+            prev = {k: v for k, v in (t.analysis or {}).items() if k != "run_token"}
+            count = int((prev.get("failure") or {}).get("count") or 0) + 1
+            t.analysis = {**prev, "failure": {"count": count, "at": utc_now().isoformat(),
+                                              "error": str(exc)[:300]}}
         bus.publish("tasks", {"type": "task", "id": task_id})
         return {"ok": False, "error": str(exc)}
 
